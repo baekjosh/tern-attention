@@ -1,0 +1,15 @@
+tern.d.luau
+.runtime/
+.DS_Store
+
+# Keep local environment files private on every machine; allow sanitized examples.
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+dist/
+
+# Compiled bytecode is build output, never source.
+__pycache__/
+*.pyc

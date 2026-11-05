@@ -1,0 +1,916 @@
+/* Tern retains this padded region even when a canvas supplies no dock. */
+.sf-dock[data-surface='plugin.tern.canvas']:empty {
+	display: none;
+}
+
+/* The root fills the native main region and scrolls only the list (or Settings) inside it, so the toolbar,
+   location line and pager are never scrolled content: native sticky painting is culled once its flow position
+   is far from the viewport, which blanked the header after about a screen of scrolling. */
+[data-role='attention.root'] {
+	position: absolute;
+	inset: 0 0 12px 0;
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	font-family: var(--sans);
+	font-size: calc(13px / var(--sf-zoom, 1));
+	line-height: calc(18px / var(--sf-zoom, 1));
+	padding: 0;
+	color: var(--t1);
+}
+
+[data-role='attention.row'] {
+	align-items: stretch;
+	min-width: 0;
+	border-bottom: 1px solid var(--l1);
+}
+
+[data-role='attention.rows'],
+[data-role='attention.rows-occupied'],
+[data-role='attention.rows-arrival'],
+[data-role='attention.rows-arrival-again'],
+[data-role='attention.settings'] {
+	flex: 1 1 0;
+	min-height: 0;
+	overflow-y: auto;
+}
+
+[data-role='attention.rows-occupied'],
+[data-role='attention.rows-arrival'],
+[data-role='attention.rows-arrival-again'] {
+	background-color: rgb(from var(--accent) r g b / 6%);
+}
+
+[data-role='attention.rows-arrival'] {
+	animation: attention-arrival 850ms ease-out 1;
+}
+
+[data-role='attention.rows-arrival-again'] {
+	animation: attention-arrival-again 850ms ease-out 1;
+}
+
+@keyframes attention-arrival {
+	0%, 100% { background-color: rgb(from var(--accent) r g b / 6%); }
+	25% { background-color: rgb(from var(--accent) r g b / 10%); }
+}
+
+@keyframes attention-arrival-again {
+	0%, 100% { background-color: rgb(from var(--accent) r g b / 6%); }
+	25% { background-color: rgb(from var(--accent) r g b / 10%); }
+}
+
+[data-role='attention.row-main'] {
+	align-items: stretch;
+	min-width: 0;
+	gap: 0;
+}
+
+/* A row button sizes to its content: Tern gives buttons a fixed one-line height unless it is reset here. */
+[data-role='attention.open'],
+[data-role='attention.open-pending'],
+[data-role='attention.row-main'] > [data-role='attention.unavailable'] {
+	display: flex;
+	flex: 1;
+	flex-direction: column;
+	align-items: stretch;
+	min-width: 0;
+	height: auto;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	text-align: left;
+	padding: 0.35em 0.6em;
+	gap: calc(2px / var(--sf-zoom, 1));
+	cursor: pointer;
+}
+
+[data-role='attention.open']:hover {
+	background: var(--l1);
+}
+
+[data-role='attention.open']:active {
+	background: var(--l2);
+}
+
+[data-role='attention.open-pending'] {
+	background: transparent;
+	cursor: progress;
+}
+
+[data-role='attention.session'] {
+	font-weight: 400;
+}
+
+/* Bottom strip: the session is a bold column spanning both lines of a conversation row, divided from the title
+   and metadata beside it. A left or right rail never emits it (the session stays in the metadata line). */
+[data-role='attention.cells'] {
+	display: flex;
+	flex-direction: row;
+	flex-wrap: nowrap;
+	align-items: stretch;
+	min-width: 0;
+	gap: calc(10px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.session-cell'] {
+	display: flex;
+	flex: 0 1 15ch;
+	align-items: center;
+	box-sizing: border-box;
+	min-width: 12ch;
+	max-width: 16ch;
+	padding-right: calc(10px / var(--sf-zoom, 1));
+	border-right: 1px solid var(--l3);
+	font-size: calc(15px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.session-name'] {
+	flex: 1 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: inherit;
+	font-weight: 700;
+	line-height: calc(20px / var(--sf-zoom, 1));
+	color: var(--t1);
+}
+
+[data-role='attention.body'] {
+	display: flex;
+	flex: 1 1 0;
+	flex-direction: column;
+	min-width: 0;
+	gap: calc(2px / var(--sf-zoom, 1));
+}
+
+/* Line one of a row: the title, ellipsized. */
+[data-role='attention.summary'] {
+	display: flex;
+	flex-direction: row;
+	flex-wrap: nowrap;
+	align-items: baseline;
+	justify-content: flex-start;
+	min-width: 0;
+	gap: calc(4px / var(--sf-zoom, 1));
+}
+
+/* Line two: where it lives and what it is doing, left-aligned, wrapping between items. */
+[data-role='attention.metadata'] {
+	display: flex;
+	flex-direction: row;
+	flex-wrap: wrap;
+	align-items: baseline;
+	justify-content: flex-start;
+	min-width: 0;
+	column-gap: calc(8px / var(--sf-zoom, 1));
+	row-gap: 0;
+}
+
+[data-role='attention.title'],
+[data-role='attention.evidence'],
+[data-role='attention.context'] {
+	min-width: 0;
+	font: inherit;
+}
+
+[data-role='attention.title'] {
+	flex: 0 1 auto;
+	max-width: 100%;
+	font-weight: 600;
+	color: var(--t1);
+}
+
+/* Metadata items stay on one line each and wrap between items; one wider than the row ellipsizes. */
+[data-role='attention.session'],
+[data-role='attention.reason'],
+[data-role='attention.qualifiers'],
+[data-role='attention.runtime'],
+[data-role='attention.age'],
+[data-role='attention.age-recorded'],
+[data-role='attention.priority'] {
+	flex: 0 1 auto;
+	min-width: 0;
+	max-width: 100%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+[data-role='attention.navigation-pending'] {
+	flex: 0 0 auto;
+	white-space: nowrap;
+}
+
+[data-role='attention.session'],
+[data-role='attention.reason'],
+[data-role='attention.qualifiers'],
+[data-role='attention.runtime'],
+[data-role='attention.age'],
+[data-role='attention.age-recorded'],
+[data-role='attention.priority'],
+[data-role='attention.navigation-pending'] {
+	font-size: calc(11px / var(--sf-zoom, 1));
+	line-height: calc(16px / var(--sf-zoom, 1));
+	color: var(--t2);
+	font-variant-numeric: tabular-nums;
+}
+
+[data-role='attention.runtime'] {
+	color: var(--t1);
+}
+
+/* A recorded time (offline or unreadable source) is muted and dashed, so it never reads as a live clock. */
+[data-role='attention.age-recorded'] {
+	color: var(--t3);
+	border: 1px dashed var(--t3);
+	border-radius: calc(3px / var(--sf-zoom, 1));
+	padding: 0 calc(4px / var(--sf-zoom, 1));
+	font-style: italic;
+}
+
+[data-role='attention.priority'] {
+	color: var(--accent);
+	font-weight: 600;
+}
+
+[data-role='attention.navigation-pending'] {
+	color: var(--accent);
+}
+
+[data-role='attention.context'],
+[data-role='attention.evidence'],
+[data-role='attention.coverage'] {
+	color: var(--t2);
+	font-size: calc(12px / var(--sf-zoom, 1));
+	line-height: calc(17px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.disclosure'] {
+	min-width: 0;
+	padding: 0.25em 0.75em 0.75em;
+	gap: calc(4px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.disclosure'] [data-role='attention.context'],
+[data-role='attention.disclosure'] [data-role='attention.evidence'] {
+	white-space: normal;
+	overflow-wrap: anywhere;
+}
+
+[data-role='attention.disclosure'] [data-role='attention.evidence'] {
+	color: var(--t1);
+}
+
+[data-role='attention.coverage'] {
+	padding: 0.5em 0.75em;
+	border-bottom: 1px solid var(--l1);
+}
+
+[data-role='attention.empty'] {
+	padding: 0.75em;
+	color: var(--t2);
+}
+
+/* The pager is the header group's second-to-last row: compact, one line, always on screen. It takes the free space
+   and right-aligns its content, so in a wide strip it sits just left of the search and gear buttons; otherwise it
+   wraps below the toolbar. */
+[data-role='attention.pagination'] {
+	flex: 1 1 auto;
+	justify-content: flex-end;
+	max-width: 100%;
+	align-items: center;
+	flex-wrap: nowrap;
+	white-space: nowrap;
+	min-width: 0;
+	gap: calc(4px / var(--sf-zoom, 1));
+	padding: calc(2px / var(--sf-zoom, 1)) calc(4px / var(--sf-zoom, 1)) 0;
+}
+
+[data-role='attention.pager-range'] {
+	flex: 0 1 auto;
+	min-width: 0;
+	color: var(--t2);
+	font-size: calc(11px / var(--sf-zoom, 1));
+	font-variant-numeric: tabular-nums;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+[data-role='attention.page-control'] {
+	flex: 0 0 auto;
+	box-sizing: border-box;
+	height: calc(20px / var(--sf-zoom, 1));
+	padding: 0 calc(6px / var(--sf-zoom, 1));
+	border: calc(1px / var(--sf-zoom, 1)) solid var(--l2);
+	border-radius: calc(4px / var(--sf-zoom, 1));
+	background: transparent;
+	color: var(--t1);
+	font: inherit;
+	font-size: calc(11px / var(--sf-zoom, 1));
+	font-weight: 600;
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+[data-role='attention.page-control']:hover {
+	background: var(--l1);
+	border-color: var(--l3);
+}
+
+[data-role='attention.page-control']:active {
+	background: var(--l2);
+}
+
+[data-role='attention.control'],
+[data-role='attention.selected'],
+[data-role='attention.triage'],
+[data-role='attention.gear'],
+[data-role='attention.gear-selected'],
+[data-role='attention.search'],
+[data-role='attention.search-unavailable'],
+[data-role='attention.next'],
+[data-role='attention.next-unavailable'],
+[data-role='attention.previous'],
+[data-role='attention.previous-unavailable'],
+[data-role='attention.unavailable'] {
+	padding: 0.25em 0.45em;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	color: var(--t1);
+	font: inherit;
+	cursor: pointer;
+}
+
+[data-role='attention.control']:hover,
+[data-role='attention.selected']:hover,
+[data-role='attention.triage']:hover,
+[data-role='attention.gear']:hover,
+[data-role='attention.gear-selected']:hover,
+[data-role='attention.search']:hover {
+	background: var(--l1);
+}
+
+[data-role='attention.control']:active,
+[data-role='attention.selected']:active,
+[data-role='attention.triage']:active,
+[data-role='attention.gear']:active,
+[data-role='attention.gear-selected']:active,
+[data-role='attention.search']:active {
+	background: var(--l2);
+}
+
+[data-role='attention.selected'],
+[data-role='attention.gear-selected'] {
+	background: var(--l1);
+	font-weight: 600;
+	box-shadow: inset 0 -1px var(--t2);
+}
+
+/* Toolbar, current-location line (Workspace only) and pager are one fixed group above the scrolled list. The group
+   wraps: a wide strip (a rail at the bottom or right of a tab) keeps modes, Next/Prev and the search and gear buttons
+   on one line, a narrow rail stacks them. The group's right padding keeps the buttons clear of the native pane grip. */
+[data-role='attention.header'] {
+	flex: none;
+	display: flex;
+	flex-direction: row;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: calc(3px / var(--sf-zoom, 1)) calc(8px / var(--sf-zoom, 1));
+	background: rgb(from var(--panel) r g b / 100%);
+	padding: calc(8px / var(--sf-zoom, 1)) calc(40px / var(--sf-zoom, 1)) calc(3px / var(--sf-zoom, 1)) 0.5em;
+	border-bottom: 1px solid var(--l2);
+}
+
+[data-role='attention.queues'],
+[data-role='attention.tools'] {
+	flex: 0 1 auto;
+	align-items: center;
+	flex-wrap: wrap;
+	min-width: 0;
+	max-width: 100%;
+	gap: calc(3px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.utility'] {
+	flex: 0 0 auto;
+	align-items: center;
+	flex-wrap: nowrap;
+	margin-left: auto;
+	gap: calc(2px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.location'] {
+	display: flex;
+	box-sizing: border-box;
+	flex: 1 1 calc(220px / var(--sf-zoom, 1));
+	align-items: baseline;
+	min-width: 0;
+	gap: calc(8px / var(--sf-zoom, 1));
+	padding: calc(2px / var(--sf-zoom, 1)) calc(4px / var(--sf-zoom, 1));
+	border: 0;
+	border-radius: calc(4px / var(--sf-zoom, 1));
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+
+[data-role='attention.location']:hover {
+	background: var(--l1);
+}
+
+[data-role='attention.location-none'] {
+	flex: 1 1 calc(220px / var(--sf-zoom, 1));
+	padding: calc(2px / var(--sf-zoom, 1)) calc(4px / var(--sf-zoom, 1));
+	color: var(--t3);
+}
+
+[data-role='attention.location-title'] {
+	flex: 0 1 auto;
+	min-width: 0;
+	font-weight: 600;
+	color: var(--t1);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+[data-role='attention.location-none'] > [data-role='attention.location-title'] {
+	font-weight: 400;
+	color: var(--t3);
+}
+
+[data-role='attention.location-context'] {
+	flex: 1 1 0;
+	min-width: 0;
+	color: var(--t2);
+	font-size: calc(11px / var(--sf-zoom, 1));
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+[data-role='attention.queue'],
+[data-role='attention.queue-selected'] {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	height: calc(22px / var(--sf-zoom, 1));
+	padding: calc(2px / var(--sf-zoom, 1)) calc(4px / var(--sf-zoom, 1));
+	gap: calc(4px / var(--sf-zoom, 1));
+	border: 0;
+	border-radius: calc(4px / var(--sf-zoom, 1));
+	background: transparent;
+	color: var(--t2);
+	font: inherit;
+	font-size: calc(12px / var(--sf-zoom, 1));
+	font-weight: 600;
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+[data-role='attention.queue-label'] {
+	flex-shrink: 0;
+}
+
+[data-role='attention.queue-count'] {
+	min-width: calc(18px / var(--sf-zoom, 1));
+	font-variant-numeric: tabular-nums;
+	text-align: center;
+}
+
+[data-role='attention.queue-selected'] {
+	color: var(--t1);
+	background: var(--l1);
+	box-shadow: inset 0 calc(-2px / var(--sf-zoom, 1)) var(--t1);
+}
+
+[data-role='attention.queue']:hover,
+[data-role='attention.queue-selected']:hover {
+	background: var(--l3);
+	color: var(--t1);
+}
+
+[data-role='attention.queue']:active,
+[data-role='attention.queue-selected']:active {
+	background: var(--l4);
+}
+
+[data-role='attention.next'],
+[data-role='attention.next-unavailable'],
+[data-role='attention.previous'],
+[data-role='attention.previous-unavailable'] {
+	display: flex;
+	flex: 0 0 auto;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	height: calc(22px / var(--sf-zoom, 1));
+	padding: 0 calc(5px / var(--sf-zoom, 1));
+	gap: calc(4px / var(--sf-zoom, 1));
+	border: calc(1px / var(--sf-zoom, 1)) solid var(--l2);
+	border-radius: calc(4px / var(--sf-zoom, 1));
+	background: transparent;
+	color: var(--t2);
+	font-size: calc(12px / var(--sf-zoom, 1));
+	font-weight: 600;
+	line-height: 1;
+	white-space: nowrap;
+}
+
+[data-role='attention.next']:hover,
+[data-role='attention.previous']:hover {
+	background: var(--l1);
+	border-color: var(--l3);
+	color: var(--t1);
+}
+
+[data-role='attention.next']:active,
+[data-role='attention.previous']:active {
+	background: var(--l2);
+	border-color: var(--l3);
+}
+
+[data-role='attention.next-icon'],
+[data-role='attention.previous-icon'] {
+	width: calc(12px / var(--sf-zoom, 1));
+	height: calc(12px / var(--sf-zoom, 1));
+	transform: translateY(calc(-2px / var(--sf-zoom, 1)));
+}
+
+[data-role='attention.gear'],
+[data-role='attention.gear-selected'],
+[data-role='attention.search'],
+[data-role='attention.search-unavailable'] {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	width: calc(24px / var(--sf-zoom, 1));
+	height: calc(24px / var(--sf-zoom, 1));
+	padding: calc(4px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.queue-count'] {
+	color: var(--accent);
+	font-weight: 600;
+	box-sizing: border-box;
+	height: calc(18px / var(--sf-zoom, 1));
+	border-radius: calc(3px / var(--sf-zoom, 1));
+	background: light-dark(color-mix(in srgb, var(--panel) 92%, var(--ink)), color-mix(in srgb, var(--panel) 30%, var(--dim)));
+	box-shadow: inset 0 calc(1px / var(--sf-zoom, 1)) calc(2px / var(--sf-zoom, 1)) light-dark(rgb(from var(--ink) r g b / 22%), var(--dim)),
+		inset 0 0 0 calc(1px / var(--sf-zoom, 1)) var(--l3), 0 calc(1px / var(--sf-zoom, 1)) 0 var(--l2);
+	text-align: center;
+}
+
+[data-role='attention.gear-icon'],
+[data-role='attention.search-icon'] {
+	width: calc(16px / var(--sf-zoom, 1));
+	height: calc(16px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.unavailable'],
+[data-role='attention.next-unavailable'],
+[data-role='attention.previous-unavailable'],
+[data-role='attention.search-unavailable'],
+[data-role='attention.row-main'] > [data-role='attention.unavailable'] {
+	color: var(--t3);
+	cursor: default;
+}
+
+[data-role='attention.triage'],
+[data-role='attention.cancel-navigation'] {
+	display: flex;
+	flex: 0 0 calc(24px / var(--sf-zoom, 1));
+	align-self: center;
+	align-items: center;
+	justify-content: center;
+	padding: calc(4px / var(--sf-zoom, 1));
+	color: var(--t2);
+}
+
+[data-role='attention.cancel-navigation'] {
+	flex: 0 0 auto;
+	font-size: calc(11px / var(--sf-zoom, 1));
+	line-height: calc(16px / var(--sf-zoom, 1));
+	white-space: nowrap;
+}
+
+[data-role='attention.triage-icon'],
+[data-role='attention.triage-icon'] .ico {
+	width: calc(12px / var(--sf-zoom, 1));
+	height: calc(12px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.settings'] {
+	box-sizing: border-box;
+	width: 100%;
+	max-width: calc(900px / var(--sf-zoom, 1));
+	padding: calc(12px / var(--sf-zoom, 1)) calc(14px / var(--sf-zoom, 1));
+	gap: calc(12px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.settings-title'] {
+	color: var(--t1);
+	font-size: calc(14px / var(--sf-zoom, 1));
+	font-weight: 600;
+}
+
+[data-role='attention.setting'] {
+	align-items: center;
+	justify-content: space-between;
+	flex-wrap: wrap;
+	gap: calc(10px / var(--sf-zoom, 1)) calc(20px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.setting-info'] {
+	flex: 1 1 calc(300px / var(--sf-zoom, 1));
+	min-width: 0;
+	gap: calc(2px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.setting-label'] {
+	color: var(--t1);
+	font-weight: 600;
+}
+
+[data-role='attention.setting-options'] {
+	flex: none;
+	align-items: stretch;
+	gap: calc(2px / var(--sf-zoom, 1));
+	padding: calc(3px / var(--sf-zoom, 1));
+	border: 1px solid var(--l2);
+	border-radius: calc(6px / var(--sf-zoom, 1));
+	background: var(--l1);
+}
+
+[data-role='attention.setting-options'] > [data-role] {
+	box-sizing: border-box;
+	min-width: calc(38px / var(--sf-zoom, 1));
+	padding: calc(4px / var(--sf-zoom, 1)) calc(8px / var(--sf-zoom, 1));
+	border-radius: calc(3px / var(--sf-zoom, 1));
+	color: var(--t2);
+	text-align: center;
+	white-space: nowrap;
+}
+
+[data-role='attention.setting-options'] > [data-role='attention.control']:hover {
+	background: var(--l3);
+	color: var(--t1);
+}
+
+[data-role='attention.setting-options'] > [data-role='attention.selected'] {
+	background: rgb(from var(--accent) r g b / 14%);
+	color: var(--accent);
+	box-shadow: inset 0 0 0 1px rgb(from var(--accent) r g b / 25%);
+}
+
+[data-role='attention.placement-controls'] {
+	flex: 0 1 auto;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: calc(8px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.placement-rows'] {
+	flex: 0 1 auto;
+	gap: calc(6px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.placement-scope'] {
+	min-width: calc(56px / var(--sf-zoom, 1));
+	color: var(--t2);
+	font-size: calc(12px / var(--sf-zoom, 1));
+	white-space: nowrap;
+}
+
+[data-role='attention.explanation'] {
+	min-width: 0;
+	color: var(--t2);
+	font-size: calc(12px / var(--sf-zoom, 1));
+	line-height: calc(17px / var(--sf-zoom, 1));
+	white-space: normal;
+}
+
+/* Workspace tree: one flat keyed list, indented by depth. */
+[data-role='workspace.row-0'],
+[data-role='workspace.row-1'],
+[data-role='workspace.row-2'],
+[data-role='workspace.row-3'] {
+	align-items: stretch;
+	min-width: 0;
+	border-bottom: 1px solid var(--l1);
+}
+
+[data-role='workspace.row-1'] { padding-left: calc(12px / var(--sf-zoom, 1)); }
+[data-role='workspace.row-2'] { padding-left: calc(24px / var(--sf-zoom, 1)); }
+[data-role='workspace.row-3'] { padding-left: calc(36px / var(--sf-zoom, 1)); }
+
+[data-role='workspace.main'],
+[data-role='workspace.main-current'] {
+	align-items: stretch;
+	min-width: 0;
+	gap: 0;
+}
+
+/* The current destination, wherever it sits in the tree. */
+[data-role='workspace.main-current'] {
+	background: rgb(from var(--accent) r g b / 10%);
+	box-shadow: inset calc(2px / var(--sf-zoom, 1)) 0 var(--accent);
+}
+
+[data-role='workspace.main'] > [data-role='attention.unavailable'],
+[data-role='workspace.main-current'] > [data-role='attention.unavailable'] {
+	display: flex;
+	flex: 1;
+	flex-direction: column;
+	align-items: stretch;
+	min-width: 0;
+	height: auto;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	font: inherit;
+	text-align: left;
+	padding: 0.35em 0.6em;
+	gap: calc(2px / var(--sf-zoom, 1));
+	color: var(--t3);
+	cursor: default;
+}
+
+[data-role='workspace.main'] > [data-role='attention.open'],
+[data-role='workspace.main-current'] > [data-role='attention.open'] {
+	padding: 0.3em 0.5em;
+}
+
+[data-role='workspace.toggle'],
+[data-role='workspace.toggle-none'] {
+	display: flex;
+	flex: 0 0 calc(22px / var(--sf-zoom, 1));
+	align-self: center;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	height: calc(22px / var(--sf-zoom, 1));
+	padding: calc(4px / var(--sf-zoom, 1));
+	border: 0;
+	background: transparent;
+	color: var(--t2);
+	font: inherit;
+	cursor: pointer;
+}
+
+[data-role='workspace.toggle']:hover {
+	background: var(--l1);
+	color: var(--t1);
+}
+
+[data-role='workspace.toggle-none'] {
+	cursor: default;
+}
+
+[data-role='workspace.section'],
+[data-role='workspace.aside'] {
+	display: flex;
+	box-sizing: border-box;
+	width: 100%;
+	align-items: center;
+	gap: calc(6px / var(--sf-zoom, 1));
+	padding: 0.25em 0.5em;
+	border: 0;
+	background: transparent;
+	color: var(--t2);
+	font: inherit;
+	font-size: calc(12px / var(--sf-zoom, 1));
+	text-align: left;
+	cursor: pointer;
+}
+
+[data-role='workspace.section']:hover,
+[data-role='workspace.aside']:hover {
+	background: var(--l1);
+	color: var(--t1);
+}
+
+[data-role='workspace.title'],
+[data-role='workspace.title-dim'] {
+	flex: 0 1 auto;
+	min-width: 0;
+	font: inherit;
+}
+
+[data-role='workspace.title'] {
+	font-weight: 600;
+	color: var(--t1);
+}
+
+/* Reference, Finished for now and set-aside conversations stay visible but quiet. */
+[data-role='workspace.title-dim'] {
+	flex: 0 2 auto;
+	font-weight: 400;
+	color: var(--t2);
+}
+
+[data-role='workspace.count'] {
+	flex: 0 0 auto;
+	white-space: nowrap;
+	font-size: calc(11px / var(--sf-zoom, 1));
+	line-height: calc(16px / var(--sf-zoom, 1));
+	color: var(--t2);
+	font-variant-numeric: tabular-nums;
+}
+
+[data-role='workspace.context'] {
+	flex: 0 1 auto;
+	min-width: 0;
+	max-width: 100%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: calc(11px / var(--sf-zoom, 1));
+	line-height: calc(16px / var(--sf-zoom, 1));
+	color: var(--t2);
+	font-variant-numeric: tabular-nums;
+}
+
+/* Beside a title (group rows) the short context keeps its width and the title ellipsizes instead. */
+[data-role='attention.summary'] > [data-role='workspace.context'] {
+	flex: 0 0 auto;
+}
+
+/* Block `attention.queue` is read on a phone: rows, the section control and the dock button are touch sized. */
+.sf-main[data-surface='plugin.attention.queue'] .queue-label,
+.sf-main[data-surface='plugin.attention.queue'] .queue-tab {
+	font-family: system-ui, sans-serif;
+	font-size: 15px;
+	line-height: 1.4;
+	letter-spacing: normal;
+	white-space: normal;
+	overflow-wrap: anywhere;
+	min-width: 0;
+}
+
+.sf-main[data-surface='plugin.attention.queue'] .queue-label[data-tone='muted'],
+.sf-main[data-surface='plugin.attention.queue'] .queue-tab {
+	color: var(--sf-c-muted);
+}
+
+.sf-main[data-surface='plugin.attention.queue'] .queue-label[data-tone='warning'] {
+	color: var(--sf-c-warning);
+}
+
+.sf-main[data-surface='plugin.attention.queue'] .queue-session {
+	font-weight: 600;
+}
+
+.sf-main[data-surface='plugin.attention.queue'] .queue-tab {
+	font-weight: 400;
+}
+
+.sf-main[data-surface='plugin.attention.queue'] [data-role='attention.queue.meta'] {
+	flex-wrap: wrap;
+}
+
+.sf-main[data-surface='plugin.attention.queue'] [data-role^='attention.queue.row'] {
+	min-height: 44px;
+	padding: 12px 4px;
+	border-bottom: 1px solid var(--l1);
+}
+
+.sf-main[data-surface='plugin.attention.queue'] [data-role='attention.queue.row']:active {
+	background: var(--l1);
+}
+
+.sf-main[data-surface='plugin.attention.queue'] [data-role='attention.queue.row-off'] {
+	opacity: 0.65;
+}
+
+.sf-main[data-surface='plugin.attention.queue'] .sf-tabs.seg {
+	display: flex;
+	width: 100%;
+	min-height: 48px;
+}
+
+.sf-main[data-surface='plugin.attention.queue'] .sf-tabs.seg .sf-tab {
+	flex: 1 1 auto;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	min-height: 44px;
+	min-width: 0;
+	padding: 8px 6px;
+	white-space: normal;
+	font-size: 15px;
+}
+
+.sf-dock[data-surface='plugin.attention.queue'] .sf-button {
+	height: 44px;
+	font-size: 15px;
+}

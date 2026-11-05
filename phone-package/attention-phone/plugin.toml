@@ -1,0 +1,7 @@
+schema = 1
+id = "attention"
+name = "Attention (phone)"
+version = "0.3.0"
+description = "PHONE ONLY, never install on the Mac (same id as the Mac plugin). Tap an Attention queue row to jump to that conversation"
+icon = "bell"
+window = "window.luau"
