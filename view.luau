@@ -1193,7 +1193,6 @@ function view.render(renderer, logical, presentation, options)
 	if status == "loading" then coverageLine("status", "Loading conversation state · total unknown")
 	elseif status == "unsaved" then coverageLine("status", "Attention changes not saved")
 	elseif status == "unavailable" then coverageLine("status", "Conversation state unavailable · last known evidence only") end
-	if retained > 0 then coverageLine("retained", retained .. " retained with no open pane · " .. reachable .. " reachable Attention conversations") end
 	coverageLine("message", presentation.message)
 	coverageLine("notice", options.notice)
 	local coverage = node("col", { key = "coverage", role = "attention.coverage", gap = "xs", hidden = #coverageLines == 0 }, coverageLines)
