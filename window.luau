@@ -2572,8 +2572,10 @@ intents.install = function()
 		local model = if destination.conversation ~= nil then destination.model else nil
 		-- `tab` and `session` name the place itself (the owning tab and its session) for the Workspace region header,
 		-- structured rather than re-parsed from `context`.
+		-- `workId` names the conversation shown there, so its queue rows can mark themselves current too.
 		return { key = key, title = destination.title, context = table.concat(context, " · "), model = model,
-			tab = tabTitle, session = sessionName }
+			tab = tabTitle, session = sessionName,
+			workId = if destination.conversation ~= nil then destination.conversation.workId else nil }
 	end
 
 	-- Saved navigator state (D3) is restored once per ownership epoch, before an intent or render first uses `logical`.
@@ -4510,7 +4512,11 @@ tern.on("canvas_action", function(ev, cx)
 		if binding.op == "previous" then previousPane(cx, data); return end
 		if binding.op == "search" then intents.searchWorkspace(cx, data); return end
 		if binding.op == "reveal" then intents.revealCurrent(cx, data); return end
-		if binding.op == "workspace-open" then intents.openWorkspaceKey(cx, binding.key, binding.signature, data); return end
+		if binding.op == "workspace-open" then
+			if view.restoreGroup(logical, binding.key) then saveUi(cx, view.ui(logical)) end
+			intents.openWorkspaceKey(cx, binding.key, binding.signature, data)
+			return
+		end
 		if binding.op == "route-open" then intents.routeOpen(cx, binding, data); return end
 		if binding.op == "native-menu" then intents.nativeMenu(cx, rail, binding); return end
 		if binding.op == "queue-menu" then intents.queueMenu(cx, binding); return end

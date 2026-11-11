@@ -1873,11 +1873,20 @@ do
 		assert(not entryFor(entries, "workspace-open", "pane:local#" .. pane), "panes inside a tab are not Workspace rows")
 	end
 	local collapsed = collectWorkspace(input, { collapsed = { [harbor.key] = true } })
-	local groupEntry, restore = entryFor(collapsed, "workspace-toggle", harbor.key)
-	assert(groupEntry and groupEntry.node.p.role == "workspace.minimized-line" and restore.expanded == false,
-		"a minimized session leaves the host's list for its Minimized group, restored by its + strip")
+	local groupEntry = entryFor(collapsed, "workspace-open", harbor.key)
+	assert(groupEntry and groupEntry.node.p.role == "workspace.minimized-line"
+		and not entryFor(collapsed, "workspace-toggle", harbor.key),
+		"a minimized session leaves the host's list for its Minimized group, with no fold of its own there")
 	assert(textOf(childAt(groupEntry.node, "toggle")) == "Minimized (1)", "the group counts its sessions")
-	assert(entryFor({ groupEntry }, "workspace-open", harbor.key), "a minimized session's name still jumps to it")
+	-- Its +, its name and its tab count all go to the session, which restores it: none is a dead click.
+	local goes = 0
+	for _, binding in ipairs(bindingsOf(groupEntry)) do
+		if binding.op == "workspace-open" and binding.key == harbor.key then
+			assert(binding.signature == harbor.signature, "each opens the session the user saw")
+			goes += 1
+		end
+	end
+	assert(goes == 3, "a minimized box's +, name and tab count each go to its session")
 	assert(not entryFor(collapsed, "workspace-open", named), "a minimized session hides its tabs")
 	assert(entryFor(collapsed, "workspace-open", "tab:local#" .. census.tab.reference), "other sessions are untouched")
 	local groupAt, emptyAt
@@ -2460,18 +2469,52 @@ do
 		"the model keeps its line role; a recorded age keeps the recorded style")
 	assert(string.find(modeledDetail.c[5].p.title, "cannot be read right now", 1, true), "the recorded age's tooltip says why")
 
-	-- A Working row says nothing on line two until its agent's last recorded activity is STALL_AFTER_SECONDS old.
-	for _, case in ipairs({ { since = 1100, text = "" }, { since = 1000, text = "Stalled 10m" }, { since = -5600, text = "Stalled 2h" } }) do
+	-- A Working row's line two follows what its agent waits on: a model call is quiet until 15m, then Stalled; a tool
+	-- is named after a minute and Stalled only past an hour; with nothing known in flight, it never claims a stall.
+	for _, case in ipairs({
+		{ wait = "model", since = 1100, text = "" },
+		{ wait = "model", since = 600, text = "Stalled 16m", tip = "No reply from the model · asked 16 minutes ago" },
+		{ wait = "tool", tool = "eval", since = 1570, text = "" },
+		{ wait = "tool", tool = "eval", since = 1360, text = "Running eval 4m", tip = "Running eval · started 4 minutes ago" },
+		{ wait = "tool", tool = "wait", since = 400, text = "Waiting on jobs 20m" },
+		{ wait = "tool", tool = "bash", since = -2000, text = "Stalled · Running bash 1h" },
+		{ since = -5600, text = "" },
+	}) do
 		local busy = railItem(5)
 		busy.nativeState, busy.attention, busy.reviewRevision = "working", false, nil
-		busy.need = { kind = "working", text = "Working", sinceUtc = case.since }
+		busy.need = { kind = "working", text = "Working", sinceUtc = case.since, wait = case.wait, tool = case.tool }
 		local busyRow = childAt(sectionRows(railScreen("rail-working", { busy }), "working"), "r5")
-		assert(textOf(detailOf(busyRow)) == case.text, "working since " .. case.since .. ": " .. textOf(detailOf(busyRow)))
-		if case.text ~= "" then
-			assert(roleTitle(busyRow, "attention.need") == "Working · last recorded activity "
-				.. (if case.since == 1000 then "10 minutes ago" else "2 hours ago"), "the stall's tooltip says since when")
-		end
+		local detail = textOf(detailOf(busyRow))
+		local line = string.gsub(string.gsub(detail, "\n·\n", " · "), "\n", " ")
+		local need = roleText(busyRow, "attention.need") or ""
+		assert(need == case.text, (case.wait or "unknown") .. " since " .. case.since .. ": " .. line)
+		if case.tip then assert(roleTitle(busyRow, "attention.need") == case.tip, roleTitle(busyRow, "attention.need")) end
 	end
+
+	-- The focused pane's conversation is marked current in its queue row too, like its Workspace box.
+	local focusedItem, otherItem = railItem(8), railItem(9)
+	local focusedScreen = railScreen("rail-current", { focusedItem, otherItem }, nil, { current = { workId = focusedItem.workId } })
+	local focusedRows = sectionRows(focusedScreen, "attention")
+	assert(childAt(childAt(focusedRows, "r8"), "main").p.role == "attention.row-main-current"
+		and childAt(childAt(focusedRows, "r9"), "main").p.role == "attention.row-main", "only the focused conversation is current")
+
+	-- A limit with a known reset rests out of Attention: folded under one line at its bottom (closed until opened),
+	-- the row says how long until the provider serves again.
+	local asking, limited = railItem(6), railItem(7)
+	limited.attention, limited.resting = false, 1600 + 7500
+	limited.need = { kind = "resting", text = "Usage limit", untilUtc = limited.resting }
+	local restScreen, restLogical, restRenderer, restInput = railScreen("rail-resting", { asking, limited })
+	local attentionRows = sectionRows(restScreen, "attention")
+	assert(childAt(attentionRows, "r7") == nil and childAt(attentionRows, "r6") ~= nil, "a resting row is not an Attention row")
+	local restToggle = childAt(attentionRows, "resting-toggle")
+	assert(restToggle and roleText(restToggle, "workspace.sub-label") == "Waiting on reset (1)" and childAt(attentionRows, "resting") == nil,
+		"the waiting group starts folded with its count")
+	local restBinding = view.resolve(restRenderer, restToggle.p.actions.click)
+	view.toggleGroup(restLogical, restBinding.key, restBinding.expanded)
+	restScreen = paint(restRenderer, restLogical, restInput, restScreen, { position = "right", nowUtc = 1600 })
+	local restingRow = childAt(childAt(sectionRows(restScreen, "attention"), "resting"), "r7")
+	assert(restingRow and roleText(restingRow, "attention.need") == "Usage limit · back in 2h",
+		tostring(restingRow and roleText(restingRow, "attention.need")))
 
 	view.expand(logical, item.workId)
 	screen = paint(renderer, logical, input, screen, { position = "right", nowUtc = 1600 })
@@ -2935,7 +2978,7 @@ do
 	end
 	assert(count(rowNode, "attention.session-cell") == 1 and count(rowNode, "attention.summary") == 1
 		and count(rowNode, "attention.metadata") == 1, "bottom rows keep the session column and both lines")
-	assert(count(rowNode, "attention.triage") == 2 and count(rowNode, "attention.line") == 0 and count(rowNode, "attention.chips") == 0)
+	assert(count(rowNode, "attention.triage") == 1 and count(rowNode, "attention.more") == 1 and count(rowNode, "attention.line") == 0 and count(rowNode, "attention.chips") == 0)
 	assert(roleText(rowNode, "attention.runtime") == "Idle" and roleText(rowNode, "attention.priority") == "P1")
 	assert(findAction(screen, renderer, "details", item.workId) and findAction(screen, renderer, "menu", item.workId))
 end

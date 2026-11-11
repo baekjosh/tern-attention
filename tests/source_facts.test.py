@@ -8,6 +8,7 @@ import contextlib
 import io
 import importlib.util
 import json
+import sqlite3
 from pathlib import Path
 import shutil
 import subprocess
@@ -550,6 +551,35 @@ class SourceFactsTests(unittest.TestCase):
             self.assertNotIn("lastError", recovered, kind)
             self.assertEqual(recovered["lastFinal"]["id"], "retried")
 
+    def test_a_limit_names_when_the_provider_can_serve_again_from_omps_account_blocks(self):
+        # omp's layout: <agent>/sessions/<cwd>/<file>.jsonl beside <agent>/agent.db. The request runs at 1793235700.
+        agent = Path(self.tmp.name) / "agent"
+        self.path = agent / "sessions" / "-project" / "session.jsonl"
+        self.path.parent.mkdir(parents=True)
+        failed = assistant("", "error", provider="openai-codex",
+                           errorMessage="Codex error event: The usage limit has been reached (code=usage_limit_reached)")
+        self.write([header(), entry("failed", message=failed)])
+        self.assertNotIn("limit", self.request()["lastError"], "no store: the reset is unknown, never guessed")
+        store = sqlite3.connect(agent / "agent.db")
+        store.executescript("""
+            CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT NOT NULL, disabled_cause TEXT);
+            CREATE TABLE auth_credential_blocks (credential_id INTEGER NOT NULL, provider_key TEXT NOT NULL,
+                block_scope TEXT NOT NULL DEFAULT '', blocked_until_ms INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+            INSERT INTO auth_credentials VALUES (1, 'openai-codex', NULL), (2, 'openai-codex', NULL),
+                (3, 'openai-codex', 'revoked'), (4, 'anthropic', NULL);
+            INSERT INTO auth_credential_blocks VALUES (1, 'openai-codex', '', 1793239300000, 0),
+                (1, 'openai-codex', 'spark', 1793249300000, 0), (2, 'openai-codex', '', 1793237500000, 0),
+                (2, 'openai-codex', '', 1793235000000, 0);
+        """)
+        store.commit()
+        # Both enabled accounts are blocked: the provider serves again when the first frees (account 2, its longest
+        # live block); the revoked account and another provider's account do not count.
+        self.assertEqual(self.request()["lastError"]["limit"], {"status": "blocked", "untilUtc": 1793237500})
+        store.execute("DELETE FROM auth_credential_blocks WHERE credential_id = 2")
+        store.commit()
+        store.close()
+        self.assertNotIn("limit", self.request()["lastError"], "no block is not a reset: nothing is claimed")
+
     def test_last_activity_is_the_newest_assistant_or_tool_record_not_human_input(self):
         tool = {"role": "toolResult", "toolName": "bash", "toolCallId": "call", "content": [{"type": "text", "text": "PRIVATE"}],
                 "isError": False, "timestamp": 1793235900000}
@@ -558,6 +588,22 @@ class SourceFactsTests(unittest.TestCase):
         result = self.request()
         self.assertEqual(result["lastActivityAtUtc"], 1793235900)
         self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_in_flight_names_the_running_tool_then_the_model_then_nothing(self):
+        start = {"customType": "tool_execution_start",
+                 "data": {"toolCallId": "call", "toolName": "eval", "startedAt": "2026-10-29T01:05:00Z"}}
+        tool = {"role": "toolResult", "toolName": "eval", "toolCallId": "call", "content": [{"type": "text", "text": "x"}],
+                "isError": False, "timestamp": 1793235900000}
+        records = [header(), entry("a", message=assistant("", "toolUse")), entry("s", "a", **start)]
+        self.write(records)
+        self.assertEqual(self.request()["inFlight"],
+                         {"kind": "tool", "tool": "eval", "count": 1, "sinceUtc": 1793235900})
+        records.append(entry("tool", "s", tool))
+        self.write(records)
+        self.assertEqual(self.request()["inFlight"], {"kind": "model", "sinceUtc": 1793235900})
+        records.append(entry("done", "tool", assistant("Finished")))
+        self.write(records)
+        self.assertNotIn("inFlight", self.request())
 
     def test_factual_projection_has_no_generative_input_or_interpretation(self):
         self.write([header(), entry("user", message={"role": "user", "attribution": "user",

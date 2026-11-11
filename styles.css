@@ -64,7 +64,7 @@
 }
 
 [data-role='attention.workspace-rows'] .sf-list-slot > [data-role='workspace.ledger'] {
-	background: rgb(from var(--t1) r g b / 4%) !important;
+	background: transparent !important;
 }
 
 [data-role='attention.workspace-rows'] .sf-list-slot > [data-role='workspace.ledger-current'] {
@@ -112,7 +112,8 @@
 /* A row button sizes to its content: Tern gives buttons a fixed one-line height unless it is reset here. */
 [data-role='attention.open'],
 [data-role='attention.open-pending'],
-[data-role='attention.row-main'] > [data-role='attention.unavailable'] {
+[data-role='attention.row-main'] > [data-role='attention.unavailable'],
+[data-role='attention.row-main-current'] > [data-role='attention.unavailable'] {
 	display: flex;
 	flex: 1;
 	flex-direction: column;
@@ -707,7 +708,8 @@
 [data-role='attention.next-unavailable'],
 [data-role='attention.previous-unavailable'],
 [data-role='attention.search-unavailable'],
-[data-role='attention.row-main'] > [data-role='attention.unavailable'] {
+[data-role='attention.row-main'] > [data-role='attention.unavailable'],
+[data-role='attention.row-main-current'] > [data-role='attention.unavailable'] {
 	color: var(--t3);
 	cursor: default;
 }
@@ -852,8 +854,8 @@
 	white-space: nowrap;
 }
 
-/* Session block: one rounded, filled box is the group; the label column inside it centers the session's name
-   against its rows, its right hairline the spine of the ledger. */
+/* Session block: one outlined box is the group, on the rail's own background; the label column inside it centers
+   the session's name against its rows, its right hairline the spine of the ledger. Only the current box is filled. */
 [data-role='workspace.ledger'],
 [data-role='workspace.ledger-current'] {
 	display: flex;
@@ -862,8 +864,11 @@
 	box-sizing: border-box;
 	border: 1px solid rgb(from var(--t1) r g b / 24%);
 	border-radius: 0;
-	background: rgb(from var(--t1) r g b / 4%);
 	margin-bottom: calc(4px / var(--sf-zoom, 1));
+}
+
+[data-role='workspace.ledger-current'] {
+	background: rgb(from var(--t1) r g b / 10%);
 }
 
 [data-role='workspace.ledger-label'] {
@@ -983,7 +988,7 @@
    inner edges); the text keeps its inset here instead. */
 [data-role='workspace.main'],
 [data-role='workspace.main-current'] {
-	padding-right: calc(4px / var(--sf-zoom, 1));
+	padding-right: 0;
 }
 
 [data-role='workspace.main'] > [data-role='attention.open'],
@@ -1281,14 +1286,34 @@
 	justify-content: flex-end;
 }
 
-/* The Workspace well: one step below panel with a hairline lip under the divider, so the
-   queues above read as the raised stratum and the split as a change of depth. */
-[data-role='attention.workspace-region'] {
-	background: light-dark(
-		color-mix(in srgb, var(--panel) 96%, var(--ink)),
-		color-mix(in srgb, var(--panel) 72%, #000)
-	);
-	border-top: 1px solid var(--l3);
+/* Both regions sit on the terminal's own black: the native split box's white wash is cancelled, and the Workspace
+   region adds no fill of its own. The seam alone marks the split: a line as strong as the session boxes' outlines,
+   with a short centred grip that brightens under the pointer and while dragging. The native handle keeps its
+   own hit area; the grip takes no pointer events. */
+.sf-split-box {
+	background: transparent !important;
+}
+
+.sf-split-box > .sf-split-handle {
+	background: rgb(from var(--t1) r g b / 24%) !important;
+}
+
+.sf-split-box > .sf-split-handle > .sf-split-grip {
+	width: calc(28px / var(--sf-zoom, 1)) !important;
+	height: calc(3px / var(--sf-zoom, 1)) !important;
+	margin: calc(-1.5px / var(--sf-zoom, 1)) 0 0 calc(-14px / var(--sf-zoom, 1)) !important;
+	border-radius: calc(2px / var(--sf-zoom, 1)) !important;
+	background: rgb(from var(--t1) r g b / 40%) !important;
+	opacity: 1 !important;
+	transform: none !important;
+}
+
+.sf-split-box > .sf-split-handle:hover > .sf-split-grip {
+	background: rgb(from var(--t1) r g b / 75%) !important;
+}
+
+.sf-split-box > .sf-split-handle:is(.held, .active) > .sf-split-grip {
+	background: var(--t1) !important;
 }
 
 /* Top region, pinned line: Next / Previous, then Search and More at the right. The buttons are outlined boxes, so
@@ -1367,7 +1392,8 @@
 	box-sizing: border-box;
 	min-width: 0;
 	min-height: calc(28px / var(--sf-zoom, 1));
-	padding-right: 0.5em;
+	/* Flush right: every header ⋯ (and the place card's −) sits in the gear's column, over the rows' ⋯ column. */
+	padding-right: 0;
 	background: rgb(from var(--panel) r g b / 100%);
 	border-bottom: 1px solid var(--l1);
 }
@@ -1385,7 +1411,8 @@
 	display: flex;
 	flex-direction: column;
 	box-sizing: border-box;
-	padding: 0 calc(8px / var(--sf-zoom, 1));
+	/* No side inset: the place card spans the session boxes' width, its − under the gear. */
+	padding: 0;
 	background: rgb(from var(--panel) r g b / 100%);
 	border-top: 1px solid var(--l2);
 	border-bottom: 1px solid var(--l2);
@@ -1769,14 +1796,22 @@
 	color: var(--t1);
 }
 
-/* A minimized box: one short line, its tab count where the rows would be. */
+/* A minimized box: one short line, its tab count where the rows would be; the line goes to the session. */
 [data-role='workspace.ledger-count'] {
 	display: flex;
 	align-items: center;
+	box-sizing: border-box;
+	width: 100%;
 	min-height: calc(26px / var(--sf-zoom, 1));
 	padding-left: calc(12px / var(--sf-zoom, 1));
 	font-size: calc(12px / var(--sf-zoom, 1));
 	color: var(--t3);
+	text-align: left;
+}
+
+[data-role='workspace.ledger-count']:hover {
+	background: rgb(from var(--t1) r g b / 10%);
+	color: var(--t1);
 }
 
 [data-role='workspace.minimized-boxes'] > [data-role='workspace.ledger'],
@@ -1816,3 +1851,96 @@
 	overflow-wrap: anywhere;
 }
 
+
+/* Every row is contained the way a Workspace session box is: the ⋯ is a full-height column of its own, divided by
+   the ledger's hairline like the − strip on the box's left edge. */
+[data-role='workspace.main'] > [data-role='attention.more'],
+[data-role='workspace.main-current'] > [data-role='attention.more'],
+[data-role='attention.stack'] [data-role='attention.row-main'] > [data-role='attention.more'],
+[data-role='attention.row-main-current'] > [data-role='attention.more'] {
+	/* 23px plus the box's 1px outline: the column spans the gear's and the header ⋯'s 24px. */
+	flex: 0 0 calc(23px / var(--sf-zoom, 1));
+	align-self: stretch;
+	height: auto;
+	padding: 0;
+	border-left: 1px solid rgb(from var(--t1) r g b / 18%);
+}
+
+/* Rail queue rows are ledger boxes: one outline per conversation, the session column and the body as full-height
+   cells. The current conversation (the focused pane's) takes the current session box's fill and ring. */
+[data-role='attention.stack'] [data-role='attention.row'] {
+	box-sizing: border-box;
+	border: 1px solid rgb(from var(--t1) r g b / 24%);
+	margin-bottom: calc(4px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.stack'] [data-role='attention.row']:has(> [data-role='attention.row-main-current']) {
+	border-color: rgb(from var(--t1) r g b / 55%);
+}
+
+[data-role='attention.stack'] [data-role='attention.row-main'],
+[data-role='attention.row-main-current'] {
+	padding-right: 0;
+	align-items: stretch;
+	min-width: 0;
+	gap: 0;
+}
+
+[data-role='attention.row-main-current'] {
+	background: rgb(from var(--t1) r g b / 10%);
+}
+
+[data-role='attention.stack'] [data-role='attention.open'],
+[data-role='attention.stack'] [data-role='attention.open-pending'] {
+	padding: 0;
+}
+
+[data-role='attention.stack'] [data-role='attention.cells'] {
+	align-items: stretch;
+	gap: 0;
+}
+
+[data-role='attention.stack'] [data-role='attention.rail-session-cell'] {
+	padding: 0 calc(8px / var(--sf-zoom, 1));
+	border-right: 1px solid rgb(from var(--t1) r g b / 18%);
+}
+
+[data-role='attention.stack'] [data-role='attention.body'] {
+	flex: 1 1 auto;
+	min-width: 0;
+	padding: 0.35em 0.6em;
+}
+
+/* Vertical space is the rail's scarcest resource: the tools line starts at the pane's top edge, without the native
+   region's and split body's top padding above it. */
+.sf-region:has([data-role='attention.regions']) {
+	padding-top: 0 !important;
+}
+
+.sf-split-box:has([data-role='attention.region']) > .sf-split-pane:first-child > .sf-split-body {
+	padding-top: 0 !important;
+}
+
+/* A header's ⋯ is an outlined box like the gear and Search buttons it lines up under. */
+[data-role='attention.section-head'] > [data-role='attention.more'] {
+	box-sizing: border-box;
+	flex: 0 0 calc(24px / var(--sf-zoom, 1));
+	height: calc(24px / var(--sf-zoom, 1));
+	padding: 0;
+	border: 1px solid rgb(from var(--t1) r g b / 24%);
+	border-radius: calc(2px / var(--sf-zoom, 1));
+	background: rgb(from var(--t1) r g b / 4%);
+}
+
+/* The place card's − is the same box in the same column. */
+[data-role='attention.region-toggle'] {
+	box-sizing: border-box;
+	border: 1px solid rgb(from var(--t1) r g b / 24%) !important;
+	border-radius: calc(2px / var(--sf-zoom, 1));
+	background: rgb(from var(--t1) r g b / 4%);
+}
+
+[data-role='attention.section-head'] > [data-role='attention.more']:hover,
+[data-role='attention.region-toggle']:hover {
+	background: rgb(from var(--t1) r g b / 10%);
+}

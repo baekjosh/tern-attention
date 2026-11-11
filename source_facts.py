@@ -12,7 +12,7 @@ source plus observed records is not an attestation of the installed binary.
 
 Per-field trust (coverage.fields). Every consumed fact belongs to one field:
   clock      lastHuman, lastAssistant, lastTerminal, lastFinal, lastInteraction*,
-             lastActivityAtUtc, lastError
+             lastActivityAtUtc, lastError, inFlight
   questions  questions, questionOutcomes, questionCoverage
 A field is "supported" when every record it reads parsed under a known shape and
 the selected ancestry was replayed whole; otherwise "unknown". A record whose
@@ -69,15 +69,17 @@ from collections import deque
 from datetime import datetime
 import hashlib
 from html.parser import HTMLParser
+from pathlib import Path
 import json
 import math
 import os
 import re
+import sqlite3
 import stat
 import sys
 import time
 
-ADAPTER = "omp-facts-v3"
+ADAPTER = "omp-facts-v5"
 SUPPORTED_WRITERS = frozenset(("18.12.5", "18.12.6", "18.13.0", "18.13.1", "18.13.2", "18.13.3",
                                "18.14.0", "18.14.1", "18.14.2", "18.15.0", "18.16.0",
                                "18.18.0", "18.18.1", "18.18.2", "18.18.3", "18.18.5", "18.18.6", "18.18.7"))
@@ -96,6 +98,11 @@ MAX_TEXT = 2000
 REPLY_TEXT = 300
 MAX_QUESTIONS = 32
 MAX_TRACKED_QUESTIONS = 512
+MAX_RUNNING_TOOLS = 64  # parallel tool calls tracked at once; more are not waited on by name
+MAX_TOOL_NAME = 64
+MAX_LIMIT_ACCOUNTS = 256  # accounts of one provider read from omp's store
+LIMIT_DB_SECONDS = 0.25  # wait on omp's store lock at most this long
+LIMIT_KINDS = frozenset(("usage_limit", "rate_limit"))
 MAX_RESULT_BYTES = 128 * 1024
 MAX_REQUEST_BYTES = 256 * 1024
 # An HTML-form ask larger or deeper than this is not parsed; its questions field reads unknown.
@@ -603,6 +610,16 @@ def normalize(entry):
     """One record's facts, or None. Raises SourceProblem("partial") when the record's shape is unknown, which demotes
     every field; a shape problem confined to ask questions/answers is returned in `problems` as (field, reason)."""
     kind, ident = entry.get("type"), entry["id"]
+    # omp marks each tool call as it starts running; a start with no result yet is the tool the agent is waiting on.
+    if kind == "custom" and entry.get("customType") == "tool_execution_start":
+        data = entry.get("data")
+        call_id = data.get("toolCallId") if isinstance(data, dict) else None
+        if not isinstance(call_id, str) or not call_id:
+            return None
+        name = data.get("toolName")
+        start = {"kind": "tool_start", "id": ident, "callId": call_id,
+                 "toolName": name[:MAX_TOOL_NAME] if isinstance(name, str) and name else "tool"}
+        return with_time(start, "atUtc", recorded_time(data.get("startedAt")) or recorded_time(entry.get("timestamp")))
     if kind != "message":
         if kind not in METADATA_TYPES:
             raise SourceProblem("partial", "unsupported-entry-type")
@@ -638,6 +655,8 @@ def normalize(entry):
                   "timeKind": "completed" if completed is not None else "recorded", **bounded_text(text), "asks": []}
         if stop == "error":
             result["errorKind"] = provider_error_kind(message)
+            provider = message.get("provider")
+            result["provider"] = provider[:MAX_TOOL_NAME] if isinstance(provider, str) and provider else None
         with_time(result, "atUtc", assistant_at)
         content = message.get("content")
         try:
@@ -652,7 +671,8 @@ def normalize(entry):
             result["asks"], result["problems"] = [], [("questions", problem.reason)]
         return result
     if role == "toolResult":
-        tool = with_time({"kind": "tool", "id": ident}, "atUtc", at)
+        call_id = message.get("toolCallId")
+        tool = with_time({"kind": "tool", "id": ident, "callId": call_id if isinstance(call_id, str) else None}, "atUtc", at)
         if message.get("toolName") != "ask":
             return tool
         try:
@@ -664,6 +684,30 @@ def normalize(entry):
     if role in ("bashExecution", "branchSummary", "compactionSummary", "hookMessage"):
         return None
     raise SourceProblem("partial", "unsupported-message-role")
+
+
+def provider_limit(database, provider, now):
+    """omp's own deadline for a limited provider: it blocks an account until a deadline when it hits a limit, and
+    deletes the block once that passes. {"status": "blocked", "untilUtc"} while every enabled account of the provider
+    is blocked (until the first frees); otherwise None. No block is not a reset: an expired or never-written block
+    says nothing about the plan, so nothing is claimed."""
+    try:
+        connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True, timeout=LIMIT_DB_SECONDS)
+    except (sqlite3.Error, ValueError):
+        return None
+    try:
+        rows = connection.execute(
+            "SELECT c.id, MAX(b.blocked_until_ms) FROM auth_credentials AS c "
+            "LEFT JOIN auth_credential_blocks AS b ON b.credential_id = c.id AND b.blocked_until_ms > ? "
+            "WHERE c.provider = ? AND c.disabled_cause IS NULL GROUP BY c.id LIMIT ?",
+            (int(now * 1000), provider, MAX_LIMIT_ACCOUNTS)).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    if not rows or any(until is None for _, until in rows):
+        return None
+    return {"status": "blocked", "untilUtc": min(until for _, until in rows) / 1000}
 
 
 def observation(info, target):
@@ -726,6 +770,9 @@ def resolve_answer(question, result, at):
 
 def project(chain, complete, coverage):
     facts, questions, calls = {}, deque(), {}
+    # What a working agent is waiting on at the branch's end: tool calls started without a result, else the model
+    # since the prompt or tool result that started its call. A terminal assistant turn waits on nothing.
+    running, model_since = {}, None
     question_count, summary_count = 0, 0
     control_roles = {}
     for record in chain:
@@ -734,6 +781,7 @@ def project(chain, complete, coverage):
         kind = record["kind"]
         if kind == "reset_boundary":
             facts, questions, calls = {}, deque(), {}
+            running, model_since = {}, None
             question_count, summary_count, control_roles = 0, 0, {}
             continue
         if kind == "control":
@@ -744,8 +792,20 @@ def project(chain, complete, coverage):
             summary_count += 1
             continue
         at, ident = record.get("atUtc"), record["id"]
+        if kind == "tool_start":
+            if at is not None and len(running) < MAX_RUNNING_TOOLS:
+                running[record["callId"]] = (at, record["toolName"])
+            continue
         if kind in ("assistant", "tool", "answer") and at is not None:
             facts["lastActivityAtUtc"] = max(at, facts.get("lastActivityAtUtc", at))
+        if kind in ("tool", "answer"):
+            running.pop(record.get("callId"), None)
+        if kind in ("user", "tool", "answer"):
+            model_since = at
+        elif kind == "assistant":
+            model_since = None
+            if record["stopReason"] in TERMINALS:
+                running = {}
         if kind == "user":
             human = with_time({"id": ident, "provenance": record["provenance"]}, "atUtc", at)
             if record["provenance"] == "user" or "lastHuman" not in facts:
@@ -764,7 +824,10 @@ def project(chain, complete, coverage):
                                                "textTruncated": clipped}, "atUtc", at)
             # Only the newest assistant turn's ending counts: a later turn of any kind clears a provider error.
             if stop == "error":
-                facts["lastError"] = with_time({"id": ident, "kind": record["errorKind"]}, "atUtc", at)
+                failure = {"id": ident, "kind": record["errorKind"]}
+                if record["provider"]:
+                    failure["provider"] = record["provider"]
+                facts["lastError"] = with_time(failure, "atUtc", at)
             else:
                 facts.pop("lastError", None)
             for question in record["asks"]:
@@ -841,6 +904,11 @@ def project(chain, complete, coverage):
     }
     coverage.update(controlsExcluded=sum(control_roles.values()), controlRolesExcluded=control_roles,
                     summariesExcluded=summary_count)
+    if running:
+        since, name = min(running.values())
+        facts["inFlight"] = {"kind": "tool", "tool": name, "count": len(running), "sinceUtc": since}
+    elif model_since is not None:
+        facts["inFlight"] = {"kind": "model", "sinceUtc": model_since}
     return facts
 
 
@@ -1178,6 +1246,11 @@ def read_target(target, now):
         result["questionCoverage"] = {"status": "unknown", "knownTotal": 0, "included": 0, "omitted": 0}
         result.update(project(replay_offsets(path, target, revision, reversed(chain), metrics, deadline),
                               complete, coverage))
+        failure = result.get("lastError")
+        if failure and failure["kind"] in LIMIT_KINDS and failure.get("provider"):
+            limit = provider_limit(Path(path).parents[2] / "agent.db", failure["provider"], now)
+            if limit is not None:
+                failure["limit"] = limit
         result = fit_output(result)
         result["reusable"] = result.get("reason") != "source-output-limit" and not issues.intersection((
             "source-deadline", "source-ancestry-deadline", "source-changed-during-read", "partial-line"))

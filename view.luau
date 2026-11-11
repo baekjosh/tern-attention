@@ -22,8 +22,10 @@ local LOCAL_HOST_KEY = "local"
 local SHARE_NUDGE = 0.0001
 local QUEUE_SECTIONS = { "attention", "working" }
 local QUEUE_SECTION_SET = { attention = true, working = true }
--- A Working row whose agent has recorded no activity for this long reads "Stalled" on its second line.
-local STALL_AFTER_SECONDS = 600
+-- When a Working row's second line speaks, by what its agent waits on (measured over a month of omp sessions:
+-- model calls reach 13.9m at p99.9; `wait` runs to its 30m cap and bash to its own timeout, so a long tool is
+-- normal and a stall only far past those). A tool shows by name after toolShown; Stalled after model/tool.
+local STALL = { modelSeconds = 900, toolSeconds = 3600, toolShownSeconds = 60 }
 
 -- The stored queue order, or the default when absent/foreign: exactly the two queues, each once.
 -- Preferences are validated at parse; this only guarantees the renderer a complete order.
@@ -114,6 +116,8 @@ local function inQueue(row, section)
 	-- A set-aside conversation (kept as reference, finished) or a record with no live route sits in no queue:
 	-- Search and the Workspace tree's saved conversations still reach it.
 	return (section == "attention" and row.attention == true)
+		-- A usage or rate limit with a known end rests out of Attention, folded at its bottom, until it passes.
+		or (section == "resting" and row.resting ~= nil and row.attention ~= true)
 		-- A pane matched to the live inventory is working. Its source or identity proof gates Open, not membership.
 		or (section == "working" and row.nativeState == "working" and row.live == true
 			and not row.offline and not row.noOpenPane and not row.orphaned)
@@ -287,6 +291,17 @@ function view.toggleGroup(logical, key, expanded)
 	else collapsed[key] = expanded end
 	logical.revision += 1
 	logical.intentRevision += 1
+end
+
+-- Going to a session restores it: a minimized session you open (by name, its tab count, its +, or No tabs) comes
+-- back to its place. Layout only, like revealQueue. Returns whether anything changed.
+-- Stored as an explicit false: a left/right rail minimizes other hosts' sessions by default (workspaceUi), and
+-- only a stored value overrides that.
+function view.restoreGroup(logical, key)
+	if string.sub(key, 1, 8) ~= "session:" or logical.workspace.collapsed[key] == false then return false end
+	logical.workspace.collapsed[key] = false
+	logical.revision += 1
+	return true
 end
 
 -- A conversation arrived in queue section `name` (Working or Attention): a folded section opens so the arrival is
@@ -592,15 +607,25 @@ local function railDetail(row, model, ageNode, nowUtc)
 	local need = row.need
 	if type(need) == "table" then
 		local phrase, tip = label(need.text, "", 80), nil
-		-- An ordinary Working row says nothing here: it already sits under the Working header.
+		-- An ordinary Working row says nothing here: it already sits under the Working header. A tool running past a
+		-- minute is named; Stalled only past the bound for what it waits on, and never when that is unknown.
 		if need.kind == "working" then
 			local idle = if finite(need.sinceUtc) and finite(nowUtc) then nowUtc - need.sinceUtc else nil
-			if idle and idle >= STALL_AFTER_SECONDS then
-				phrase = "Stalled " .. phone.age(idle)
-				tip = "Working · last recorded activity " .. phone.relativeLong(need.sinceUtc, nowUtc)
-			else
-				phrase = ""
+			local since = if idle then phone.relativeLong(need.sinceUtc, nowUtc) else nil
+			phrase = ""
+			if idle and need.wait == "model" and idle >= STALL.modelSeconds then
+				phrase, tip = "Stalled " .. phone.age(idle), "No reply from the model · asked " .. since
+			elseif idle and need.wait == "tool" and idle >= STALL.toolShownSeconds then
+				local doing = if need.tool == "wait" then "Waiting on jobs" else "Running " .. label(need.tool, "tool", 40)
+				phrase = if idle >= STALL.toolSeconds then "Stalled · " .. doing .. " " .. phone.age(idle)
+					else doing .. " " .. phone.age(idle)
+				tip = doing .. " · started " .. since
 			end
+		elseif need.kind == "resting" and finite(need.untilUtc) and finite(nowUtc) then
+			-- Every account of the provider is blocked: say when the first frees, as time left.
+			local left = math.max(need.untilUtc - nowUtc, 0)
+			phrase = phrase .. " · back in " .. phone.age(left)
+			tip = phrase .. " · every account of this provider is blocked; it returns to Attention by itself"
 		end
 		if phrase ~= "" then
 			local needNode = text("need", "attention.need", phrase)
@@ -982,7 +1007,7 @@ function view.render(renderer, logical, presentation, options)
 	-- Attention queue acknowledges review (`open`); every other activation is the navigation-only `route-open`.
 	local function conversationNode(item, row, mode)
 		local nav = item.navRow
-		local queue = mode == "attention" or mode == "working"
+		local queue = mode == "attention" or mode == "working" or mode == "resting"
 		-- Stack sections can list the same conversation twice; their binding slots stay apart per section.
 		local slotPrefix = if stacked then (if queue then mode else "workspace") .. ":" else ""
 		local title, session = label(row.title, "Untitled conversation"), label(row.sessionName, "Unknown session")
@@ -1073,7 +1098,8 @@ function view.render(renderer, logical, presentation, options)
 					else nil,
 			}, content)
 		end
-		local mainRole = if queue then "attention.row-main"
+		local currentRow = queue and options.current ~= nil and options.current.workId == row.workId
+		local mainRole = if currentRow then "attention.row-main-current" elseif queue then "attention.row-main"
 			elseif nav.leaf and nav.leaf.current then "workspace.main-current" else "workspace.main"
 		local model = if nav then leafModel(nav) else modelOfPane(row.hostKey, row.pane)
 		local mainChildren
@@ -1119,7 +1145,7 @@ function view.render(renderer, logical, presentation, options)
 				title = if expanded then "Collapse recorded facts" else "Inspect recorded facts · does not acknowledge or navigate",
 				actions = { click = rowAction("details") } },
 				{ node("icon", { key = "icon", role = "attention.triage-icon", name = if expanded then "chev" else "chev-r" }) })
-			local menu = node("el", { key = "menu", role = "attention.triage", tag = "button",
+			local menu = node("el", { key = "menu", role = "attention.more", tag = "button",
 				title = "Priority and explicit tracking disposition", actions = { click = rowAction("menu") } },
 				{ node("icon", { key = "icon", role = "attention.triage-icon", name = "more" }) })
 			mainChildren = { open, disclosure, menu }
@@ -1294,15 +1320,18 @@ local function ledgerLabel(navRow)
 end
 
 -- The full-height strip at a session box's left edge: − minimizes the session into its host's Minimized group, +
--- restores it to its place (both lists keep native session order). Empty sessions and sections have none.
+-- goes to it, which restores it to its place (both lists keep native session order). Empty sessions and sections
+-- have none.
 local function ledgerEdge(navRow)
 	if navRow.kind ~= "session" or navRow.empty then return nil end
 	local title = label(navRow.title, "Untitled", 160)
+	local action = if navRow.expanded
+		then bind(navRow.key .. ":toggle", { op = "workspace-toggle", key = navRow.key, expanded = true })
+		else bind(navRow.key .. ":restore", { op = "workspace-open", key = navRow.ref.key, signature = navRow.signature })
 	return node("el", { key = "edge", role = "workspace.ledger-edge", tag = "button",
 		text = if navRow.expanded then "\u{2212}" else "+",
-		title = (if navRow.expanded then "Minimize · " else "Restore · ") .. title,
-		actions = { click = bind(navRow.key .. ":toggle", { op = "workspace-toggle", key = navRow.key,
-			expanded = navRow.expanded }) },
+		title = (if navRow.expanded then "Minimize · " else "Restore and go to · ") .. title,
+		actions = { click = action },
 	})
 end
 
@@ -1353,7 +1382,7 @@ local function tabRowNode(navRow)
 	}, { node("row", { key = "summary", role = "attention.summary", gap = "xs", wrap = false }, summary) })
 	local parts = { open }
 	if navRow.kind == "tab" then
-		table.insert(parts, node("el", { key = "menu", role = "attention.triage", tag = "button",
+		table.insert(parts, node("el", { key = "menu", role = "attention.more", tag = "button",
 			title = "More · " .. title,
 			actions = { click = bind(navRow.key .. ":menu", { op = "native-menu", key = navRow.ref.key,
 				signature = navRow.signature }) },
@@ -1482,8 +1511,11 @@ end
 				budget.rows, budget.nodes = budget.rows - 1, budget.nodes - cost
 			elseif name == "workspace" and navRow.kind == "session" and not navRow.empty and not navRow.expanded then
 				-- A minimized session: one short box ("N tabs") in its host's Minimized group, + at its edge.
-				local count = text("count", "workspace.ledger-count",
-					tostring(navRow.count or 0) .. (if navRow.count == 1 then " tab" else " tabs"))
+				local count = node("el", { key = "count", role = "workspace.ledger-count", tag = "button",
+					text = tostring(navRow.count or 0) .. (if navRow.count == 1 then " tab" else " tabs"),
+					title = "Restore and go to · " .. label(navRow.title, "Untitled", 160),
+					actions = { click = bind(navRow.key .. ":count", { op = "workspace-open", key = navRow.ref.key,
+						signature = navRow.signature }) } })
 				local box = ledgerNode(nodeKey(navRow.key), ledgerEdge(navRow), ledgerLabel(navRow), { count }, navRow.current)
 				cost = countNodes(box) + (if #minimized.boxes > 0 then 0 else 5)
 				if cost > budget.nodes then budget.rows = 0 break end
@@ -1667,7 +1699,7 @@ end
 				text("title", "workspace.title", queueLabels[name]), text("count", "workspace.count", tostring(counts[name])) })
 			local headParts = { toggle }
 			if not logical.settings then
-				table.insert(headParts, node("el", { key = "menu", role = "attention.triage", tag = "button",
+				table.insert(headParts, node("el", { key = "menu", role = "attention.more", tag = "button",
 					title = "More · " .. queueLabels[name],
 					actions = { click = bind("queue-menu:" .. name, { op = "queue-menu", name = name }) },
 				}, { node("icon", { key = "icon", role = "attention.triage-icon", name = "more" }) }))
@@ -1676,6 +1708,24 @@ end
 				elseif name == "attention" and #rowNodesOfSection > 0 then "attention.rows-occupied" else "attention.rows"
 			-- A section is as tall as its rows: an empty one is just its header with the count.
 			local rowLines = rowNodesOfSection
+			-- Rows waiting on a usage or rate limit's reset fold under one line at Attention's bottom (closed unless
+			-- opened); each returns to Attention by itself when its reset passes.
+			local restingRows = if name == "attention" and open and not logical.settings then listOf("resting") else {}
+			if #restingRows > 0 then
+				local restOpen = logical.workspace.collapsed["queue:resting"] == false
+				local restLabel = "Waiting on reset (" .. #restingRows .. ")"
+				rowLines = table.clone(rowNodesOfSection)
+				table.insert(rowLines, node("el", { key = "resting-toggle", role = "workspace.sub-toggle", tag = "button",
+					title = (if restOpen then "Collapse · " else "Expand · ") .. restLabel,
+					actions = { click = bind("queue:resting:toggle", { op = "workspace-toggle", key = "queue:resting", expanded = restOpen }) },
+				}, { node("icon", { key = "chev", role = "attention.triage-icon", name = if restOpen then "chev" else "chev-r" }),
+					text("label", "workspace.sub-label", restLabel) }))
+				if restOpen then
+					local restNodes, restShown = rowNodesOf("resting")
+					shown += restShown
+					table.insert(rowLines, node("col", { key = "resting", role = "attention.rows", gap = "none" }, restNodes))
+				end
+			end
 			return node("col", { key = name, role = "attention.section", gap = "none" }, {
 				node("row", { key = "head", role = "attention.section-head", gap = "xs", wrap = false }, headParts),
 				node("col", { key = "rows", role = rowsRole, gap = "none", hidden = not open or logical.settings }, rowLines),

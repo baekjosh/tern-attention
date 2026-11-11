@@ -143,9 +143,27 @@ local function providerError(entry)
 	return failure.kind
 end
 
+-- A usage or rate limit's three wordings: while omp blocks every account (the row rests, out of Attention), once
+-- that block's deadline passed (due, never claimed as reset: the provider may still refuse), and with no deadline.
+local LIMIT_NEEDS = {
+	usage_limit = { "Usage limit", "Usage limit · reset due", "Usage limit · reset time unknown" },
+	rate_limit = { "Rate limited", "Rate limit · reset due", "Rate limited · reset time unknown" },
+}
+
+-- Until when a limited row rests: the reader's `limit` says every enabled account of the provider is blocked until
+-- `untilUtc`. Nil once that passes, for any other error, or when the store could not say (the row stays in Attention).
+local function restingUntil(entry, nowUtc)
+	local kind = providerError(entry)
+	if LIMIT_NEEDS[kind] == nil then return nil end
+	local limit = entry.source.lastError.limit
+	if type(limit) ~= "table" or limit.status ~= "blocked" or not finite(limit.untilUtc) or not finite(nowUtc)
+		or nowUtc >= limit.untilUtc then return nil end
+	return limit.untilUtc
+end
+
 local function attentionEligible(entry)
 	return entry.disposition == "active" and (conditionFor(entry) ~= nil or sourceQuestionCurrent(entry)
-		or providerError(entry) ~= nil or (passiveCurrent(entry)
+		or (providerError(entry) ~= nil and entry.resting == nil) or (passiveCurrent(entry)
 		and (entry.reviewRevision ~= nil or entry.deferredResult ~= nil or entry.manualRevisit == true)))
 end
 
@@ -212,11 +230,20 @@ local function questionNeed(source)
 	return "Asks a question"
 end
 
--- When a working agent last did something on record: its newest assistant/tool record, the prompt that started the
--- turn, or the observed start of work, whichever is latest. Nil without a source whose clock parsed.
+-- What a working agent is waiting on and since when. The source names it: a tool call started without a result
+-- ("tool", with its name) or the model call since the prompt or tool result that started it ("model"), never earlier
+-- than the observed start of work, so a call left open by an older turn cannot backdate this one. Without that,
+-- when it last did something on record (its newest assistant/tool record, the prompt, or the observed start of
+-- work, whichever is latest), waiting on nothing known. Nil without a source whose clock parsed.
 local function workingSince(entry)
 	local source = entry.source
 	if source == nil or fieldUnknown(source.coverage, "clock") then return nil end
+	local flight = source.inFlight
+	if type(flight) == "table" and finite(flight.sinceUtc) and (flight.kind == "tool" or flight.kind == "model") then
+		local since = flight.sinceUtc
+		if finite(entry.sourceWorkUtc) and entry.sourceWorkUtc > since then since = entry.sourceWorkUtc end
+		return since, flight.kind, if flight.kind == "tool" and type(flight.tool) == "string" then flight.tool else nil
+	end
 	local since = nil
 	-- Not ipairs: any of the three may be nil.
 	for _, at in { source.lastActivityAtUtc or false, source.lastInteractionAtUtc or false, entry.sourceWorkUtc or false } do
@@ -227,30 +254,36 @@ end
 
 -- The row's need (kind, text, sinceUtc), in reasonFor's precedence; a stale row's need is its last known one.
 local function needFor(entry)
-	local condition, kind, text, since = conditionFor(entry), nil, nil, nil
+	local condition, kind, text, since, wait, tool, untilUtc = conditionFor(entry), nil, nil, nil, nil, nil, nil
 	local provider = if condition == nil then providerError(entry) else nil
 	if condition == "waiting" then kind, text = "waiting", "Waiting for input"
 	elseif condition == "delivery" then kind, text = "undelivered", "Prompt not delivered"
 	elseif condition == "startup" then kind, text = "startup", "Agent didn't start"
 	elseif sourceQuestionCurrent(entry) then kind, text = "question", questionNeed(entry.source)
+	elseif provider and LIMIT_NEEDS[provider] then
+		local words, limit = LIMIT_NEEDS[provider], entry.source.lastError.limit
+		if entry.resting then kind, text, untilUtc = "resting", words[1], entry.resting
+		else kind, text = "provider", if type(limit) == "table" and limit.status == "blocked" then words[2] else words[3] end
 	elseif provider then kind, text = "provider", PROVIDER_NEEDS[provider]
 	elseif passiveCurrent(entry) and entry.reviewRevision ~= nil then kind, text = "review", REVIEW_NEEDS[entry.reviewKind] or "New update"
 	elseif passiveCurrent(entry) and entry.deferredResult ~= nil then kind, text = "review", "Completion unverified"
 	elseif passiveCurrent(entry) and entry.manualRevisit then kind, text = "review", "Manual revisit"
 	elseif entry.disposition == "active" and entry.nativeState == "working" then
-		kind, text, since = "working", "Working", workingSince(entry)
+		kind, text = "working", "Working"
+		since, wait, tool = workingSince(entry)
 	else return nil end
 	if entry.stale then return "offline", "Last known: " .. text, nil end
-	return kind, text, since
+	return kind, text, since, wait, tool, untilUtc
 end
 
 -- Rows compare shallowly (publish), so an unchanged need keeps the previous row's table.
 local function needOf(entry)
-	local kind, text, since = needFor(entry)
+	local kind, text, since, wait, tool, untilUtc = needFor(entry)
 	if kind == nil then return nil end
 	local previous = if entry.row then entry.row.need else nil
-	if previous and previous.kind == kind and previous.text == text and previous.sinceUtc == since then return previous end
-	return { kind = kind, text = text, sinceUtc = since }
+	if previous and previous.kind == kind and previous.text == text and previous.sinceUtc == since
+		and previous.wait == wait and previous.tool == tool and previous.untilUtc == untilUtc then return previous end
+	return { kind = kind, text = text, sinceUtc = since, wait = wait, tool = tool, untilUtc = untilUtc }
 end
 
 local function ranked(a, b)
@@ -304,7 +337,7 @@ local function publish(state)
 			priority = entry.priority, queueOrder = entry.queueOrder, identityKey = entry.identityKey,
 			attention = attentionEligible(entry), attentionRevision = entry.attentionRevision, reviewRevision = entry.reviewRevision,
 			condition = conditionFor(entry), reviewKind = entry.reviewKind, reviewSuperseded = entry.reviewSuperseded == true,
-			sourceQuestionCurrent = sourceQuestionCurrent(entry), need = needOf(entry),
+			sourceQuestionCurrent = sourceQuestionCurrent(entry), need = needOf(entry), resting = entry.resting,
 			stale = entry.stale == true, navigable = entry.navigable == true, orphaned = entry.orphaned == true,
 			retryableHeaderRoute = entry.retryableHeaderRoute == true,
 			unavailableReason = entry.unavailableReason, parked = entry.parked, floating = entry.floating,
@@ -1621,6 +1654,8 @@ function model.reconcile(state, snapshot, events, context)
 				and locator.localSource == true and locator.key == entry.identityKey and not mismatched
 		end
 	end
+	-- Rests are timed: every pass re-reads the clock, so a row comes back to Attention when its limit's end passes.
+	for _, entry in pairs(state.entries) do entry.resting = restingUntil(entry, now) end
 	return publish(state)
 end
 local function selected(state, pane, serial)

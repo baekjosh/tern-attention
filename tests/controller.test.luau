@@ -631,8 +631,10 @@ local function native(enabled, os, position)
 		self:click(pane, toggle.p.actions.click)
 	end
 	-- Restores every minimized session of a stack's Workspace list with its box's + strip: minimized boxes sit in a
-	-- host's Minimized group.
+	-- host's Minimized group. + also goes to the session, so each restore is followed by a switch back to the rail's
+	-- own tab, as a user returning would.
 	function world:openSessions(pane)
+		local home = self.membership[pane]
 		for _ = 1, 16 do
 			local rows = descend(self.canvases[pane].view, "bottom", "rows")
 			local action = nil
@@ -643,6 +645,8 @@ local function native(enabled, os, position)
 			end
 			if not action then return end
 			self:click(pane, action)
+			self:advance(32)
+			self:switch(home)
 			self:advance(32)
 		end
 		error("the stack kept collapsed sessions after sixteen openings")
@@ -6749,10 +6753,37 @@ do
 	local hostRow = wsRow(world, rail, "host:6:host-8")
 	assert(hostRow and hostRow.p.tag == "button" and hostRow.p.actions and hostRow.p.actions.click,
 		"a host row is listed once two hosts have content, and its whole row is the disclosure")
+	local switchesBefore = #world.hostSwitches
 	world:click(rail, wsPart(world, rail, "tab:host-8#6", "open")); world:advance(100)
-	assert(#world.hostSwitches == 1 and world.hostSwitches[1] == 8 and world.currentHost == 8,
-		"a tab row on another host switches to that host")
+	assert(#world.hostSwitches == switchesBefore + 1 and world.hostSwitches[#world.hostSwitches] == 8
+		and world.currentHost == 8, "a tab row on another host switches to that host")
 end
+-- A minimized session's tab count goes to the session and restores its box, never a dead click. Another host's
+-- session starts minimized on a left rail with nothing stored, so the restore must be stored, not just cleared.
+do
+	local world, rail = workspaceWorld()
+	world:addTab(6, 13, 8, 21)
+	world.sessions[21].name, world.hostNames = "Laptop work", { [8] = "Laptop" }
+	world:advance(3100)
+	world.viewing = "workspace"
+	local function minimizedCount()
+		for _, row in ipairs(descend(world.canvases[rail].view, "bottom", "rows").c or {}) do
+			local boxes = if row.p.role == "workspace.minimized-line" then descend(row, "boxes") else nil
+			for _, box in ipairs(if boxes then boxes.c or {} else {}) do
+				local count = descend(box, "rows", "count")
+				if count and count.p.actions then return count.p.actions.click end
+			end
+		end
+		return nil
+	end
+	local count = minimizedCount()
+	assert(count, "fixture: the other host's session is minimized, its tab count shown")
+	world:click(rail, count); world:advance(100)
+	assert(world.currentHost == 8 and world.currentSession == 21, "the tab count goes to its session")
+	assert(world.prefs.uiByWindow.desktop.collapsed["session:host-8#21"] == false,
+		"and restores it: the session is stored open, overriding the other-host default")
+end
+
 -- A tab row on an offline host is refused like its host row: native focus does not change.
 do
 	local world, rail = workspaceWorld()
@@ -6763,9 +6794,9 @@ do
 	world.hostStates[8] = "disconnected"; world:advance(1100)
 	local action = wsPart(world, rail, "tab:host-8#6", "open")
 	assert(action, "an offline host's tab row is listed with its open control")
-	local focused = world.focused
+	local focused, writes, switches = world.focused, world.focusWrites, #world.hostSwitches
 	world:click(rail, action); world:advance(100)
-	assert(world.focusWrites == 0 and world.focused == focused and #world.hostSwitches == 0
+	assert(world.focusWrites == writes and world.focused == focused and #world.hostSwitches == switches
 		and toastCount(world, "info", "Host is offline · nothing changed") == 1,
 		"a tab row on an offline host is refused and focus does not change")
 end
