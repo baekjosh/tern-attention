@@ -12,7 +12,7 @@
 
 ---
 
-[![Attention demo: the Attention queue and per-tab placement](docs/media/demo.gif)](docs/media/demo.mp4)
+<img src="docs/media/attention.png" alt="Attention in a left rail: Working and Attention queues over the Workspace" width="420">
 
 Clicking Tern's stock ⌘⇧I needs-attention inbox was too many clicks, so I built this! Why click many times when one click better.
 
