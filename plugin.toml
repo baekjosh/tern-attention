@@ -1,7 +1,7 @@
 schema = 1
 id = "attention"
 name = "Attention"
-version = "0.9.11"
+version = "0.9.12"
 description = "Attention, Currently working, and Workspace with factual tracking and a phone queue"
 icon = "bell"
 window = "window.luau"
