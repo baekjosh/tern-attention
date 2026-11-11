@@ -62,6 +62,39 @@ def answer(details, call="ask-one", error=False, text="PRIVATE_RAW_TOOL"):
             "isError": error, "timestamp": 1793235601000}
 
 
+# An omp 18.18 HTML-form ask, shaped like the producer's own example (packages/coding-agent ask tool): context text,
+# a fieldset radio group, label-wrapped and label-for controls, an unlabeled textarea, hidden and submit inputs.
+FORM = """<form>
+  <p>Sessions live in memory &amp; are lost on restart.</p>
+  <fieldset>
+    <legend>Session store</legend>
+    <label><input type="radio" name="store" value="sqlite" checked> SQLite: one file</label>
+    <label><input type="radio" name="store" value="redis"> Redis: shared</label>
+  </fieldset>
+  <label>Session lifetime (days) <input type="number" name="ttl_days" value="30" min="1"></label>
+  <p>Which extras?</p>
+  <label><input type="checkbox" name="extras" value="a"> Metrics</label>
+  <label><input type="checkbox" name="extras" value="b"> Tracing</label>
+  <svg viewBox="0 0 10 10"><text>diagram label</text></svg>
+  <label for="region">Deploy region</label>
+  <select id="region" name="region"><option>us</option><option>eu</option></select>
+  <textarea name="extra_notes"></textarea>
+  <input type="hidden" name="token" value="x">
+  <input type="submit" value="Go">
+</form>"""
+FORM_QUESTIONS = ["Session store", "Session lifetime (days)", "Which extras?", "Deploy region", "extra notes"]
+
+
+def form_ask(html=FORM, call="form-one"):
+    return assistant("", "toolUse", content=[{"type": "toolCall", "name": "ask", "id": call,
+                                              "arguments": {"i": "Choosing storage", "html": html}}])
+
+
+def form_answers(answers, call="form-one", **details):
+    return answer({"answers": [{"name": name, "question": "PRODUCER_WORDING", "answer": value}
+                               for name, value in answers], **details}, call)
+
+
 class SourceFactsTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -170,7 +203,7 @@ class SourceFactsTests(unittest.TestCase):
         coverage = result["coverage"]
         self.assertEqual(coverage["controlsExcluded"], 3)
         self.assertEqual(coverage["controlRolesExcluded"], {"developer": 2, "custom": 1})
-        self.assertEqual(result["lastHuman"]["text"], "Inspect only.")
+        self.assertEqual(result["lastHuman"]["id"], "human")
         self.assertNotIn("context", result)
 
     def test_explicit_failed_ask_needs_no_answer_details_payload(self):
@@ -204,7 +237,7 @@ class SourceFactsTests(unittest.TestCase):
         self.assertFalse(result["complete"])
         self.assertFalse(result["coverage"]["recordsComplete"])
         self.assertEqual(result["coverage"]["historyScope"], "unavailable")
-        self.assertEqual(result["coverage"]["selectionSupport"], "unknown")
+        self.assertEqual(result["coverage"]["fields"], {"clock": "unknown", "questions": "unknown"})
         self.assertEqual(result["sessionId"], "session-one")
         self.assertIsNone(result["selectedLeafId"])
         self.assertEqual(result["selection"], "unknown")
@@ -232,7 +265,6 @@ class SourceFactsTests(unittest.TestCase):
         self.assertEqual(result["lastInteractionId"], "human")
         self.assertEqual(result["lastInteractionAtUtc"], 1793235590)
         self.assertEqual(result["lastHuman"]["id"], "human")
-        self.assertEqual(result["lastHuman"]["text"], "Inspect only.")
 
     def test_mixed_batch_preserves_manual_and_automatic_question_provenance(self):
         self.write([header(), entry("a", message=ask([question("manual"), question("auto")])),
@@ -249,7 +281,6 @@ class SourceFactsTests(unittest.TestCase):
         self.assertNotIn("answeredAtUtc", automatic)
         self.assertEqual(result["lastInteractionId"], "b")
         self.assertEqual(result["lastHuman"]["id"], "b:0")
-        self.assertEqual(result["lastHuman"]["text"], "Use the existing folder")
 
     def test_reissued_raw_call_id_resolves_only_its_own_attempt(self):
         self.write([header(),
@@ -278,7 +309,6 @@ class SourceFactsTests(unittest.TestCase):
         human = result["lastHuman"]
         self.assertEqual(human["id"], "b:0")
         self.assertEqual(human["provenance"], "user")
-        self.assertEqual(human["text"], "Also implement the export step")
         self.assertEqual(human["atUtc"], 1793235601)
         self.assertEqual(human["questionId"], result["questions"][0]["id"])
         self.assertEqual(human["callId"], "ask-one")
@@ -299,7 +329,6 @@ class SourceFactsTests(unittest.TestCase):
         result = self.request()
         self.assertEqual(result["lastHuman"]["id"], "b:0")
         self.assertEqual(result["lastHuman"]["atUtc"], 1793235601)
-        self.assertEqual(result["lastHuman"]["text"], "No")
         self.assertEqual(result["lastHuman"]["answerKind"], "selection")
         self.assertEqual(result["lastInteractionId"], "b")
         self.assertEqual(result["questions"][1]["answerProvenance"], "automatic")
@@ -317,7 +346,6 @@ class SourceFactsTests(unittest.TestCase):
                 self.assertNotIn("lastHuman", result)
                 self.assertNotIn("lastInteractionId", result)
             else:
-                self.assertEqual(result["lastHuman"]["text"], "[]")
                 self.assertEqual(result["lastHuman"]["id"], "b:0")
                 self.assertEqual(result["lastHuman"]["questionId"], question_fact["id"])
                 self.assertEqual(result["lastHuman"]["answerKind"], "selection")
@@ -392,9 +420,10 @@ class SourceFactsTests(unittest.TestCase):
         self.write(records)
         self.assertEqual(self.request()["lastFinal"]["text"], "Changed result")
 
-    def test_observed_writer_shapes_are_qualified_and_unknown_writer_is_not(self):
+    def test_listed_writers_are_qualified_and_a_missing_version_is_only_an_advisory(self):
         for writer in ("18.12.5", "18.12.6", "18.13.0", "18.13.1", "18.13.2", "18.13.3",
-                       "18.14.0", "18.14.1", "18.14.2", "18.15.0", "18.16.0"):
+                       "18.14.0", "18.14.1", "18.14.2", "18.15.0", "18.16.0",
+                       "18.18.0", "18.18.1", "18.18.2", "18.18.3", "18.18.5", "18.18.6", "18.18.7"):
             runtime = {"version": writer}
             self.write([header(), entry("ask", message=ask([question()]), runtime=runtime),
                         entry("answer", "ask", answer({"selectedOptions": ["Yes"]}), runtime=runtime),
@@ -405,12 +434,15 @@ class SourceFactsTests(unittest.TestCase):
             self.assertEqual(result["schemaVersion"], 3)
             self.assertEqual(result["selection"], "disk-replayed")
             self.assertEqual(result["coverage"]["writerSupport"], "qualified", writer)
-            self.assertEqual(result["coverage"]["selectionSupport"], "schema3-replayed", writer)
+            self.assertEqual(result["coverage"]["fields"], {"clock": "supported", "questions": "supported"}, writer)
             self.assertEqual(result["coverage"]["liveLeaf"], "not-observed")
             self.assertEqual(result["questions"][0]["status"], "answered", writer)
             self.assertEqual(result["questions"][0]["answer"], "Yes", writer)
         self.write([header(), entry("a", message=assistant(), runtime={})])
-        self.assertEqual(self.request()["status"], "partial")
+        missing = self.request()
+        self.assertEqual(missing["status"], "ready")
+        self.assertEqual(missing["coverage"]["writerSupport"], "unknown")
+        self.assertEqual(missing["coverage"]["fields"], {"clock": "supported", "questions": "supported"})
         unsupported_header = header()
         unsupported_header["version"] = 4
         self.write([unsupported_header])
@@ -442,6 +474,90 @@ class SourceFactsTests(unittest.TestCase):
             self.assertFalse(result["complete"])
             self.assertEqual(result["coverage"]["writerSupport"], "qualified")
             self.assertTrue(result["coverage"]["issues"])
+
+    def test_html_form_ask_questions_take_the_producers_wording_and_its_answers(self):
+        runtime = {"version": "18.18.7"}
+        self.write([header(), entry("ask", message=form_ask(), runtime=runtime)])
+        asked = self.request()
+        self.assertEqual(asked["status"], "ready")
+        self.assertEqual(asked["coverage"]["fields"], {"clock": "supported", "questions": "supported"})
+        self.assertEqual([q["text"] for q in asked["questions"]], FORM_QUESTIONS)
+        self.assertEqual({q["status"] for q in asked["questions"]}, {"open"})
+        self.assertNotIn("diagram label", json.dumps(asked))
+        submitted = [("store", "SQLite: one file"), ("ttl_days", "30"), ("extras", "Metrics, Tracing"),
+                     ("region", "eu"), ("extra_notes", "")]
+        self.write([header(), entry("ask", message=form_ask(), runtime=runtime),
+                    entry("answer", "ask", form_answers(submitted), runtime=runtime)])
+        answered = self.request()
+        self.assertEqual(answered["status"], "ready")
+        self.assertEqual([(q["text"], q["status"], q["answer"]) for q in answered["questions"]],
+                         [(text, "answered", value) for text, (_, value) in zip(FORM_QUESTIONS, submitted)])
+        self.assertEqual(answered["questions"][0]["answerProvenance"], "user")
+        self.assertEqual(answered["lastHuman"]["sourceEntryId"], "answer")
+        self.write([header(), entry("ask", message=form_ask(), runtime=runtime),
+                    entry("answer", "ask", form_answers(submitted, timedOut=True), runtime=runtime)])
+        timed = self.request()["questions"][0]
+        self.assertEqual((timed["status"], timed["answerProvenance"]), ("answered", "automatic"))
+        self.write([header(), entry("ask", message=form_ask(), runtime=runtime),
+                    entry("cancel", "ask", answer({}, "form-one", error=True, text="Ask input was cancelled"), runtime=runtime)])
+        self.assertEqual({q["status"] for q in self.request()["questions"]}, {"cancelled"})
+
+    def test_unknown_writer_with_parseable_records_keeps_every_field_supported(self):
+        runtime = {"version": "99.0.0"}
+        self.write([header(), entry("ask", message=ask([question()]), runtime=runtime),
+                    entry("answer", "ask", answer({"selectedOptions": ["Yes"]}), runtime=runtime),
+                    entry("a", "answer", message=assistant(), runtime=runtime)])
+        result = self.request()
+        self.assertEqual(result["status"], "ready")
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["coverage"]["writerSupport"], "unknown")
+        self.assertEqual(result["coverage"]["fields"], {"clock": "supported", "questions": "supported"})
+        self.assertEqual(result["coverage"]["issues"], [])
+        self.assertEqual(result["lastFinal"]["atUtc"], 1793235600.123)
+        self.assertEqual(result["questionCoverage"]["status"], "complete")
+
+    def test_an_unparseable_ask_demotes_only_questions_and_its_record_keeps_the_clock(self):
+        broken = ask([{"question": "Choose", "options": "Yes,No"}])
+        broken["completedAt"] = 1793235700000
+        self.write([header(), entry("a", message=assistant()), entry("broken", "a", broken)])
+        result = self.request()
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["coverage"]["fields"], {"clock": "supported", "questions": "unknown"})
+        self.assertIn("unsupported-question-options", result["coverage"]["issues"])
+        self.assertEqual(result["lastAssistant"]["id"], "broken")
+        self.assertEqual(result["lastActivityAtUtc"], 1793235700)
+        self.assertEqual(result["questionCoverage"]["status"], "unknown")
+        malformed_result = answer({"results": "not-a-list"})
+        self.write([header(), entry("ask", message=ask([question()])), entry("bad", "ask", malformed_result)])
+        self.assertEqual(self.request()["coverage"]["fields"], {"clock": "supported", "questions": "unknown"})
+
+    def test_provider_error_on_the_last_turn_is_a_fact_and_a_later_turn_clears_it(self):
+        errors = [
+            ({"errorStatus": 429, "errorId": 659456, "errorMessage": '429 {"error":{"message":"[1308][Usage limit reached for 5 hour]"}}'}, "usage_limit"),
+            ({"errorMessage": "Codex error event: The usage limit has been reached (code=usage_limit_reached)"}, "usage_limit"),
+            ({"errorStatus": 429, "errorId": 135168, "errorMessage": '429 {"error":{"message":"[1302][Rate limit reached for requests]"}}'}, "rate_limit"),
+            ({"errorStatus": 500, "errorMessage": "500 Internal Server Error"}, "api_error"),
+            ({"errorMessage": "ECONNRESET: The socket connection was closed unexpectedly"}, "provider"),
+        ]
+        for fields, kind in errors:
+            failed = assistant("", "error", **fields)
+            failed["completedAt"] = 1793235800000
+            records = [header(), entry("a", message=assistant()), entry("failed", "a", failed)]
+            self.write(records)
+            self.assertEqual(self.request()["lastError"], {"id": "failed", "kind": kind, "atUtc": 1793235800}, kind)
+            self.write(records + [entry("retried", "failed", assistant("Recovered"))])
+            recovered = self.request()
+            self.assertNotIn("lastError", recovered, kind)
+            self.assertEqual(recovered["lastFinal"]["id"], "retried")
+
+    def test_last_activity_is_the_newest_assistant_or_tool_record_not_human_input(self):
+        tool = {"role": "toolResult", "toolName": "bash", "toolCallId": "call", "content": [{"type": "text", "text": "PRIVATE"}],
+                "isError": False, "timestamp": 1793235900000}
+        human = {"role": "user", "attribution": "user", "content": "next", "timestamp": 1793236000000}
+        self.write([header(), entry("a", message=assistant("", "toolUse")), entry("tool", "a", tool), entry("human", "tool", human)])
+        result = self.request()
+        self.assertEqual(result["lastActivityAtUtc"], 1793235900)
+        self.assertNotIn("PRIVATE", json.dumps(result))
 
     def test_factual_projection_has_no_generative_input_or_interpretation(self):
         self.write([header(), entry("user", message={"role": "user", "attribution": "user",
@@ -496,11 +612,10 @@ class SourceFactsTests(unittest.TestCase):
         self.assertEqual(self.request()["status"], "malformed")
         self.write([header(), entry("a", message=assistant()), entry("a", message=assistant("conflict"))])
         self.assertEqual(self.request()["status"], "malformed")
-        self.write([header(), entry("a", message=assistant(), runtime={"version": "99.0.0"})])
+        self.write([header(), entry("a", message={"role": "newRole", "content": "x"})])
         unknown = self.request()
         self.assertEqual(unknown["status"], "partial")
-        self.assertEqual(unknown["lastFinal"]["text"], "Result")
-        self.assertEqual(unknown["coverage"]["writerSupport"], "unknown")
+        self.assertEqual(unknown["coverage"]["fields"], {"clock": "unknown", "questions": "unknown"})
         self.path.write_text("{not json}\n")
         self.assertEqual(self.request()["status"], "malformed")
         self.path.unlink()
@@ -510,10 +625,13 @@ class SourceFactsTests(unittest.TestCase):
 
     def test_factual_excerpt_clipping_and_oversize_record_are_explicit(self):
         self.write([header(), entry("human", message={"role": "user", "attribution": "user",
-                    "content": "x" * (adapter.MAX_TEXT + 10)})])
+                    "content": "x" * (adapter.MAX_TEXT + 10)}),
+                    entry("reply", "human", assistant("y" * (adapter.REPLY_TEXT + 1)))])
         result = self.request()
-        self.assertEqual(len(result["lastHuman"]["text"]), adapter.MAX_TEXT)
-        self.assertTrue(result["lastHuman"]["textTruncated"])
+        self.assertNotIn("text", result["lastHuman"], "human input is carried by its time, not its text")
+        for field in ("lastFinal", "lastAssistant"):
+            self.assertEqual(result[field]["text"], "y" * adapter.REPLY_TEXT)
+            self.assertTrue(result[field]["textTruncated"])
         self.assertEqual(result["questionCoverage"]["status"], "complete")
         self.write([header()], b"x" * (adapter.MAX_RECORD_BYTES + 1) + b"\n")
         result = self.request()
@@ -890,97 +1008,11 @@ print("parser-model outcomes passed")
         self.write([header(), record])
         self.assertEqual(self.request()["lastFinal"]["atUtc"], 9999999999)
 
-    def test_default_zone_is_discovered_without_assuming_utc(self):
-        with mock.patch.dict("os.environ", {"TZ": "America/Los_Angeles"}):
-            result = adapter.respond({"protocol": 1, "requestId": "local-date", "op": "date",
-                                      "civilDate": "2026-11-03"})
-        self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["zone"], "America/Los_Angeles")
-        self.assertEqual(result["resolvedUTC"], 1793692800)
-        self.assertEqual(result["civilTime"], "00:00")
-
     def test_invalid_protocol_is_explicit_and_never_runs_sources(self):
         for request in (None, {}, {"protocol": True, "requestId": "boolean"},
                         {"protocol": 1, "requestId": "not-finite", "nowUtc": float("nan"), "targets": []}):
             with self.assertRaises(ValueError):
                 adapter.respond(request)
-
-    @staticmethod
-    def resolve(date, time="00:00", zone="America/New_York", **extra):
-        return adapter.respond({"protocol": 1, "requestId": "date", "op": "date",
-                                "civilDate": date, "civilTime": time, "zone": zone, **extra})
-
-    def test_iana_dates_dst_and_explicit_zone(self):
-        resolve = self.resolve
-        self.assertEqual(resolve("2026-11-03")["resolvedUTC"], 1793682000)
-        self.assertEqual(resolve("2026-02-30")["status"], "invalid")
-        self.assertEqual(resolve("2026-11-03", zone="not-a-zone")["status"], "invalid")
-        self.assertIn("not-a-zone", resolve("2026-11-03", zone="not-a-zone")["error"])
-        self.assertEqual(resolve("2026-11-03", "25:00")["status"], "invalid")
-        self.assertEqual(resolve("2026-11-03", zone="/etc/localtime")["status"], "invalid")
-
-    def test_nonexistent_and_repeated_local_times_are_refused_not_shifted(self):
-        cases = (
-            ("America/New_York", "2026-03-08", "02:30", "invalid", "nonexistent", "does not exist"),
-            ("America/New_York", "2026-11-01", "01:30", "ambiguous", "repeated", "happens twice"),
-            ("Europe/London", "2026-03-29", "01:30", "invalid", "nonexistent", "does not exist"),
-            ("Europe/London", "2026-10-25", "01:30", "ambiguous", "repeated", "happens twice"),
-        )
-        for zone, date, time, status, problem, wording in cases:
-            with self.subTest(zone=zone, date=date, time=time):
-                result = self.resolve(date, time, zone)
-                self.assertEqual((result["status"], result["problem"]), (status, problem))
-                self.assertIn(wording, result["error"])
-                self.assertIn(date + " " + time + " " + zone, result["error"])
-                self.assertIn("Choose another time", result["error"])
-                for name in ("resolvedUTC", "display", "utcDisplay", "confirmation", "past"):
-                    self.assertNotIn(name, result, "a refused time never carries an instant")
-
-    def test_times_next_to_a_transition_resolve_exactly(self):
-        self.assertEqual(self.resolve("2026-03-08", "03:30")["resolvedUTC"], 1772955000)
-        self.assertEqual(self.resolve("2026-03-08", "01:59")["utcDisplay"], "2026-03-08T06:59:00Z")
-        self.assertEqual(self.resolve("2026-11-01", "02:00")["utcDisplay"], "2026-11-01T07:00:00Z")
-        self.assertEqual(self.resolve("2026-11-01", "00:59")["utcDisplay"], "2026-11-01T04:59:00Z")
-
-    def test_confirmation_states_local_time_zone_and_utc_instant(self):
-        result = self.resolve("2026-11-03", "09:00", nowUtc=1700000000)
-        self.assertEqual(result["status"], "ready")
-        self.assertEqual(result["resolvedUTC"], 1793714400)
-        self.assertEqual(result["display"], "2026-11-03 09:00 America/New_York")
-        self.assertEqual(result["utcDisplay"], "2026-11-03T14:00:00Z")
-        self.assertEqual(result["zoneSource"], "request")
-        self.assertIs(result["past"], False)
-        for part in ("2026-11-03 09:00", "America/New_York", "2026-11-03T14:00:00Z"):
-            self.assertIn(part, result["confirmation"])
-        self.assertNotIn("already passed", result["confirmation"])
-        london = self.resolve("2026-06-15", "09:00", "Europe/London")
-        self.assertEqual((london["resolvedUTC"], london["utcDisplay"]), (1781510400, "2026-06-15T08:00:00Z"))
-
-    def test_past_instant_is_accepted_and_says_it_returns_on_next_refresh(self):
-        result = self.resolve("2026-11-03", "09:00", nowUtc=1793714401)
-        self.assertEqual(result["status"], "ready")
-        self.assertIs(result["past"], True)
-        self.assertIn("already passed", result["confirmation"])
-        self.assertIn("returns to Attention on the next refresh", result["confirmation"])
-        self.assertIs(self.resolve("2026-11-03", "09:00", nowUtc=1793714400)["past"], True)
-        self.assertIs(self.resolve("2026-11-03", "09:00", nowUtc=1793714399)["past"], False)
-        self.assertNotIn("past", self.resolve("2026-11-03", "09:00"), "past is only claimed against a supplied instant")
-        self.assertEqual(self.resolve("2026-11-03", "09:00", nowUtc=float("inf"))["status"], "invalid")
-
-    def test_system_zone_is_named_in_the_confirmation(self):
-        with mock.patch.dict("os.environ", {"TZ": "Europe/London"}):
-            result = adapter.respond({"protocol": 1, "requestId": "system", "op": "date",
-                                      "civilDate": "2026-06-15", "civilTime": "09:00"})
-        self.assertEqual((result["zone"], result["zoneSource"]), ("Europe/London", "system"))
-        self.assertIn("2026-06-15 09:00 Europe/London (system time zone)", result["confirmation"])
-
-    def test_date_payload_contract_is_json_and_complete(self):
-        result = self.resolve("2026-11-03", "09:00", nowUtc=1700000000)
-        self.assertEqual(sorted(result), sorted((
-            "protocol", "requestId", "status", "civilDate", "civilTime", "zone", "zoneSource",
-            "resolvedUTC", "display", "utcDisplay", "past", "confirmation")))
-        self.assertEqual(json.loads(json.dumps(result)), result)
-        self.assertEqual((result["protocol"], result["requestId"]), (1, "date"))
 
 
 QUALIFY = Path(__file__).resolve().parents[1] / "tools" / "qualify_writer.py"
@@ -1041,6 +1073,24 @@ class QualifyWriterTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("FAIL", output)
         self.assertIn("NOT QUALIFIED", output)
+
+    def test_form_asks_pass_only_when_parsed_wording_equals_the_producers(self):
+        runtime = {"version": NEXT}
+        submitted = list(zip(["store", "ttl_days", "extras", "region", "extra_notes"], ["Redis: shared", "7", "", "us", ""]))
+
+        def form_session(wording):
+            result = answer({"answers": [{"name": name, "question": question, "answer": value}
+                                         for (name, value), question in zip(submitted, wording)]}, "form-one")
+            return [header(), entry("ask", message=form_ask(), runtime=runtime),
+                    entry("answer", "ask", result, runtime=runtime), entry("done", "answer", assistant("Done"), runtime=runtime)]
+
+        self.session("sole.jsonl", form_session(FORM_QUESTIONS))
+        code, output = self.run_tool()
+        self.assertEqual(code, 0, output)
+        self.session("sole.jsonl", form_session(["Storage backend"] + FORM_QUESTIONS[1:]))
+        code, output = self.run_tool()
+        self.assertEqual(code, 1)
+        self.assertIn("questions differ", output)
 
     def test_a_version_never_written_alone_or_absent_is_not_qualified(self):
         code, output = self.run_tool()

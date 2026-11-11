@@ -15,7 +15,7 @@ local MAX_COUNT = 1000000
 local MAX_INTEGER = 9007199254740991
 
 local STATUSES = { ok = true, disabled = true, unavailable = true }
-local SECTIONS = { attention = true, later = true, working = true }
+local SECTIONS = { attention = true, working = true }
 local PLACEMENTS = { tiled = true, floating = true, parked = true, unattached = true }
 local CLOCK_KINDS = { asked = true, replied = true, updated = true }
 local JUMPABLE_PLACEMENTS = { tiled = true, floating = true }
@@ -297,11 +297,11 @@ function phone.snapshot(presentation, workspace, options)
 		schema = phone.SCHEMA, revision = options.revision or 0, generatedUtc = math.floor(options.nowUtc), status = status,
 		reason = if status == "ok" then nil else bounded(options.reason, 200),
 		host = bounded(options.hostName, 64) or "Mac",
-		counts = { attention = 0, later = 0, working = 0 }, rows = {},
+		counts = { attention = 0, working = 0 }, rows = {},
 	}
 	if status ~= "ok" then return snapshot end
 	local tabs = tabIndex(workspace)
-	for _, section in ipairs({ "attention", "later", "working" }) do
+	for _, section in ipairs({ "attention", "working" }) do
 		local listed = options.view.queue(presentation, section)
 		snapshot.counts[section] = #listed
 		for _, row in ipairs(listed) do
@@ -388,11 +388,10 @@ local function check(raw)
 	snapshot.host = text(raw.host, 64)
 	if not snapshot.host or snapshot.host == "" then return nil, "snapshot host" end
 	local counts = raw.counts
-	if type(counts) ~= "table" or not integer(counts.attention, 0, MAX_COUNT) or not integer(counts.later, 0, MAX_COUNT)
-		or not integer(counts.working, 0, MAX_COUNT) then
+	if type(counts) ~= "table" or not integer(counts.attention, 0, MAX_COUNT) or not integer(counts.working, 0, MAX_COUNT) then
 		return nil, "snapshot counts"
 	end
-	snapshot.counts = { attention = counts.attention, later = counts.later, working = counts.working }
+	snapshot.counts = { attention = counts.attention, working = counts.working }
 	local rows = raw.rows
 	if type(rows) ~= "table" then return nil, "snapshot rows" end
 	if #rows > phone.MAX_ROWS then return nil, "too many rows" end

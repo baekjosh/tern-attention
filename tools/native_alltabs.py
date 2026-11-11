@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Native journeys for the explicit "use this position for all tabs" action (isolated headless Tern, real package).
 
-    persist   rail at LEFT, press Bottom on the tab, reload the plugin, switch tabs and back, create a new tab, reload
-              again: it must stay bottom and new tabs must open at the default bottom (no path may rewrite a chosen
-              position back to the physical edge)
-    alltabs   4 tabs, two rails at LEFT, Settings > All tabs > Bottom: the visited tab starts at once, the other marked
-              tab waits for its visit, tabs with no rail open at bottom, content trees are unchanged, no marker remains
-    shots     the two-row Placement setting at 1839x1135 (screenshot)
+    persist   rail at LEFT, "Use Bottom in this tab" (palette: a rail has no per-tab control), reload the plugin, Settings >
+              Rail placement > Bottom (the all-tabs move; it also sets the default for new rails), switch tabs and back, create a new tab, reload again:
+              it must stay bottom and the new tab must open at the default bottom (no path may rewrite a chosen position
+              back to the physical edge)
+    alltabs   4 tabs, two rails at LEFT; the Settings placement row carries Bottom/Right/Left; "Use Bottom for all tabs"
+              (palette, the same move the Settings row makes): the visited tab starts at once, the other marked tab
+              waits for its visit, tabs with no rail open at bottom, content trees are unchanged, no marker remains
+    shots     the Settings > Rail placement row at 1839x1135 with the rail at the default left (screenshot)
     all       every journey
 
     python3 tools/native_alltabs.py all [--package READYDIR] [--log FILE]
@@ -22,7 +24,6 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import native_harness as nh  # noqa: E402
 import native_journeys as nj  # noqa: E402
 
 PLUGIN, ENABLE, OPEN = nj.PLUGIN, nj.ENABLE, nj.OPEN
@@ -30,20 +31,6 @@ PLUGIN, ENABLE, OPEN = nj.PLUGIN, nj.ENABLE, nj.OPEN
 
 def lua(T, code):
     return nj.lua_retry(T, code) or {}
-
-
-def nudged_wait(T, predicate, what, timeout=60.0, nudge_every=6.0):
-    """Pump until predicate() holds; headless plugin timers stall mid-placement, so `Attention: Open` is the nudge."""
-    started, nudged = time.monotonic(), time.monotonic()
-    while time.monotonic() - started < timeout:
-        T.pump()
-        if predicate():
-            return round(time.monotonic() - started, 2)
-        if time.monotonic() - nudged >= nudge_every:
-            T.run_action(OPEN, check=False)
-            nudged = time.monotonic()
-        time.sleep(0.3)
-    raise nh.WaitTimeout(f"{what} not reached in {timeout}s")
 
 
 def edge_of(T, tab):
@@ -73,24 +60,9 @@ def focus_content(T, tab):
     return pane
 
 
-def click_position(T, label, scope):
-    """Click Settings > Placement `label` in the `scope` row ("this" = first match, "all" = last match in document order)."""
-    if nj.page_button_text(T, label) is None:
-        nj.click_until(T, lambda: nj.button_by_title(T, "More \u00b7"), lambda: nj.page_button_text(T, label) is not None, "settings open")
-    for _ in range(4):
-        for _ in range(6):
-            T.pump()
-            time.sleep(0.3)
-        found = [n for n in nj.nodes(T, "button") if n.get("text") == label]
-        if found:
-            nj.click_node(T, found[0] if scope == "this" else found[-1])
-            return len(found)
-    raise nh.HarnessError(f"no {label} button")
-
-
 def persist_case(package, log, name, split, mid_move):
-    """One rail at LEFT, Bottom pressed on its tab (optionally with split content and a plugin reload before the
-    placement settles), then every re-read of the store the plugin can make."""
+    """One rail at LEFT, moved to Bottom for this tab only (optionally with split content and a plugin reload before the
+    placement settles), Settings sets the default to Bottom, then every re-read of the store the plugin can make."""
     check = nj.Checks(log, f"PERSIST.{name}")
     with nj.new_instance(package, seed_files=nj.seeded_position("left"), width=1280, height=800) as T:
         tab = T.tabs()[0]["id"]
@@ -104,25 +76,30 @@ def persist_case(package, log, name, split, mid_move):
         nj.rail_ready(T, tab)
         kv_path = T.config / "plugin-data" / PLUGIN / "kv.json"
         if mid_move:
-            click_position(T, "Bottom", "this")
-            nudged_wait(T, lambda: stored(T, tab).get("position") == "bottom", "request recorded")
+            nj.request_this_tab(T, tab, "bottom")
+            nj.nudged_wait(T, lambda: stored(T, tab).get("position") == "bottom", "request recorded")
             nj.reload_plugin(T)
         else:
-            nj.choose_position(T, tab, "Bottom", "bottom")
-        nudged_wait(T, lambda: stored(T, tab).get("placement") is None and edge_of(T, tab) == "bottom", "bottom placement settled")
+            nj.choose_position(T, tab, "bottom")
+        nj.nudged_wait(T, lambda: stored(T, tab).get("placement") is None and edge_of(T, tab) == "bottom", "bottom placement settled")
         check("bottom-applied", edge_of(T, tab) == "bottom" and stored(T, tab).get("position") == "bottom"
-              and defaults(T).get("position") == "bottom" and content_tree(T, tab, "bottom") == contents,
-              {"edge": edge_of(T, tab), "stored": stored(T, tab).get("position"), "defaults": defaults(T).get("position"),
+              and content_tree(T, tab, "bottom") == contents,
+              {"edge": edge_of(T, tab), "stored": stored(T, tab).get("position"),
                "contentUnchanged": content_tree(T, tab, "bottom") == contents})
+        check("this-tab-move-leaves-the-default-at-left", defaults(T).get("position") == "left", defaults(T))
         tree = nj.layout_of(T, tab)
         nj.reload_plugin(T)
         nj.settle_store(T, kv_path, quiet=6.0)
         check("stays-bottom-after-plugin-reload", edge_of(T, tab) == "bottom" and stored(T, tab).get("position") == "bottom"
               and nj.layout_of(T, tab) == tree, {"edge": edge_of(T, tab), "stored": stored(T, tab).get("position")})
+        nj.press_placement(T, "bottom")
+        check("settings-default-row-sets-bottom", defaults(T).get("position") == "bottom" and edge_of(T, tab) == "bottom",
+              {"defaults": defaults(T).get("position"), "edge": edge_of(T, tab)})
+        nj.close_settings(T)
         second = T.new_tab()
         new_tab = T.lua_json(f"return {{ t = cx.session:tab_of({second}) }}")["t"]
         T.mount_count(PLUGIN, 2, timeout=40)
-        nudged_wait(T, lambda: stored(T, new_tab).get("placement") is None and edge_of(T, new_tab) == "bottom", "new tab at bottom")
+        nj.nudged_wait(T, lambda: stored(T, new_tab).get("placement") is None and edge_of(T, new_tab) == "bottom", "new tab at bottom")
         check("new-tab-opens-at-default-bottom", edge_of(T, new_tab) == "bottom" and stored(T, new_tab).get("position") == "bottom",
               {"edge": edge_of(T, new_tab), "stored": stored(T, new_tab).get("position")})
         for target in (tab, new_tab, tab):
@@ -150,8 +127,21 @@ def persist(package, log):
     items = [item for check in checks for item in check.items]
     return {"journey": "persist", "pass": all(check.passed for check in checks), "checks": items}
 
+
+def placement_row_facts(T):
+    """What the open Settings page shows for the rail placement row: its label, its state line and each control's count."""
+    buttons = [n["text"] for n in nj.nodes(T, "button") if n.get("text") in nj.PLACEMENT_LABELS.values()]
+    return {"labels": [n.get("text") for n in nj.nodes(T, "[data-role='attention.setting-label']")],
+            "states": [n.get("text") for n in nj.nodes(T, "[data-role='attention.explanation']")],
+            "controls": {label: buttons.count(label) for label in nj.PLACEMENT_LABELS.values()}}
+
+
+def placement_row_present(facts):
+    """The row exists and carries exactly one each of Bottom / Right / Left."""
+    return "Rail placement" in facts["labels"] and all(count == 1 for count in facts["controls"].values())
+
 def alltabs(package, log):
-    log("## alltabs: two rails at left, All tabs > Bottom, then visit every tab")
+    log("## alltabs: two rails at left, Use Bottom for all tabs, then visit every tab")
     check = nj.Checks(log, "ALLTABS")
     with nj.new_instance(package, seed_files=nj.seeded_position("left"), width=1280, height=800) as T:
         tab1 = T.tabs()[0]["id"]
@@ -164,7 +154,7 @@ def alltabs(package, log):
         tab2 = T.lua_json(f"return {{ t = cx.session:tab_of({pane2}) }}")["t"]
         nj.build(T, [("split", 0, "right")])
         T.mount_count(PLUGIN, 2, timeout=40)
-        nudged_wait(T, lambda: stored(T, tab2).get("placement") is None and edge_of(T, tab2) == "left", "tab 2 rail at left")
+        nj.nudged_wait(T, lambda: stored(T, tab2).get("placement") is None and edge_of(T, tab2) == "left", "tab 2 rail at left")
         tabs = [tab1, tab2]
         for _ in range(2):
             pane = lua(T, "return { p = cx.layout:new_tab({}, { focus = false }) }")["p"]
@@ -178,9 +168,13 @@ def alltabs(package, log):
               and nj.tab_rail(T, tab3) is None and nj.tab_rail(T, tab4) is None, {"edges": lefts, "tabs": tabs})
         tab2_before = nj.layout_of(T, tab2)
         shot_before = nj.keep_shot(T, "alltabs-before")
-        clicked = click_position(T, "Bottom", "all")
-        check("all-tabs-row-present", clicked >= 2, {"bottomButtons": clicked})
-        nudged_wait(T, lambda: stored(T, tab1).get("placement") is None and edge_of(T, tab1) == "bottom", "visited tab moves at once")
+        nj.open_settings(T)
+        facts = placement_row_facts(T)
+        check("settings-placement-row-present", placement_row_present(facts), facts)
+        nj.close_settings(T)
+        nj.focus_pane(T, first)
+        T.run_action(f"plugin.{PLUGIN}.all-tabs-bottom")
+        nj.nudged_wait(T, lambda: stored(T, tab1).get("placement") is None and edge_of(T, tab1) == "bottom", "visited tab moves at once")
         record = {t: stored(T, t) for t in tabs}
         check("selected-tab-moved-at-once", edge_of(T, tab1) == "bottom" and content_tree(T, tab1, "bottom") == contents[tab1]
               and record[tab1].get("moveTo") is None and record[tab1].get("position") == "bottom", {"edge": edge_of(T, tab1)})
@@ -195,7 +189,7 @@ def alltabs(package, log):
         for target in (tab2, tab3, tab4):
             focus_content(T, target) if nj.tab_rail(T, target) is not None else nj.focus_pane(
                 T, [p["pane"] for p in nj.pane_rows(T) if p["tab"] == target][0])
-            nudged_wait(T, lambda t=target: nj.tab_rail(T, t) is not None and stored(T, t).get("placement") is None
+            nj.nudged_wait(T, lambda t=target: nj.tab_rail(T, t) is not None and stored(T, t).get("placement") is None
                         and edge_of(T, t) == "bottom", f"tab {target} at bottom")
         final = {t: stored(T, t) for t in tabs}
         check("every-tab-at-bottom-with-content-unchanged", all(edge_of(T, t) == "bottom" for t in tabs)
@@ -216,27 +210,27 @@ def alltabs(package, log):
 
 
 def shots(package, log):
-    """The Placement setting at the viewport the user has: two rows (This tab, All tabs) under Settings."""
-    log("## shots: Settings > Placement at 1839x1135, rail at the default bottom")
+    """The Rail placement setting at the viewport the user has: one row (Bottom / Right / Left) under Settings."""
+    log("## shots: Settings > Rail placement at 1839x1135, rail at the default left")
     check = nj.Checks(log, "SHOTS")
     with nj.new_instance(package, width=1839, height=1135) as T:
         tab = T.tabs()[0]["id"]
         T.run_action(ENABLE)
         T.mount_count(PLUGIN, 1, timeout=40)
-        nudged_wait(T, lambda: stored(T, tab).get("placement") is None and edge_of(T, tab) == "bottom", "rail at bottom")
+        nj.nudged_wait(T, lambda: stored(T, tab).get("placement") is None and edge_of(T, tab) == "left", "rail at left")
         nj.rail_ready(T, tab)
-        nj.click_until(T, lambda: nj.button_by_title(T, "More \u00b7"), lambda: nj.page_button_text(T, "Reset placement") is not None, "settings open")
+        nj.open_settings(T)
         for _ in range(6):
             T.pump()
             time.sleep(0.4)
+        facts = placement_row_facts(T)
         T.ctl("hover", "[data-surface]")
         T.wheel(0, 400)
         for _ in range(4):
             T.pump()
             time.sleep(0.3)
-        labels = [n.get("text") for n in nj.nodes(T, "button") if n.get("text") in ("Bottom", "Right", "Left", "Reset placement")]
-        check("two-placement-rows", labels.count("Bottom") == 2 and labels.count("Right") == 2 and labels.count("Left") == 2
-              and labels.count("Reset placement") == 1, {"labels": labels, "shot": nj.keep_shot(T, "alltabs-settings")})
+        check("placement-row-at-default-left", placement_row_present(facts) and "Default for new tabs: Left." in facts["states"],
+              {**facts, "shot": nj.keep_shot(T, "alltabs-settings")})
     return {"journey": "shots", "pass": check.passed, "checks": check.items}
 
 JOURNEYS = {"persist": persist, "alltabs": alltabs, "shots": shots}
@@ -250,7 +244,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     package = args.package or nj.prepare_package()
     log = nj.Log(args.log)
-    log(f"# native all-tabs journeys · package {package}")
+    nj.RUN["edge"] = "left"  # every all-tabs journey drives LEFT rails: stacked two-region chrome, not bottom tabs
     reports = []
     for name in (JOURNEYS if args.journey == "all" else [args.journey]):
         try:

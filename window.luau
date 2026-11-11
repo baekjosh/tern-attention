@@ -35,13 +35,27 @@ local function countKeys(map)
 	return count
 end
 
+-- The all-tabs toast body: this tab, the rails that move on their next visit, and every kept rail by its reason.
+local function markSummary(movesNow, queued, kept)
+	local parts = {}
+	if movesNow then table.insert(parts, "This tab moves now") end
+	if queued > 0 then table.insert(parts, queued .. (if queued == 1 then " tab moves" else " tabs move") .. " on their next visit") end
+	local reasons = {}
+	if kept.hidden > 0 then table.insert(reasons, kept.hidden .. " hidden") end
+	if kept.parked > 0 then table.insert(reasons, kept.parked .. " parked or floating") end
+	if kept.elsewhere > 0 then table.insert(reasons, kept.elsewhere .. " not open in this tab") end
+	-- Disconnected hosts are marked like any other, so no reason names them.
+	if #reasons > 0 then table.insert(parts, "left as they are: " .. table.concat(reasons, ", ")) end
+	if #parts == 0 then return "Every tab is already there" end
+	return table.concat(parts, " · ")
+end
+
 -- Immutable vocabulary tables live at module scope; `bootstrap` sits at Luau's 200-local limit.
 local MARKER = "attention:rail:v1"
 local PREFS = "preferences"
 local INITIAL_SHARE = 0.25
-local BACKLOG_AGES = { [0] = true, [10800] = true, [21600] = true, [43200] = true, [86400] = true }
 local states = { idle = true, working = true, waiting_input = true, exited = true }
-local UI_SECTIONS = { attention = true, workspace = true, later = true, working = true }
+local UI_SECTIONS = { attention = true, workspace = true, working = true }
 local MAX_UI_KEYS, MAX_UI_KEY, MAX_UI_WINDOWS = 512, 256, 32
 local MAX_REMNANTS, REMNANT_ATTEMPTS, REMNANT_RETRY_MS, CAPTURE_LIMIT = 8, 3, 5000, 65536
 local results = { done = true, failed = true, exited = true, closed = true }
@@ -76,6 +90,10 @@ local acquireSources
 local owned = {}
 local events = {}
 local closedPanes, closedTabs = {}, {}
+-- `cx.agents:list()` is the costliest native read (8.6 ms mean, 21 ms worst in a live window), so a pass re-reads it only
+-- when an agent event, a pane appearing or closing, or the refresh age says it may have changed. Model and delivery
+-- error have no event; REFRESH_MS bounds how stale they can be.
+local agentCensus = { list = nil, readAt = nil, dirty = true, REFRESH_MS = 5000 }
 local snapshot = nil
 local ownerActive = false
 local ownerKey = nil
@@ -107,12 +125,30 @@ local eventOverflow = false
 local shortcutChecked = false
 local nextChord = nil
 local counters = { passes = 0, inventories = 0, canvasWrites = 0, layoutWrites = 0,
-	focusWrites = 0, kvWrites = 0, events = 0, errors = 0, budgetPauses = 0 }
+	focusWrites = 0, kvWrites = 0, events = 0, errors = 0, budgetPauses = 0, renders = 0 }
+-- Diagnostics-only firsts for agent panes, in this VM's monotonic ms: when a pane first joined a session inventory
+-- (`membershipAt`), when the native agent census first named its model (`modelAt`), when its recorded source was
+-- first read (`sourceAt`), and when its identity was first proven (`identityAt`). They ride on `counters` because
+-- the main chunk is at its local-register limit; no behavior reads them, the diagnostics command reports them
+-- (oldest first, bounded by `max`). Firsts survive an ownership epoch change: a reused pane id keeps its earlier
+-- first, which the diagnostics `allPanes` list makes visible when reading them.
+counters.stages = { panes = {}, order = {}, max = 64 }
+function counters.stage(pane, field)
+	local stages = counters.stages
+	if type(pane) ~= "number" then return end
+	local entry = stages.panes[pane]
+	if entry == nil then
+		if #stages.order >= stages.max then stages.panes[table.remove(stages.order, 1)] = nil end
+		entry = {}
+		stages.panes[pane], stages.order[#stages.order + 1] = entry, pane
+	end
+	if entry[field] == nil then entry[field] = tern.now() end
+end
 local durations, durationIndex = {}, 0
 -- Background-rail catch-up (see `render`): one lagging non-visible rail is painted per pass, round-robin by instance key.
 -- `after` is the last key painted, `passStartedAt` the current pass start and `budgetEventAt` the last native budget report.
 local catchup = { after = "", passStartedAt = nil, budgetEventAt = nil, PASS_MS = 25, PAUSE_MS = 5000, BACKOFF_MS = 2000,
-	BACKOFF_MAX_MS = 30000, REFRESH_MS = 10000, OVER_BUDGET_RETRY_MS = 250 }
+	BACKOFF_MAX_MS = 30000, REFRESH_MS = 10000, OVER_BUDGET_RETRY_MS = 250, timer = nil, pending = nil }
 local schedule, runPass, armHeartbeat, resetOwnedTitles
 
 local function id(value)
@@ -159,11 +195,21 @@ local placement = {
 	positions = { left = true, bottom = true, right = true },
 	edges = { left = "left", bottom = "down", right = "right" },
 	positionOf = { left = "left", down = "bottom", right = "right" },
-	default = "bottom",
-	-- Stored fields this version validates; anything else belongs to a newer or foreign writer and is carried through.
+	default = "left",
+	-- Delay before the next pass while a rail is placing: a tab the user is waiting on must not idle between batches.
+	PASS_MS = 8,
+	-- Two observed rail widths closer than this are the same width.
+	SHARE_EPSILON = 0.000001,
+	-- Tabs this window saw created (`tab_created`), until their rail is created or the tab closes. Such a tab cannot hold a
+	-- restored canvas, so its rail skips the restore grace. Bounded: entries past the cap are not recorded (they keep the grace).
+	createdTabs = {},
+	MAX_CREATED_TABS = 64,
+	-- Stored fields this version reads or validates. Legacy fields it drops on load (`share`, `shares`, `relocate`, the retired
+	-- Later age `backlogAfterSeconds`) are listed too, so `carry` never forwards them. Anything else belongs to a newer or
+	-- foreign writer and is carried through.
 	known = {
 		top = { schema = true, enabled = true, owner = true, backlogAfterSeconds = true, defaults = true,
-			instances = true, uiByWindow = true },
+			instances = true, uiByWindow = true, queueOrder = true, sessionOrder = true },
 		defaults = { position = true, shares = true, share = true, hidden = true },
 		entry = { tab = true, session = true, pane = true, userHidden = true, position = true, shares = true,
 			share = true, creating = true, retiring = true, closeAccepted = true, placement = true, remnants = true,
@@ -198,14 +244,6 @@ function placement.carry(target, source, known)
 	end
 end
 
--- Records the edge a rail already occupies (or the default for one that was never mounted). A pre-position
--- `share` was a left-rail fraction, so it survives only as the left size; any other adopted edge drops it.
-function placement.record(saved, position)
-	saved.position = position
-	if position == "left" and saved.shares.left == nil then saved.shares.left = saved.share end
-	saved.share = nil
-end
-
 -- The rail's share of the tab along its edge: the root ratio for a left rail, the remainder for the others.
 function placement.share(edge, root)
 	local ratio = root.ratio or 0.5
@@ -215,20 +253,22 @@ end
 -- Persisted navigator state for one window (D3): an unknown or transient section falls back to Attention and
 -- only bounded string keys survive, so a hand-edited or foreign value can never wedge the view.
 local function sanitizeUi(saved)
-	local ui = { section = "attention", collapsed = {}, setAsideOpen = {} }
+	local ui = { section = "attention", collapsed = {} }
 	if UI_SECTIONS[saved.section] then ui.section = saved.section end
-	for _, field in ipairs({ "collapsed", "setAsideOpen" }) do
-		local keys = {}
-		if type(saved[field]) == "table" then
-			for key, open in pairs(saved[field]) do
-				if type(key) == "string" and #key <= MAX_UI_KEY and open == true then table.insert(keys, key) end
+	local keys = {}
+	if type(saved.collapsed) == "table" then
+		for key, open in pairs(saved.collapsed) do
+			-- `collapsed` is tri-state (false = opened against a closed default).
+			if type(key) == "string" and #key <= MAX_UI_KEY and (open == true or open == false) then
+				table.insert(keys, key)
 			end
 		end
-		table.sort(keys)
-		for index = 1, math.min(#keys, MAX_UI_KEYS) do ui[field][keys[index]] = true end
 	end
+	table.sort(keys)
+	for index = 1, math.min(#keys, MAX_UI_KEYS) do ui.collapsed[keys[index]] = saved.collapsed[keys[index]] end
 	return ui
 end
+
 
 -- Parses any stored preferences into one schema-4 value and reports whether the stored copy must be rewritten.
 -- Schema 2/3 migrate on read (their in-flight placement checkpoints are dropped unreplayed). A schema-4 store
@@ -236,10 +276,51 @@ end
 -- edge on first observation, never moved. The obsolete `relocate` flag is stripped, unknown fields survive, and
 -- a newer schema raises, so nothing here can ever write it back downgraded.
 local function parsePreferences(raw, checkMigration)
+	-- The queue sections' display order: both queue names, once each. The retired `later` queue is dropped from a stored
+	-- order; anything that is not then exactly the two queues falls back to the default.
+	local function parseQueueOrder(value)
+		local default = { "attention", "working" }
+		if value == nil then return default end
+		array(value, "Attention queue order")
+		local queueOrder = {}
+		for _, name in ipairs(value) do
+			if name ~= "later" then table.insert(queueOrder, name) end
+		end
+		local permutation = #queueOrder == 2 and queueOrder[1] ~= queueOrder[2]
+			and table.find(default, queueOrder[1]) ~= nil and table.find(default, queueOrder[2]) ~= nil
+		return if permutation then queueOrder else default
+	end
+
+	-- Per-host session display order: string host key → unique positive session ids, capped per host and in
+	-- total; ids with no live session are ignored on read in navigation.
+	local function parseSessionOrder(value)
+		local order = {}
+		if value == nil then return order end
+		assert(type(value) == "table" and value ~= tern.json.null, "Attention session order unavailable")
+		local maxPerHost, maxHosts, maxEntries = 256, 64, 1024
+		local entries = 0
+		for hostKey, ids in pairs(value) do
+			assert(type(hostKey) == "string" and #hostKey <= MAX_UI_KEY, "Attention session order host unavailable")
+			array(ids, "Attention session order")
+			assert(#ids > 0 and #ids <= maxPerHost, "Attention session order length unavailable")
+			local seen = {}
+			for _, sessionId in ipairs(ids) do
+				assert(id(sessionId) and sessionId > 0 and not seen[sessionId], "Attention session order unavailable")
+				seen[sessionId] = true
+			end
+			-- Stored ids carry Tern's protected metatable; copy into a plain table.
+			local stored = {}
+			for _, sessionId in ipairs(ids) do table.insert(stored, sessionId) end
+			order[hostKey] = stored
+			entries += #ids
+		end
+		assert(countKeys(order) <= maxHosts and entries <= maxEntries, "Attention session order is too large")
+		return order
+	end
 	if raw == nil then
-		return { schema = SCHEMA, enabled = false, backlogAfterSeconds = 0,
+		return { schema = SCHEMA, enabled = false,
 			defaults = { position = placement.default, shares = { left = {}, bottom = {}, right = {} }, hidden = {} },
-			instances = {}, uiByWindow = {} }, false
+			instances = {}, uiByWindow = {}, queueOrder = parseQueueOrder(nil), sessionOrder = parseSessionOrder(nil) }, false
 	end
 	assert(type(raw) == "table" and type(raw.enabled) == "boolean", "Attention preferences unavailable")
 	local schema = raw.schema
@@ -254,11 +335,10 @@ local function parsePreferences(raw, checkMigration)
 	assert(type(defaults) == "table", "Attention defaults unavailable")
 	local position = defaults.position or placement.default
 	assert(placement.positions[position], "Attention placement unavailable")
-	local afterSeconds = raw.backlogAfterSeconds or 0
-	assert(BACKLOG_AGES[afterSeconds], "Attention backlog timing unavailable")
-	local value = { schema = SCHEMA, enabled = raw.enabled, owner = raw.owner, backlogAfterSeconds = afterSeconds,
+	local value = { schema = SCHEMA, enabled = raw.enabled, owner = raw.owner,
 		defaults = { position = position, shares = { left = {}, bottom = {}, right = {} }, hidden = {} },
-		instances = {}, uiByWindow = {} }
+		instances = {}, uiByWindow = {}, queueOrder = parseQueueOrder(raw.queueOrder),
+		sessionOrder = parseSessionOrder(raw.sessionOrder) }
 	if schema == SCHEMA then
 		placement.carry(value, raw, placement.known.top)
 		placement.carry(value.defaults, defaults, placement.known.defaults)
@@ -270,14 +350,6 @@ local function parsePreferences(raw, checkMigration)
 		for key, share in pairs(sizes or {}) do
 			assert(type(key) == "string" and fraction(share), "Attention size preference unavailable")
 			value.defaults.shares[axis][key] = share
-		end
-	end
-	if schema == SCHEMA then
-		-- The single pre-position size map described a left rail.
-		assert(defaults.share == nil or type(defaults.share) == "table", "Attention size preference unavailable")
-		for key, share in pairs(defaults.share or {}) do
-			assert(type(key) == "string" and fraction(share), "Attention size preference unavailable")
-			if value.defaults.shares.left[key] == nil then value.defaults.shares.left[key] = share end
 		end
 	end
 	for key, hidden in pairs(defaults.hidden or {}) do
@@ -295,8 +367,6 @@ local function parsePreferences(raw, checkMigration)
 			assert(entry.position == nil or placement.positions[entry.position], "Attention tab placement unavailable")
 			assert(schema ~= 3 or entry.position ~= nil, "Attention tab placement unavailable")
 			assert(entry.moveTo == nil or placement.positions[entry.moveTo], "Attention tab move request unavailable")
-			assert(entry.shares == nil or type(entry.shares) == "table", "Attention tab size unavailable")
-			assert(entry.share == nil or fraction(entry.share), "Attention tab size unavailable")
 			assert(entry.creating == nil or type(entry.creating) == "boolean", "Attention creation state unavailable")
 			assert(entry.retiring == nil or type(entry.retiring) == "boolean", "Attention retirement state unavailable")
 			assert(entry.closeAccepted == nil or type(entry.closeAccepted) == "boolean", "Attention close state unavailable")
@@ -318,21 +388,13 @@ local function parsePreferences(raw, checkMigration)
 				assert(entry.placement.generation == nil or (id(entry.placement.generation)
 					and entry.placement.generation >= 0), "Attention placement request unavailable")
 			end
-			local shares = {}
-			for axis, share in pairs(entry.shares or {}) do
-				assert(placement.positions[axis] and fraction(share), "Attention tab size unavailable")
-				shares[axis] = share
-			end
 			local saved = {}
 			if schema == SCHEMA then placement.carry(saved, entry, placement.known.entry) end
 			saved.tab, saved.session, saved.pane, saved.userHidden = entry.tab, entry.session, entry.pane, entry.userHidden
-			saved.position, saved.shares, saved.creating = entry.position, shares, entry.creating
+			saved.position, saved.creating = entry.position, entry.creating
 			saved.retiring, saved.closeAccepted, saved.remnants = entry.retiring, entry.closeAccepted, remnants
 			saved.moveTo = if schema == SCHEMA then entry.moveTo else nil
 			saved.placement = if schema == 3 then nil else entry.placement
-			-- Without a position the legacy size waits for the edge the rail is adopted at.
-			saved.share = if entry.position == nil then entry.share else nil
-			if entry.position == "left" and shares.left == nil then shares.left = entry.share end
 			value.instances[key][tabKey] = saved
 		end
 	end
@@ -373,6 +435,20 @@ end
 local function savePreferences(cx, prefs)
 	requireOwner(cx)
 	commitPreferences(prefs)
+end
+
+-- The width a rail on `rail`'s host takes at `position`: one share per host and position, 0.25 until the user drags.
+function placement.shareFor(rail, position)
+	return preferences().defaults.shares[position][rail.key] or INITIAL_SHARE
+end
+
+-- Persists a settled drag as that host's width for `position`; an unchanged width writes nothing.
+function placement.recordShare(cx, rail, position, share)
+	local prefs = preferences()
+	local sizes = prefs.defaults.shares[position]
+	if math.abs((sizes[rail.key] or INITIAL_SHARE) - share) <= placement.SHARE_EPSILON then return end
+	sizes[rail.key] = share
+	savePreferences(cx, prefs)
 end
 
 -- Writes one rail's saved instance immediately; write-ahead placement checkpoints use this directly.
@@ -509,6 +585,7 @@ local function invalidate()
 	remnantProbe, remnantEvidence, remnantCloses = nil, {}, {}
 	rails, owned, events = {}, {}, {}
 	closedPanes, closedTabs = {}, {}
+	placement.createdTabs = {}
 	snapshot, pendingVisit, pendingNavigation = nil, nil, nil
 	workspace, uiRestored = nil, false
 	focusHistory, contentPane = { stack = {}, current = nil, pendingBack = nil }, nil
@@ -608,8 +685,41 @@ end
 
 local function inventory(cx)
 	counters.inventories += 1
-	local raw = { hosts = cx.hosts:list(), sessions = cx.sessions:list(), tabs = cx.session:tabs(),
-		panes = cx.session:panes(), agents = cx.agents:list(), canvases = cx.canvas:list(), focused = cx.session:focused() }
+	local hosts, sessions, tabs = cx.hosts:list(), cx.sessions:list(), cx.session:tabs()
+	local panes = cx.session:panes()
+	local now = tern.now()
+	if agentCensus.dirty or agentCensus.list == nil or now - agentCensus.readAt >= agentCensus.REFRESH_MS then
+		agentCensus.list, agentCensus.readAt, agentCensus.dirty = cx.agents:list(), now, false
+	end
+	local agents = agentCensus.list
+	if agentCensus.readAt ~= now then
+		-- A reused census never names a pane that has since left; that agent is gone, not pending.
+		local present, kept = {}, {}
+		for _, source in ipairs(panes) do
+			if type(source) == "table" and type(source.pane) == "number" then present[source.pane] = true end
+		end
+		for _, source in ipairs(agents) do
+			if type(source) ~= "table" or present[source.pane] then table.insert(kept, source) end
+		end
+		agents = kept
+	end
+	local raw = { hosts = hosts, sessions = sessions, tabs = tabs,
+		panes = panes, agents = agents, canvases = cx.canvas:list(), focused = cx.session:focused() }
+	if #raw.agents > 0 then
+		-- Stage firsts (diagnostics only): this is where the census and pane membership are read.
+		local member = {}
+		for _, source in ipairs(raw.panes) do
+			local pane = if type(source) == "table" then source.pane else source
+			if type(pane) == "number" then member[pane] = true end
+		end
+		for _, source in ipairs(raw.agents) do
+			local pane = if type(source) == "table" then source.pane else nil
+			if type(pane) == "number" then
+				if member[pane] then counters.stage(pane, "membershipAt") end
+				if type(source.model) == "string" and source.model ~= "" then counters.stage(pane, "modelAt") end
+			end
+		end
+	end
 	local data = navigation.inventory(raw, { canvasOwned = canvasOwned, closedTabs = closedTabs, now = tern.now(),
 		states = states, null = tern.json.null })
 	if data.panes[data.focused] ~= nil then contentPane = data.focused
@@ -622,7 +732,7 @@ local function observationContext(cx, data, prefs, coherent)
 	local connected = {}
 	for _, host in pairs(if data then data.hosts else {}) do connected[host.key] = host.connected end
 	return { window = cx:window_key(), hostKeys = knownHostKeys, connected = connected,
-		coherent = coherent, nowUtc = utcNow(), afterSeconds = prefs.backlogAfterSeconds }
+		coherent = coherent, nowUtc = utcNow() }
 end
 
 local function hydrate(cx)
@@ -630,7 +740,8 @@ local function hydrate(cx)
 	local ok, failure = pcall(function()
 		local saved = tern.kv.get("triage")
 		store = model.new(saved)
-		savedRevision = if saved == nil or saved.schema == 3 then store.persistenceRevision else nil
+		-- model.new starts at revision 0; any bump during load is a migration (later → finished, retired fields) to write.
+		savedRevision = if saved == nil or saved.schema == 3 then 0 else nil
 		hydrated = true
 		for _, record in ipairs(if saved and saved.schema == 3 then saved.items else {}) do
 			if record.identityKey and record.source then sourceFacts[record.identityKey] = record.source end
@@ -733,6 +844,17 @@ local function refresh(cx, deferSources, acceptIdentity, shared)
 	value.sourceObservations, value.sourceHeaders = sourceObservations, sourceHeaders
 	snapshot = value
 	model.reconcile(store, value, pending, observationContext(cx, value, prefs, true))
+	-- Stage firsts (diagnostics only): the pass where a tracking record first claims an agent pane (native pane
+	-- authority, navigation's preferred route). The scan builds the presentation only while a member pane is
+	-- still unclaimed, so a settled pass costs one table walk.
+	for pane, entry in pairs(counters.stages.panes) do
+		if entry.membershipAt ~= nil and entry.claimedAt == nil then
+			for _, row in ipairs(model.current(store).rows) do
+				if row.pane == pane then counters.stage(pane, "claimedAt") end
+			end
+			break
+		end
+	end
 	-- Identity-keyed source caches outlive their panes only while a current locator names the key or a retained
 	-- record still holds it: its recorded fact resumes incremental capture when the conversation reopens, so an
 	-- evicted key is simply re-read in full if it ever returns. Eviction waits for this VM's identity picture to
@@ -793,9 +915,10 @@ local function project(cx, _data, _prefs, _coherent)
 	return projection, ok
 end
 
+-- Returns whether a conversation newly needs attention, and whether one newly entered Working.
 local function observeArrivals()
-	if projection == observedProjection then return false end
-	local observed, arrived = {}, false
+	if projection == observedProjection then return false, false end
+	local observed, arrived, started = {}, false, false
 	for _, row in ipairs(projection.rows) do
 		local previous = observedAttention and observedAttention[row.serial]
 		local changed = not previous or previous.pane ~= row.pane or previous.revision ~= row.attentionRevision
@@ -803,11 +926,13 @@ local function observeArrivals()
 		if observedAttention and not row.stale and row.attention and changed then
 			arrived = true
 		end
+		local working = view.inQueue(row, "working")
+		if observedAttention and not row.stale and working and not (previous and previous.working) then started = true end
 		observed[row.serial] = if row.stale and previous and previous.pane == row.pane then previous
-			else { pane = row.pane, revision = row.attentionRevision, eligible = row.attention == true }
+			else { pane = row.pane, revision = row.attentionRevision, eligible = row.attention == true, working = working }
 	end
 	observedAttention, observedProjection = observed, projection
-	return arrived
+	return arrived, started
 end
 
 local function railVisible(rail, data, activeHost, activeTab)
@@ -903,11 +1028,10 @@ local function viewOptions(prefs, rail, data)
 	local counts = if workspace then workspace.counts else nil
 	local position = rail.saved.position or prefs.defaults.position
 	return { now = tern.now(), nowUtc = utcNow(), notice = rail.error or notice, position = position,
-		navigation = shared.navigation, previous = shared.previous,
+		navigation = shared.navigation, previous = shared.previous, queueOrder = prefs.queueOrder,
 		workspace = workspace, current = if workspace then intents.currentLocation(workspace, data.content) else nil,
 		search = { available = counts ~= nil and counts.sessions + counts.destinations + counts.retained > 0 },
-		settings = { position = position, defaultPosition = prefs.defaults.position,
-			backlogAfterSeconds = prefs.backlogAfterSeconds, shortcut = nextChord } }
+		settings = { position = position, defaultPosition = prefs.defaults.position, shortcut = nextChord } }
 end
 
 local function ownedCanvas(cx, pane)
@@ -962,11 +1086,10 @@ local function newRail(host, tab, prefs)
 	local saved = entries and entries[tostring(tab.id)]
 	if not saved or saved.session ~= tab.session then
 		saved = { tab = tab.id, session = tab.session, userHidden = prefs.defaults.hidden[host.key] == true,
-			position = prefs.defaults.position, shares = {} }
-		for position in pairs(placement.positions) do saved.shares[position] = prefs.defaults.shares[position][host.key] end
+			position = prefs.defaults.position }
 	elseif saved.position == nil and saved.pane == nil then
 		-- Nothing is mounted to adopt, so the tab follows the default.
-		placement.record(saved, prefs.defaults.position)
+		saved.position = prefs.defaults.position
 	end
 	local restored = layout.new()
 	local requestGeneration = nil
@@ -1009,9 +1132,11 @@ local function ensureRail(data, prefs, host, tab)
 	return rail
 end
 
--- Follows where the rail physically is: its canonical edge and size are recorded, so a divider drag or a rail
--- that was moved natively is remembered per position. A rail found at a different edge than it was recorded at
--- was moved by hand, and a pending all-tabs move for it is dropped rather than undoing that.
+-- Follows where the rail physically is: its canonical edge is recorded per tab, and its width once the user's drag has
+-- settled. Width is one share per host and position (`defaults.shares[position][hostKey]`), never per tab. A rail's
+-- first observation, or its first at a new edge, is a baseline; a drag is settled when two consecutive observations
+-- agree, so one gesture is one write. A rail found at a different edge than it was recorded at was moved by hand,
+-- and a pending all-tabs move for it is dropped rather than undoing that.
 local function observeShare(cx, rail)
 	if rail.phase ~= "ready" or not rail.pane then return end
 	local arrangement = placement.observe(cx, rail.tab)
@@ -1021,28 +1146,36 @@ local function observeShare(cx, rail)
 	local position, share = placement.positionOf[edge], placement.share(edge, arrangement.root)
 	if share <= 0 or share >= 1 then return end
 	local saved = rail.saved
-	if saved.position ~= position or saved.shares[position] == nil or math.abs(saved.shares[position] - share) > 0.000001 then
-		if saved.position ~= position then saved.moveTo = nil end
-		saved.position, saved.share = position, nil
-		saved.shares[position] = share
+	if saved.position ~= position then
+		saved.moveTo, saved.position = nil, position
 		saveInstance(cx, rail)
+	end
+	local seen = rail.divider
+	if seen == nil or seen.position ~= position then
+		rail.divider = { position = position, share = share, settled = true }
+	elseif math.abs(seen.share - share) > placement.SHARE_EPSILON then
+		rail.divider = { position = position, share = share, settled = false }
+	elseif not seen.settled then
+		seen.settled = true
+		placement.recordShare(cx, rail, position, share)
 	end
 end
 
 -- A mounted rail whose store never recorded a position is adopted exactly where it is: its canonical edge when the
--- tab's root is an outer rail, otherwise the default. Adoption records a fact in memory (discover() persists every
--- adoption of a pass in one write) and never moves anything. Returns whether a position was recorded.
+-- tab's root is an outer rail, otherwise the default. It never moves anything. Returns the position it was adopted at
+-- and the physical width it was found at (nil when it has no edge); discover() records that width once per host and
+-- position in the same write as the adoption.
 function placement.adopt(cx, rail, native, prefs)
 	local position, share = prefs.defaults.position, nil
 	if native.tab == rail.tab and not native.parked and not native.floating then
 		local arrangement = placement.observe(cx, rail.tab)
-		if not arrangement then return false end
+		if not arrangement then return nil end
 		local edge = layout.edgeOf(arrangement.root, rail.pane)
 		if edge then position, share = placement.positionOf[edge], placement.share(edge, arrangement.root) end
 	end
-	placement.record(rail.saved, position)
-	if share and share > 0 and share < 1 then rail.saved.shares[position] = share end
-	return true
+	rail.saved.position = position
+	if share and (share <= 0 or share >= 1) then share = nil end
+	return position, share
 end
 
 local function retire(cx, rail, data)
@@ -1356,6 +1489,7 @@ acquireSources = function(cx, data)
 								end
 							end
 							sourceDirty[pane], sourcePollPending[pane] = nil, nil
+							counters.stage(pane, "sourceAt")
 						end
 					end
 				end
@@ -1552,14 +1686,14 @@ local function adoptManualMoves(cx, data)
 			end
 			local prefs = preferences()
 			local sourceSaved = { tab = rail.tab, session = rail.session, userHidden = true,
-				position = rail.saved.position, shares = table.clone(rail.saved.shares), share = rail.saved.share,
+				position = rail.saved.position,
 				pane = displaced and displaced.pane, retiring = rail.saved.retiring, remnants = rail.saved.remnants }
 			local source = displaced or newRail(data.hosts[rail.host], { id = rail.tab, session = rail.session }, prefs)
 			source.tab, source.session, source.saved, source.pane = rail.tab, rail.session, sourceSaved, sourceSaved.pane
 			source.phase, source.status, source.layout, source.pending = "ready", "Moved out · hidden in this tab", layout.new(), false
 			rail.tab, rail.session = tab.id, tab.session
 			rail.saved = { tab = tab.id, session = tab.session, pane = rail.pane, userHidden = false,
-				position = rail.saved.position, shares = table.clone(rail.saved.shares), share = rail.saved.share }
+				position = rail.saved.position }
 			rail.layout, rail.status, rail.phase, rail.error, rail.pending = layout.new(), "Manually moved · adopted in place", "ready", nil, false
 			rails[move.key], rails[destinationKey] = source, rail
 			prefs.instances[rail.key] = prefs.instances[rail.key] or {}
@@ -1668,7 +1802,14 @@ local function discover(cx, data, prefs)
 			saveInstance(cx, rail)
 		elseif native and data.canvases[rail.pane] then
 			rail.pending = false
-			if rail.saved.position == nil and placement.adopt(cx, rail, native, prefs) then table.insert(adopted, rail) end
+			local position, physical = nil, nil
+			if rail.saved.position == nil then position, physical = placement.adopt(cx, rail, native, prefs) end
+			if position then
+				table.insert(adopted, { rail = rail, position = position, share = physical })
+				-- Adopted means found where it is: an interrupted creation or placement is dropped, not finished, so the
+				-- host's width never resizes a rail nobody asked to move.
+				if rail.phase == "placing" then rail.phase = "ready" end
+			end
 			-- Accepted and owned: from here a later restart can blank it like any other recorded canvas.
 			if rail.saved.creating then rail.saved.creating = nil; saveInstance(cx, rail) end
 			if native.tab and native.tab ~= rail.tab then
@@ -1717,10 +1858,14 @@ local function discover(cx, data, prefs)
 	end
 	if #adopted > 0 then
 		local fresh, changed = preferences(), false
-		for _, rail in ipairs(adopted) do
+		for _, adoption in ipairs(adopted) do
+			local rail = adoption.rail
 			if rails[instanceKey(rail.key, rail.tab)] == rail and not rail.saved.retiring then
 				fresh.instances[rail.key] = fresh.instances[rail.key] or {}
 				fresh.instances[rail.key][tostring(rail.tab)] = rail.saved
+				-- One width per host and position: the first adopted width is recorded, and a stored width is never replaced.
+				local sizes = fresh.defaults.shares[adoption.position]
+				if adoption.share and sizes[rail.key] == nil then sizes[rail.key] = adoption.share end
 				changed = true
 			end
 		end
@@ -1745,8 +1890,11 @@ local function selectedContent(cx, data)
 	if type(arrangement) ~= "table" then return nil end
 	local target = if not owned[focused.pane] and treeHas(arrangement.root, focused.pane) then focused.pane
 		else treeLeaf(arrangement.root, owned)
+	local host = data.hosts[focused.host]
+	-- The one visit-eligibility predicate (placement, discovery and the all-tabs consume): a mounted, unzoomed, nonfloating
+	-- tab on a connected host.
 	return { host = focused.host, tab = focused.tab, target = target, arrangement = arrangement,
-		eligible = not focused.floating and not focused.parked and not arrangement.zoomed }
+		eligible = host ~= nil and host.connected and not focused.floating and not focused.parked and not arrangement.zoomed }
 end
 
 local function prepareLayout(cx, rail)
@@ -1767,7 +1915,10 @@ end
 
 local function createRail(cx, rail, data, selected, prefs)
 	rail.discoveries += 1
-	if rail.pending or rail.saved.creating or tern.now() - rail.firstMissing < 2000 or rail.discoveries < 2 then return end
+	-- The restore grace waits out canvases a restarted window is still replicating; a tab this window saw created has none.
+	local created = placement.createdTabs[rail.tab] == true
+	if rail.pending or rail.saved.creating
+		or (not created and (tern.now() - rail.firstMissing < 2000 or rail.discoveries < 2)) then return end
 	-- A metadata-less canvas here may be this tab's own accepted canvas awaiting replication; only a
 	-- host-side capture showing it blank or someone else's content lets creation proceed.
 	for pane in pairs(data.allPanes) do
@@ -1784,10 +1935,10 @@ local function createRail(cx, rail, data, selected, prefs)
 	local current = cx.hosts:current()
 	assert(current and current.id == rail.host and current.state == "connected", "Host selection changed")
 	assert(cx.session:tab_of(cx.session:focused()) == rail.tab, "Tab selection changed")
-	if rail.saved.position == nil then placement.record(rail.saved, prefs.defaults.position) end
+	if rail.saved.position == nil then rail.saved.position = prefs.defaults.position end
 	prepareLayout(cx, rail)
 	-- A tab marked by an all-tabs action that had no rail yet opens one straight at the marked position.
-	if rail.saved.moveTo then rail.saved.position, rail.saved.share, rail.saved.moveTo = rail.saved.moveTo, nil, nil end
+	if rail.saved.moveTo then rail.saved.position, rail.saved.moveTo = rail.saved.moveTo, nil end
 	rail.view = freshView(instanceKey(rail.key, rail.tab))
 	local options = viewOptions(prefs, rail, data)
 	local initial = view.render(rail.view, logical, projection, options)
@@ -1801,7 +1952,7 @@ local function createRail(cx, rail, data, selected, prefs)
 	end
 	local sessionId: number, tabId: number = rail.session, rail.tab
 	local position = rail.saved.position
-	local share = rail.saved.shares[position] or INITIAL_SHARE
+	local share = placement.shareFor(rail, position)
 	local spec = { title = "Attention", about = string.format("attention:tab:v1:%.0f:%.0f", sessionId, tabId),
 		view = initial.view, focus = false }
 	if position == "left" then
@@ -1832,9 +1983,10 @@ local function createRail(cx, rail, data, selected, prefs)
 	rail.publishedLogicalRevision = logical.revision
 	rail.pane, rail.saved.pane, rail.livePane = pane, pane, pane
 	rail.phase, rail.status = "placing", "Waiting for created canvas replica"
+	placement.createdTabs[rail.tab] = nil
 	savePlacement(cx, rail, "placing")
 	owned[pane] = true
-	schedule(32)
+	schedule(placement.PASS_MS)
 end
 
 local function placeRail(cx, rail, data, selected)
@@ -1872,17 +2024,17 @@ local function placeRail(cx, rail, data, selected)
 			return
 		end
 		rail.phase = "placing"
-		schedule(32)
+		schedule(placement.PASS_MS)
 		return
 	end
 	local outcome = layout.reconcile(rail.layout, guardedLayout(cx, rail), {
 		pane = rail.pane, target = target, tab = rail.tab, edge = edge,
-		share = rail.saved.shares[position] or INITIAL_SHARE, now = tern.now(), generation = rail.generation or 0,
+		share = placement.shareFor(rail, position), now = tern.now(), generation = rail.generation or 0,
 	})
 	rail.status = outcome.reason or (if outcome.settled then "Ready in this tab" else "Placing in this tab")
 	if outcome.settled then
 		rail.phase, rail.error = "ready", nil
-		rail.saved.creating, rail.saved.placement = nil, nil
+		rail.saved.creating, rail.saved.placement, rail.divider = nil, nil, nil
 		saveInstance(cx, rail)
 	elseif not outcome.again then
 		rail.phase, rail.error = "failed", outcome.reason or "Placement stopped · use Reset placement"
@@ -1890,7 +2042,7 @@ local function placeRail(cx, rail, data, selected)
 		savePlacement(cx, rail, "failed")
 	end
 	if outcome.again then savePlacement(cx, rail, "placing") end
-	if outcome.again then schedule(32) end
+	if outcome.again then schedule(placement.PASS_MS) end
 end
 
 local function maintainInstances(cx, data, prefs)
@@ -1929,42 +2081,79 @@ local function maintainInstances(cx, data, prefs)
 	end
 	if not selected or not selected.target or not selected.eligible then return end
 	local host, tab = data.hosts[selected.host], data.tabs[selected.tab]
-	if not host or not host.connected or not tab or closedTabs[selected.tab] then return end
+	if not tab or closedTabs[selected.tab] then return end
 	local rail = ensureRail(data, prefs, host, tab)
 	if rail.saved.userHidden or rail.phase ~= "unmounted" then return end
 	createRail(cx, rail, data, selected, prefs)
 end
 
--- What a paint depends on besides the clock: canvases built from equal keys are equal. A change in any other input
--- (a title, a relative time) reaches a background rail through the slower `REFRESH_MS` re-render instead.
+-- What a background rail's paint depends on besides the clock: canvases built from equal keys are equal. Where the user
+-- is (the current location, the Previous target, the focused-pane part of a tab row) is deliberately not in it: a focus
+-- change repaints the active rail only, and a background rail catches up when it becomes active or its own content
+-- changes. Any other input (a title, a relative time) reaches it through the slower `REFRESH_MS` re-render.
 function catchup.key(options)
-	local current, active, previous = options.current, options.navigation, options.previous
+	local active = options.navigation
 	return table.concat({ logical.revision, projection.revision or 0, projection.status or "", projection.message or "",
 		if workspace then workspace.signature else "", options.notice or "", options.position,
 		if active then tostring(active.workId) .. "|" .. tostring(active.serial) .. "|" .. tostring(active.pane) .. "|"
 			.. tostring(active.phase) .. "|" .. tostring(active.token) else "",
-		if current then current.key .. "|" .. current.title .. "|" .. current.context else "",
-		if previous and previous.available then previous.title else "", tostring(options.search.available),
-		tostring(options.settings.backlogAfterSeconds), tostring(options.settings.shortcut) }, "\30")
+		tostring(options.search.available),
+		tostring(options.settings.shortcut) }, "\30")
+end
+
+-- Everything `view.render` reads besides its renderer, as one string, or nil when it cannot be encoded (the rail then
+-- renders as before). The presentation is copy-on-change, so its revision and status stand for its rows; the workspace is
+-- rebuilt every pass, so its rendered tree is encoded (its `byKey`/`byPane` indexes repeat that tree). The clock enters
+-- only as a clock bucket, so an age chip advances at most that late: RENDER_CLOCK_S on the rail in view, and
+-- HIDDEN_CLOCK_S (ages are minute-granular) on a background rail a viewer may mirror. A pass that would rebuild an
+-- identical tree, then diff it to nothing, costs one native encode instead.
+local RENDER_CLOCK_S, HIDDEN_CLOCK_S = 10, 60
+local function renderInputs(options, clockSeconds)
+	local rest = {}
+	for key, value in pairs(options) do
+		if key ~= "now" and key ~= "nowUtc" and key ~= "workspace" and key ~= "arrival" then rest[key] = value end
+	end
+	local ws = options.workspace
+	local encoded, text = pcall(tern.json.encode, {
+		logical = logical, options = rest,
+		workspace = if ws then { hosts = ws.hosts, retained = ws.retained, counts = ws.counts, currentPane = ws.currentPane,
+			coverage = ws.coverage } else nil,
+	})
+	if not encoded then return nil end
+	return table.concat({ projection.revision or 0, projection.status or "", projection.message or "", projection.count or -1,
+		math.floor((options.nowUtc or 0) / clockSeconds), text }, "\30")
 end
 
 -- One paint of one rail: renders, writes the change and records what the canvas now shows. Returns whether the native
 -- write was accepted, its failure, and the options used. A rejected write leaves the renderer to resend in full.
-local function paintRail(cx, data, prefs, rail, arrival)
+local function paintRail(cx, data, prefs, rail, arrival, hidden)
 	local options = viewOptions(prefs, rail, data)
 	options.arrival = arrival
-	local change = view.render(rail.view, logical, projection, options)
-	if options.arrival and not rail.view.arrival then pendingArrival = nil end
+	local inputs = renderInputs(options, if hidden then HIDDEN_CLOCK_S else RENDER_CLOCK_S)
+	local renderer = rail.view
+	-- Unchanged inputs, a settled previous screen and no arrival starting or running: the render would be a no-op.
+	if inputs ~= nil and renderer.inputs == inputs and renderer.previous ~= nil and renderer.initialized
+		and not options.arrival and not renderer.arrival then
+		rail.painted = { renderer = renderer, key = catchup.key(options), at = tern.now() }
+		return true, nil, options
+	end
+	counters.renders += 1
+	renderer.inputs = nil
+	local change = view.render(renderer, logical, projection, options)
+	if options.arrival and not renderer.arrival then pendingArrival = nil end
 	local accepted, failure = true, nil
 	if change then
 		accepted, failure = pcall(setCanvas, cx, rail.pane, change, data)
-		if not accepted then view.invalidate(rail.view, true) end
+		if not accepted then view.invalidate(renderer, true) end
 	end
-	if accepted and (change or rail.publishedBindings == nil) then
-		rail.publishedBindings = table.clone(rail.view.bindings)
+	-- A revision-only change sends no patch, but the renderer now carries the new revision's bindings for the same screen.
+	-- Record them either way, or a click on the screen the user sees is refused as stale and nothing responds.
+	if accepted then
+		rail.publishedBindings = table.clone(renderer.bindings)
 		rail.publishedLogicalRevision = logical.revision
+		renderer.inputs = inputs
 	end
-	rail.painted = if accepted then { renderer = rail.view, key = catchup.key(options), at = tern.now() } else nil
+	rail.painted = if accepted then { renderer = renderer, key = catchup.key(options), at = tern.now() } else nil
 	return accepted, failure, options
 end
 
@@ -2025,7 +2214,7 @@ function catchup.run(cx, data, prefs, activeHost, activeTab)
 	local rail = chosen.rail
 	catchup.after = chosen.key
 	local writeFailed = canvasWriteFailed
-	local ran, accepted, failure = pcall(paintRail, cx, data, prefs, rail, false)
+	local ran, accepted, failure = pcall(paintRail, cx, data, prefs, rail, false, true)
 	if not ran then
 		failure, accepted = accepted, false
 		view.invalidate(rail.view, true)
@@ -2044,7 +2233,26 @@ function catchup.run(cx, data, prefs, activeHost, activeTab)
 			tern.log.warn("Attention:", "Background rail update failed: " .. string.sub(tostring(failure), 1, 512))
 		end
 	end
-	if waiting > 0 then schedule(32) end
+	if waiting > 0 then catchup.followUp(data, prefs) end
+end
+
+-- The next lagging background rail is painted from the same pass data, not by a full pass: one visible change can stale
+-- every hidden rail, and a full pass per rail (inventory, reconcile, render) ran a dozen of them back to back on the UI
+-- thread. The timer always paints from the latest pass's data; a pass running when it fires does its own catch-up.
+function catchup.followUp(data, prefs)
+	catchup.pending = { data = data, prefs = prefs }
+	if catchup.timer then return end
+	catchup.timer = tern.timer(32, function(cx)
+		local pending = catchup.pending
+		catchup.timer, catchup.pending = nil, nil
+		if busy or pending == nil or snapshot ~= pending.data then return end
+		local ok, failure = pcall(function()
+			if not isOwner(cx) then return end
+			local focused = cx.session:focused()
+			catchup.run(cx, pending.data, pending.prefs, cx.hosts:current(), if focused then cx.session:tab_of(focused) else nil)
+		end)
+		if not ok then report(cx, failure, false) end
+	end)
 end
 
 local function render(cx, data, prefs)
@@ -2099,14 +2307,12 @@ end
 
 local function rowVersion(row)
 	return table.concat({ row.workId, tostring(row.serial), tostring(row.identityKey), tostring(row.sourceSessionId), tostring(row.pane),
-		tostring(row.attentionRevision), tostring(row.reviewRevision), row.disposition, tostring(row.priority),
-		tostring(row.untilUtc), tostring(row.availableOn), tostring(row.availableTime), tostring(row.zone) }, "|")
+		tostring(row.attentionRevision), tostring(row.reviewRevision), row.disposition, tostring(row.priority) }, "|")
 end
 
 local function intentVersion(row)
 	return table.concat({ row.workId, tostring(row.serial), tostring(row.identityKey), tostring(row.pane),
-		tostring(row.attentionRevision), tostring(row.reviewRevision), row.disposition, tostring(row.priority),
-		tostring(row.untilUtc), tostring(row.availableOn), tostring(row.availableTime), tostring(row.zone) }, "|")
+		tostring(row.attentionRevision), tostring(row.reviewRevision), row.disposition, tostring(row.priority) }, "|")
 end
 
 local function captureOrigin(cx, rail, row)
@@ -2201,7 +2407,7 @@ local function validateOrigin(cx, origin, data, navigation)
 		origin.sourceSessionId, origin.rowVersion = row.sourceSessionId, rowVersion(row)
 	end
 	assert(not origin.workId or (row and rowVersion(row) == origin.rowVersion),
-		"Conversation evidence changed; choose its current menu")
+		"This conversation menu is no longer current")
 	return data, row
 end
 
@@ -2278,35 +2484,48 @@ local function saveAction(cx, data)
 	schedule(32)
 end
 
-local function deferDate(cx, origin)
-	cx:prompt({ placeholder = "YYYY-MM-DD [HH:MM] [IANA zone · default: system zone] · availability, not deadline",
-		action = "resolve local date" }):next(completedAction(origin, function(fresh, value)
-		assert(type(value) == "string", "Date entry unavailable")
-		local parts = {}
-		for part in string.gmatch(value, "%S+") do table.insert(parts, part) end
-		assert(#parts >= 1 and #parts <= 3, "Use YYYY-MM-DD [HH:MM] [IANA zone]")
-		local civilTime, zone = nil, nil
-		if parts[2] and string.find(parts[2], ":", 1, true) then civilTime, zone = parts[2], parts[3]
-		else zone = parts[2]; assert(parts[3] == nil, "Use YYYY-MM-DD [HH:MM] [IANA zone]") end
-		enqueueHelperAction(fresh, { op = "date", civilDate = parts[1], civilTime = civilTime, zone = zone, nowUtc = utcNow() }, 3000,
-			function(resolved, current)
-				validateOrigin(current, origin)
-				assert(resolved.status == "ready", resolved.error or "Civil time is invalid or ambiguous; specify another time")
-				assert(type(resolved.resolvedUTC) == "number" and type(resolved.zone) == "string"
-					and type(resolved.display) == "string" and type(resolved.confirmation) == "string",
-					"Resolved civil time unavailable")
-				current:pick({ placeholder = resolved.confirmation,
-					action = "defer until shown time", items = { { label = "Confirm Later", resolved = resolved } },
-				}):next(completedMutation(origin, function(owner, selected, row, data)
-					local date = selected.resolved
-					model.setDisposition(store, row.workId, "later", utcNow(),
-						{ untilUtc = date.resolvedUTC, availableOn = parts[1], availableTime = date.civilTime, zone = date.zone })
-					saveAction(owner, data)
-				end))
-			end)
-	end))
+-- Applies one native tab move for the reorder intent: the session's tabs by current position, the moved tab
+-- spliced ahead of `beforeId` (nil = end), one order_tab call at the dense one-based position, then a readback
+-- that proves native accepted it — the native sidebar ends in exactly this order.
+function intents.orderSessionTab(cx, sessionId, tabId, beforeId)
+	local ordered, index, positionOf = {}, {}, {}
+	for listed, tab in ipairs(array(cx.session:tabs(), "Tabs")) do
+		if tab.session == sessionId then
+			table.insert(ordered, tab.id)
+			index[tab.id], positionOf[tab.id] = listed, tab.position
+		end
+	end
+	table.sort(ordered, function(a, b)
+		if positionOf[a] ~= positionOf[b] then return positionOf[a] < positionOf[b] end
+		return index[a] < index[b]
+	end)
+	local movingAt = table.find(ordered, tabId)
+	if movingAt == nil then return nil, "Target changed" end
+	table.remove(ordered, movingAt)
+	local insertAt = if beforeId == nil then #ordered + 1 else table.find(ordered, beforeId)
+	if insertAt == nil then return nil, "Target changed" end
+	table.insert(ordered, insertAt, tabId)
+	local position = table.find(ordered, tabId)
+	cx.layout:order_tab(tabId, position)
+	counters.layoutWrites += 1
+	placement.changed()
+	local readback, readbackIndex, readbackPosition = {}, {}, {}
+	for listed, tab in ipairs(array(cx.session:tabs(), "Tabs")) do
+		if tab.session == sessionId then
+			table.insert(readback, tab.id)
+			readbackIndex[tab.id], readbackPosition[tab.id] = listed, tab.position
+		end
+	end
+	table.sort(readback, function(a, b)
+		if readbackPosition[a] ~= readbackPosition[b] then return readbackPosition[a] < readbackPosition[b] end
+		return readbackIndex[a] < readbackIndex[b]
+	end)
+	if #readback ~= #ordered then error("Native tab order did not change", 0) end
+	for at, id in ipairs(ordered) do
+		if readback[at] ~= id then error("Native tab order did not change", 0) end
+	end
+	return true
 end
-
 
 -- Navigation intents (D4): the navigator tree, search, creation and navigation-only activation. They live in their
 -- own function scope because `bootstrap` is at Luau's limit of 200 local registers; only the entry points are
@@ -2314,9 +2533,12 @@ end
 -- skips, or advances the Next attention round, and a pending review navigation is dropped, never completed.
 intents.install = function()
 	-- One navigator tree per observation: conversation tracking rows joined onto the native destinations.
-	local function projectWorkspace(cx, data, rows)
+	local function projectWorkspace(cx, data, rows, sessionOrder)
+		-- The hot pass hands in the prefs it already parsed; an intent without them reads the store, where a
+		-- just-written order is already visible.
 		return navigation.project(data, { rows = rows, identities = data.identities, identityPending = data.identityPending,
-			window = cx:window_key(), nowUtc = utcNow() })
+			window = cx:window_key(), nowUtc = utcNow(),
+			sessionOrder = if sessionOrder ~= nil then sessionOrder else preferences().sessionOrder })
 	end
 
 	-- A fresh inventory and tree for an intent that must re-resolve its target; never a cached pass.
@@ -2333,16 +2555,25 @@ intents.install = function()
 		local destination = if key then navigation.resolve(space, key) else nil
 		if destination == nil then return nil end
 		local chain = navigation.ancestors(space, key)
-		local context = {}
+		local context, tabTitle, sessionName = {}, nil, nil
 		if destination.placement == "parked" then table.insert(context, "Parked")
 		elseif destination.placement == "unattached" then table.insert(context, "Unattached") end
 		for index = #chain, 1, -1 do
 			local ancestor = navigation.resolve(space, chain[index])
-			if ancestor ~= nil and ancestor.kind == "tab" and not ancestor.flattened then table.insert(context, ancestor.title)
-			elseif ancestor ~= nil and ancestor.kind == "session" then table.insert(context, ancestor.name)
+			if ancestor ~= nil and ancestor.kind == "tab" then
+				tabTitle = ancestor.title
+				if ancestor.title ~= destination.title then table.insert(context, ancestor.title) end
+			elseif ancestor ~= nil and ancestor.kind == "session" then
+				sessionName = ancestor.name
+				table.insert(context, ancestor.name)
 			elseif ancestor ~= nil and ancestor.kind == "host" and #space.hosts > 1 then table.insert(context, ancestor.name) end
 		end
-		return { key = key, title = destination.title, context = table.concat(context, " · ") }
+		-- The model is display-only: named only for a conversation, as its rail row is, and it never enters the key above.
+		local model = if destination.conversation ~= nil then destination.model else nil
+		-- `tab` and `session` name the place itself (the owning tab and its session) for the Workspace region header,
+		-- structured rather than re-parsed from `context`.
+		return { key = key, title = destination.title, context = table.concat(context, " · "), model = model,
+			tab = tabTitle, session = sessionName }
 	end
 
 	-- Saved navigator state (D3) is restored once per ownership epoch, before an intent or render first uses `logical`.
@@ -2431,20 +2662,20 @@ intents.install = function()
 		schedule(32)
 	end
 
-	-- Opens every collapsed ancestor of `key`, selects Workspace and anchors the list on the row; view state only.
+	-- Opens every ancestor of the row that represents `key` (a pane inside a tab is represented by its tab row), explicitly,
+	-- so a stacked rail's collapsed default cannot hide it, and selects Workspace; view state only. A row past the
+	-- canvas cap is covered by the canvas footer ("N more not shown · Search reaches them").
 	local function revealNode(cx, space, key)
+		local rowKey = navigation.rowKey(space, key)
 		view.section(logical, "workspace")
-		for _, ancestor in ipairs(navigation.ancestors(space, key)) do
-			if string.sub(ancestor, 1, 6) == "aside:" then logical.workspace.setAsideOpen[string.sub(ancestor, 7)] = true
-			else logical.workspace.collapsed[ancestor] = nil end
+		for _, ancestor in ipairs(navigation.ancestors(space, rowKey)) do
+			logical.workspace.collapsed[ancestor] = false
 		end
-		local order, index = {}, nil
-		for position, row in ipairs(navigation.rows(space, logical.workspace).rows) do
-			order[position] = row.key
-			if index == nil and row.ref.key == key then index = position end
+		local listed = false
+		for _, row in ipairs(navigation.rows(space, logical.workspace).rows) do
+			if row.ref.key == rowKey then listed = true; break end
 		end
-		assert(index, "That place is not listed in Workspace")
-		logical.anchors.workspace = { key = order[index], index = index, order = order }
+		assert(listed, "That place is not listed in Workspace")
 		logical.revision += 1
 		logical.intentRevision += 1
 		saveUi(cx, view.ui(logical))
@@ -2462,25 +2693,49 @@ intents.install = function()
 		if node.kind == "pane" then
 			activateDestination(cx, space, current, node)
 		elseif node.kind == "tab" then
-			local destination = destinationOf(space, node.focusedPane)
-			if destination == nil or destination.tabId ~= node.id or destination.hostKey ~= node.hostKey then
-				destination = node.destinations[1]
-			end
-			if destination == nil then refuse(cx, "This tab has no content to show"); return end
-			activateDestination(cx, space, current, destination)
+			-- The tab's target pane is what a pane click would open; a tab with none is refused, never guessed.
+			if node.target == nil then refuse(cx, "Tab has no open pane · nothing changed"); return end
+			activateDestination(cx, space, current, node.target)
 		elseif node.kind == "session" or node.kind == "host" then
 			local host = hostNode(space, node.hostKey)
 			if host == nil or not host.connected then refuse(cx, "Host is offline · nothing changed"); return end
 			requireOwner(cx)
 			pendingVisit, pendingNavigation = nil, nil
 			if node.kind == "session" then showSession(cx, current, host, node.id) else showHost(cx, current, host) end
+			-- An empty session has nothing to show Attention in: opening it opens its first tab, as native's New tab would.
+			if node.kind == "session" and node.empty then
+				cx.layout:new_tab({})
+				placement.changed()
+				counters.layoutWrites += 1
+			end
 			schedule(32)
 		elseif node.kind == "retained" then
-			revealNode(cx, space, key)
-			if logical.expandedWorkId ~= node.workId then view.expand(logical, node.workId) end
-			schedule(32)
+			-- A saved conversation has no open pane to go to; it is not a tree row, so Search and queue rows
+			-- resolve here and are told so plainly.
+			refuse(cx, "No open pane")
 		else
 			error("Unknown Workspace target")
+		end
+	end
+
+	-- Closing the last tab of the current session leaves no tab for Attention to live in, so the window goes back to
+	-- where you were before, like closing a browser's last tab: the newest live pane of the focus history. The empty
+	-- session stays listed. A session you switch to while empty is left alone; only a close lands here.
+	intents.leaveEmptySession = function(cx)
+		local space, data = freshWorkspace(cx)
+		local sessionId = data.currentSession
+		if sessionId == nil or data.sessions[sessionId] == nil then return end
+		for _, tab in pairs(data.tabs) do
+			if tab.session == sessionId and not closedTabs[tab.id] then return end
+		end
+		local stack = focusHistory.stack
+		while #stack > 0 do
+			local pane = table.remove(stack)
+			local destination = if focusTarget(data, pane) then destinationOf(space, pane) else nil
+			if destination ~= nil and destination.placement ~= "parked" then
+				activateDestination(cx, space, data, destination)
+				return
+			end
 		end
 	end
 
@@ -2682,34 +2937,270 @@ intents.install = function()
 			completedIntent(intent, function(fresh, selected) createKind(fresh, intent, target, selected.op) end))
 	end
 
-	-- The native More menu of a tab or session row: rename and add a tab. Close is never offered here.
-	local function nativeMenu(cx, binding)
+	-- The panes a tab row owns, read live. Empty when the lookup fails, so a tab whose panes cannot be read simply
+	-- offers no Park or Close.
+	local function tabPanes(cx, tabId)
+		local listed, panes = pcall(function() return array(cx.session:panes(), "Panes") end)
+		if not listed then return {} end
+		local found = {}
+		for _, info in ipairs(panes) do
+			if info.tab == tabId then table.insert(found, info.pane) end
+		end
+		return found
+	end
+
+	-- A conversation's tracking choices. Its own More menu and the More menu of the tab row whose target it is (the
+	-- conversation the row is titled with) both list these, so the labels and ops live in one place. Open existing pane
+	-- is added by the conversation's own menu only: a tab row already opens its tab.
+	function intents.trackingItems(row)
+		local items = {}
+		table.insert(items, { label = "Set priority · P0–P3 or unset", op = "priority" })
+		table.insert(items, { label = "Keep as reference", op = "reference" })
+		table.insert(items, { label = "Finished for now · current scope", op = "finished" })
+		if row.disposition == "reference" or row.disposition == "finished" then
+			table.insert(items, { label = "Resume tracking · does not run agent", op = "active" })
+			table.insert(items, { label = "Bring back now", op = "bring-back" })
+		end
+		if row.pane == nil and row.retained then table.insert(items, { label = "Remove retained row · no open pane", op = "remove" }) end
+		if row.pane ~= nil and row.orphaned and not row.navigable then
+			table.insert(items, { label = "Remove unavailable tracking · no verified route", op = "remove-unavailable" })
+		end
+		table.insert(items, { label = "Inspect recorded facts · does not navigate or acknowledge", op = "inspect" })
+		return items
+	end
+
+	-- The dispatch of one tracking choice, shared by a conversation's More menu and its tab row's More menu. The origin
+	-- pins the window, rail and conversation version the menu was built from; completion goes through validateOrigin, so a
+	-- conversation that changed since the menu opened refuses and nothing is written.
+	function intents.workChoice(origin)
+		return function(fresh, selected, current, data)
+			if selected.op == "inspect" then
+				if logical.expandedWorkId ~= current.workId then view.expand(logical, current.workId) end
+				return
+			end
+			if selected.op == "open-pane" then
+				intents.routeOpen(fresh, { workId = current.workId, serial = current.serial, pane = current.pane,
+					identityKey = current.identityKey, sourceSessionId = current.sourceSessionId }, data)
+				return
+			end
+			if selected.op == "priority" then
+				local choices = { { label = "Unset", current = current.priority == nil } }
+				for priority, label in ipairs({ "P0 Now", "P1 Next", "P2 Planned", "P3 Optional" }) do
+					table.insert(choices, { label = label, priority = priority - 1, current = current.priority == priority - 1 })
+				end
+				fresh:pick({ placeholder = "Explicit priority · not inferred urgency", items = choices }):next(
+					completedMutation(origin, function(owner, choice, selectedRow, selectedData)
+						model.setPriority(store, selectedRow.workId, choice.priority)
+						saveAction(owner, selectedData)
+					end))
+				return
+			end
+			withHeaderProof(fresh, current, function(owner)
+				local currentData, rowValue = validateOrigin(owner, origin)
+				if selected.op == "remove" then assert(model.removeRetained(store, rowValue.workId), "Only retained work without an open pane may be removed")
+				elseif selected.op == "remove-unavailable" then
+					assert(model.removeUnavailable(store, rowValue.pane, rowValue.serial), "Live or offline conversations cannot be removed")
+				elseif selected.op == "bring-back" then model.setDisposition(store, rowValue.workId, "active", utcNow(), { bringBack = true })
+				else model.setDisposition(store, rowValue.workId, selected.op, utcNow()) end
+				saveAction(owner, currentData)
+			end)
+		end
+	end
+
+	-- Manual reorder (D6) from a ⋯ menu: Move up, down, to top or to bottom among the target's siblings (queue
+	-- sections; one host's sessions; one session's tabs). Only moves that change the order are offered.
+	local MOVE_LABELS = { up = "up", down = "down", top = "to top", bottom = "to bottom" }
+
+	-- The moves that change `current`'s place among `ids`, in menu order.
+	local function movesFor(ids, current)
+		local at, count = table.find(ids, current), #ids
+		if at == nil then return {} end
+		local moves = {}
+		if at > 1 then table.insert(moves, "up") end
+		if at < count then table.insert(moves, "down") end
+		if at > 2 then table.insert(moves, "top") end
+		if at < count - 1 then table.insert(moves, "bottom") end
+		return moves
+	end
+
+	-- `ids` with `current` moved `to`, or nil when that move no longer changes the order.
+	local function movedOrder(ids, current, to)
+		local at = table.find(ids, current)
+		if at == nil or table.find(movesFor(ids, current), to) == nil then return nil end
+		local order = table.clone(ids)
+		table.remove(order, at)
+		table.insert(order, if to == "top" then 1 elseif to == "bottom" then #ids elseif to == "up" then at - 1 else at + 1, current)
+		return order
+	end
+
+	-- The listed (non-empty) sessions of a host, and one session's tabs, in display order.
+	local function listedSessionIds(host)
+		local ids = {}
+		for _, session in ipairs(host.sessions) do
+			if #session.tabs > 0 then table.insert(ids, session.id) end
+		end
+		return ids
+	end
+	local function sessionTabIds(host, sessionId)
+		for _, session in ipairs(host.sessions) do
+			if session.id == sessionId then
+				local ids = {}
+				for _, tab in ipairs(session.tabs) do table.insert(ids, tab.id) end
+				return ids, session
+			end
+		end
+		return {}, nil
+	end
+
+	-- Applies one chosen move against a fresh snapshot. A session or tab target must still carry the signature
+	-- the user saw, and the move must still change the order, else it refuses rather than moves something else.
+	-- Tabs order natively (`order_tab`), so the native sidebar matches; queue and session order are Attention's
+	-- own preferences.
+	local function applyMove(cx, target, to)
+		local active, prefs = syncOwnership(cx)
+		assert(active, "Use Attention: Enable here to reorder from this window")
+		ensureUi(cx, prefs)
+		if target.scope == "queue" then
+			local order = movedOrder(prefs.queueOrder, target.name, to)
+			if order == nil then refuse(cx, "Target changed"); return end
+			prefs.queueOrder = order
+			savePreferences(cx, prefs)
+			return
+		end
+		local space = freshWorkspace(cx)
+		local host = hostNode(space, target.hostKey)
+		if host == nil or navigation.resolve(space, target.key) == nil
+			or not navigation.signatureMatches(space, target.key, target.signature) then
+			refuse(cx, "Target changed")
+			return
+		end
+		if target.scope == "session" then
+			local order = movedOrder(listedSessionIds(host), target.sessionId, to)
+			if order == nil then refuse(cx, "Target changed"); return end
+			-- Empty sessions are not listed; they keep their place after the listed ones.
+			for _, session in ipairs(host.sessions) do
+				if not table.find(order, session.id) then table.insert(order, session.id) end
+			end
+			prefs.sessionOrder[target.hostKey] = order
+			savePreferences(cx, prefs)
+			return
+		end
+		assert(target.scope == "tab", "Unknown move target")
+		local order = movedOrder((sessionTabIds(host, target.sessionId)), target.tabId, to)
+		if order == nil then refuse(cx, "Target changed"); return end
+		requireOwner(cx)
+		local applied, reason = intents.orderSessionTab(cx, target.sessionId, target.tabId, order[table.find(order, target.tabId) + 1])
+		if not applied then refuse(cx, reason or "Target changed") end
+	end
+
+	-- A queue section's ⋯ menu: its moves among the queue sections.
+	local QUEUE_NAMES = { attention = "Attention", working = "Working" }
+	local function queueMenu(cx, binding)
+		local active, prefs = syncOwnership(cx)
+		assert(active, "Use Attention: Enable here to reorder from this window")
+		ensureUi(cx, prefs)
+		local name = assert(QUEUE_NAMES[binding.name] and binding.name, "Unknown queue")
+		local items = {}
+		for _, to in ipairs(movesFor(prefs.queueOrder, name)) do
+			table.insert(items, { label = "Move " .. MOVE_LABELS[to], detail = QUEUE_NAMES[name], to = to })
+		end
+		local choose = completedIntent(captureIntent(cx), function(fresh, selected)
+			applyMove(fresh, { scope = "queue", name = name }, selected.to)
+		end)
+		cx:pick({ items = items, placeholder = QUEUE_NAMES[name] }):next(choose)
+	end
+
+	-- The native More menu of a tab row: the row's target conversation's tracking items first, then the tab
+	-- actions: rename, add a tab, and move the tab or its session. A tab that owns panes also offers Park
+	-- (detach them, programs keep running) and Close (end them) for every one of its panes. Close is destructive by
+	-- design, so it is deliberate (open the menu, choose Close) and never asks again.
+	local function nativeMenu(cx, rail, binding)
 		local active, prefs = syncOwnership(cx)
 		assert(active, "Use Attention: Enable here to manage tabs from this window")
 		ensureUi(cx, prefs)
-		local space = freshWorkspace(cx)
+		local space, data = freshWorkspace(cx)
 		local node = navigation.resolve(space, binding.key)
-		if node == nil or (node.kind ~= "tab" and node.kind ~= "session")
+		if node == nil or node.kind ~= "tab"
 			or not navigation.signatureMatches(space, binding.key, binding.signature) then
 			refuse(cx, "Target changed")
 			return
 		end
 		local host = hostNode(space, node.hostKey)
 		if host == nil or not host.connected then refuse(cx, "Host is offline · nothing changed"); return end
-		local title = if node.kind == "tab" then node.title else node.name
-		local items = {
-			{ label = if node.kind == "tab" then "Rename tab…" else "Rename session…", detail = title, op = "rename" },
-			{ label = "New tab here", detail = "Shell tab in " .. title, op = "new" },
-		}
+		local title = node.title
+		-- A tab row whose target is a conversation with a current work row (the conversation the row is titled with)
+		-- offers that conversation's tracking choices first. They are pinned to the conversation's version as the menu
+		-- opens, so a change before a choice refuses.
+		local conversation = if node.kind == "tab" and node.target ~= nil and node.target.conversation ~= nil
+			then workRow(node.target.conversation.workId) else nil
+		local origin = if conversation then captureOrigin(cx, rail, conversation) else nil
+		local items = if conversation then intents.trackingItems(conversation) else {}
+		for _, item in ipairs(items) do item.work = true end
+		table.insert(items, { label = "Rename tab…", detail = title, op = "rename" })
+		table.insert(items, { label = "New tab here", detail = "Shell tab in " .. title, op = "new" })
+		-- Tab moves change native order, so they are offered only on the host this window shows.
+		local tabIds, session = sessionTabIds(host, node.sessionId)
+		if data.currentHost == host.id then
+			for _, to in ipairs(movesFor(tabIds, node.id)) do
+				table.insert(items, { label = "Move tab " .. MOVE_LABELS[to], detail = title, op = "move", to = to,
+					target = { scope = "tab", key = node.key, signature = node.signature, hostKey = node.hostKey,
+						sessionId = node.sessionId, tabId = node.id } })
+			end
+		end
+		if session ~= nil then
+			for _, to in ipairs(movesFor(listedSessionIds(host), session.id)) do
+				table.insert(items, { label = "Move session " .. MOVE_LABELS[to], detail = session.name, op = "move", to = to,
+					target = { scope = "session", key = session.key, signature = session.signature, hostKey = session.hostKey,
+						sessionId = session.id } })
+			end
+		end
+		local paneCount = if data.currentHost == host.id then #tabPanes(cx, node.id) else 0
+		if paneCount > 0 then
+			local suffix = if paneCount > 1 then " · " .. paneCount .. " panes" else ""
+			table.insert(items, { label = "Park (keep program alive)" .. suffix, detail = "Detaches the panes of " .. title, op = "park" })
+			table.insert(items, { label = "Close" .. suffix, detail = "Ends the programs in " .. title, op = "close" })
+		end
 		local intent = captureIntent(cx)
-		cx:pick({ items = items, placeholder = title }):next(completedIntent(intent, function(fresh, selected)
+		local chooseTab = completedIntent(intent, function(fresh, selected)
 			local freshSpace, data = freshWorkspace(fresh)
 			if not navigation.signatureMatches(freshSpace, node.key, node.signature) then refuse(fresh, "Target changed"); return end
+			if selected.op == "move" then
+				applyMove(fresh, selected.target, selected.to)
+				return
+			end
 			if selected.op == "new" then
 				requireOwner(fresh)
 				pendingVisit, pendingNavigation = nil, nil
-				showSession(fresh, data, host, if node.kind == "tab" then node.sessionId else node.id)
+				showSession(fresh, data, host, node.sessionId)
 				createTab(fresh, nil)
+				return
+			end
+			if selected.op == "park" or selected.op == "close" then
+				requireOwner(fresh)
+				assert(data.currentHost == host.id, "Open " .. host.name .. " first to " .. selected.op .. " here")
+				local targets = tabPanes(fresh, node.id)
+				assert(#targets > 0, "This tab has no panes to " .. selected.op)
+				local failure = nil
+				-- Close events can arrive inside this loop; a pass then would retire the rail it is about to close itself.
+				local outer = busy
+				busy = true
+				for _, pane in ipairs(targets) do
+					local done, reason = pcall(function()
+						if selected.op == "park" then
+							local accepted, why = fresh.layout:park(pane)
+							assert(accepted ~= false, why or "Pane was not parked")
+						else
+							fresh.layout:close(pane)
+						end
+					end)
+					counters.layoutWrites += 1
+					if not done and failure == nil then failure = tostring(reason) end
+				end
+				busy = outer
+				if not outer then schedule(32) end
+				if selected.op == "close" and not outer then intents.leaveEmptySession(fresh) end
+				placement.changed()
+				assert(failure == nil, failure)
 				return
 			end
 			assert(data.currentHost == host.id, "Open " .. host.name .. " first to rename here")
@@ -2740,10 +3231,16 @@ intents.install = function()
 					assert(renamed, "Session was not renamed")
 				end
 			end)
-		end))
+		end)
+		local chooseWork = if origin then completedAction(origin, intents.workChoice(origin)) else nil
+		cx:pick({ items = items, placeholder = title }):next(function(result, err, fresh)
+			if result ~= nil and result.work then chooseWork(result, err, fresh) else chooseTab(result, err, fresh) end
+		end)
 	end
 
+
 	intents.projectWorkspace, intents.currentLocation = projectWorkspace, currentLocation
+	intents.queueMenu = queueMenu
 	intents.ensureUi, intents.refuse, intents.noteFocus = ensureUi, refuse, noteFocus
 	intents.hostNode, intents.destinationOf, intents.routeOpen = hostNode, destinationOf, routeOpen
 	intents.openWorkspaceKey, intents.searchWorkspace, intents.revealCurrent = openWorkspaceKey, searchWorkspace, revealCurrent
@@ -2899,22 +3396,7 @@ local function workMenu(cx, rail, binding)
 		"This conversation menu is no longer current")
 	local origin = captureOrigin(cx, rail, row)
 	validateOrigin(cx, origin)
-	local items = {}
-	if row.disposition == "later" then table.insert(items, { label = "Bring back now", op = "bring-back" })
-	else table.insert(items, { label = "Later · no date", op = "later" }) end
-	table.insert(items, { label = "Later · choose date and optional time", op = "date" })
-	table.insert(items, { label = "Set priority · P0–P3 or unset", op = "priority" })
-	table.insert(items, { label = "Keep as reference", op = "reference" })
-	table.insert(items, { label = "Finished for now · current scope", op = "finished" })
-	if row.disposition == "reference" or row.disposition == "finished" then
-		table.insert(items, { label = "Resume tracking · does not run agent", op = "active" })
-		table.insert(items, { label = "Bring back now", op = "bring-back" })
-	end
-	if row.pane == nil and row.retained then table.insert(items, { label = "Remove retained row · no open pane", op = "remove" }) end
-	if row.pane ~= nil and row.orphaned and not row.navigable then
-		table.insert(items, { label = "Remove unavailable tracking · no verified route", op = "remove-unavailable" })
-	end
-	table.insert(items, { label = "Inspect recorded facts · does not navigate or acknowledge", op = "inspect" })
+	local items = intents.trackingItems(row)
 	-- Opening an existing pane is availability-derived: only a live, reachable route is offered, and a parked,
 	-- floating or unattached pane says so (a parked pane is restored through the native chooser, never unparked here).
 	local destination = if row.pane ~= nil and workspace ~= nil then intents.destinationOf(workspace, row.pane) else nil
@@ -2926,40 +3408,7 @@ local function workMenu(cx, rail, binding)
 			else ""
 		table.insert(items, { label = "Open existing pane" .. where, op = "open-pane" })
 	end
-	cx:pick({ placeholder = row.title, action = "update tracking", items = items }):next(
-		completedAction(origin, function(fresh, selected, current, data)
-			if selected.op == "date" then deferDate(fresh, origin); return end
-			if selected.op == "inspect" then
-				if logical.expandedWorkId ~= current.workId then view.expand(logical, current.workId) end
-				return
-			end
-			if selected.op == "open-pane" then
-				intents.routeOpen(fresh, { workId = current.workId, serial = current.serial, pane = current.pane,
-					identityKey = current.identityKey, sourceSessionId = current.sourceSessionId }, data)
-				return
-			end
-			if selected.op == "priority" then
-				local choices = { { label = "Unset", current = current.priority == nil } }
-				for priority, label in ipairs({ "P0 Now", "P1 Next", "P2 Planned", "P3 Optional" }) do
-					table.insert(choices, { label = label, priority = priority - 1, current = current.priority == priority - 1 })
-				end
-				fresh:pick({ placeholder = "Explicit priority · not inferred urgency", items = choices }):next(
-					completedMutation(origin, function(owner, choice, selectedRow, selectedData)
-						model.setPriority(store, selectedRow.workId, choice.priority)
-						saveAction(owner, selectedData)
-					end))
-				return
-			end
-			withHeaderProof(fresh, current, function(owner)
-				local currentData, rowValue = validateOrigin(owner, origin)
-				if selected.op == "remove" then assert(model.removeRetained(store, rowValue.workId), "Only retained work without an open pane may be removed")
-				elseif selected.op == "remove-unavailable" then
-					assert(model.removeUnavailable(store, rowValue.pane, rowValue.serial), "Live or offline conversations cannot be removed")
-				elseif selected.op == "bring-back" then model.setDisposition(store, rowValue.workId, "active", utcNow(), { bringBack = true })
-				else model.setDisposition(store, rowValue.workId, selected.op, utcNow()) end
-				saveAction(owner, currentData)
-			end)
-		end))
+	cx:pick({ placeholder = row.title, action = "update tracking", items = items }):next(completedAction(origin, intents.workChoice(origin)))
 end
 
 local function finishVisit(cx, data, headerVerified)
@@ -3057,7 +3506,7 @@ local function navigate(cx, binding, data, verified, headerVerified, navigation)
 	local row = currentRow(binding.pane, binding.serial)
 	local native = data.panes[binding.pane]
 	assert(row and native, "This attention target is no longer available")
-	assert(not binding.requireAttention or (row.attention and row.disposition ~= "later"), "The captured Attention target was deferred or changed")
+	assert(not binding.requireAttention or row.attention, "The captured Attention target changed")
 	assert(binding.sourceSessionId == nil or row.sourceSessionId == binding.sourceSessionId,
 		"The recorded conversation header changed; choose its current row")
 	if binding.sourceSessionId == nil and row.sourceSessionId ~= nil then
@@ -3239,6 +3688,9 @@ acquireIdentity = function(cx)
 							end
 						end
 						identities, identityReady, accepted = current, true, true
+						for pane, key in pairs(current) do
+							if key ~= nil then counters.stage(pane, "identityAt") end
+						end
 						identitySourceObservedAt = request.startedAt
 					end)
 					if identityRequest ~= request or epoch ~= request.epoch then return end
@@ -3364,31 +3816,6 @@ local function reconcileFocusHistory(cx, data)
 	end
 end
 
-local function snoozeNext(cx)
-	local active, prefs = syncOwnership(cx)
-	assert(active, "Use Attention: Enable here to snooze from this window")
-	local data = refresh(cx)
-	assert(data, "Native attention inventory is unavailable")
-	local current = project(cx, data, prefs, true)
-	assert(hydrated, storageProblem or "Saved attention is unavailable")
-	local pane, _, serial = model.next(store, data.focused, current.attentionTargets)
-	if pane == nil then
-		if current.attentionCount > 0 then acquireIdentity(cx) end
-		cx:toast("info", "Attention", "No reachable attention to defer")
-		schedule(32)
-		return
-	end
-	local row = currentRow(pane, serial)
-	assert(row, "Attention target changed")
-	local version = rowVersion(row)
-	withHeaderProof(cx, row, function(fresh, current, currentData)
-		assert(rowVersion(current) == version, "Conversation changed before deferral; choose it again")
-		model.setDisposition(store, current.workId, "later", utcNow())
-		project(fresh, currentData, preferences(), true)
-		schedule(32)
-	end)
-end
-
 -- NAT-03: why Attention is or is not mounted in this window, described from state the caller already read.
 -- Pure: no native write and no inventory. Every state without a mounted rail names its cause.
 local function availability(cx, prefs, data, selected, rail)
@@ -3478,13 +3905,15 @@ function placement.start(cx, rail, position)
 		end
 	end
 	saved.moveTo = nil
-	if position then saved.position, saved.share = position, nil
-	elseif saved.position == nil then placement.record(saved, preferences().defaults.position) end
+	-- The next observation of this rail is a baseline, not a drag.
+	rail.divider = nil
+	if position then saved.position = position
+	elseif saved.position == nil then saved.position = preferences().defaults.position end
 	rail.error = nil
 	if rail.pane then rail.phase = "recovering"
 	elseif not saved.creating then rail.phase, rail.firstMissing, rail.discoveries = "unmounted", tern.now() - 2000, 1 end
 	if rail.pane then savePlacement(cx, rail, "placing") else saveInstance(cx, rail) end
-	schedule(32)
+	schedule(placement.PASS_MS)
 end
 
 -- A tab marked by an all-tabs action moves on its first eligible visit: this tab selected and unzoomed, its host
@@ -3513,43 +3942,50 @@ function placement.consume(cx, rail, data, selected)
 	placement.start(cx, rail, target)
 end
 
--- "Use this position for all tabs": the position becomes the default, and every rail on a connected host that is
--- not already there is marked to move on its first eligible visit (the selected tab, when eligible, starts now).
--- Rails that are hidden, parked, floating or unconfirmed are left as they are and counted as such; a tab with no
--- rail mounted simply opens its rail at the new position. One write records the default and every marker.
+-- "Use this position for all tabs": the position becomes the default, and every rail that is not already there is
+-- marked to move on its first eligible visit (the selected tab, when eligible, starts now). A rail on a disconnected
+-- host is marked like any other and moves on its first visit after the host connects. Rails that are hidden, parked,
+-- floating or not open in this tab stay where they are; the toast counts them by reason, and a tab with no rail mounted
+-- simply opens its rail at the new position. One write records the default and every marker.
 function placement.markAll(cx, data, selected, position)
 	requireOwner(cx)
 	assert(placement.positions[position], "Invalid placement action")
 	local fresh = preferences()
 	fresh.defaults.position = position
-	local marked, kept, changes = 0, 0, {}
+	local marked, kept, changes = 0, { hidden = 0, parked = 0, elsewhere = 0 }, {}
 	for _, rail in pairs(rails) do
 		local host, saved = data.hosts[rail.host], rail.saved
-		if host and host.connected and not saved.retiring and rail.phase ~= "closing" and rail.phase ~= "retired" then
-			local native = if rail.pane then data.allPanes[rail.pane] else nil
+		if not saved.retiring and rail.phase ~= "closing" and rail.phase ~= "retired" then
+			-- Native state of a disconnected host's pane is unknown; its marker is re-checked on the first visit.
+			local connected = host ~= nil and host.connected
+			local native = if rail.pane and connected then data.allPanes[rail.pane] else nil
 			local candidate = table.clone(saved)
-			candidate.shares, candidate.moveTo = table.clone(saved.shares), nil
+			candidate.moveTo = nil
 			if saved.userHidden then
-				kept += 1
+				kept.hidden += 1
 			elseif rail.pane == nil and not saved.creating then
-				placement.record(candidate, position)
-			elseif rail.pane and (native == nil or not data.canvases[rail.pane] or native.parked or native.floating
-				or native.tab ~= rail.tab) then
-				kept += 1
+				candidate.position = position
+			elseif connected and rail.pane and native and (native.parked or native.floating) then
+				kept.parked += 1
+			elseif connected and rail.pane and (native == nil or not data.canvases[rail.pane] or native.tab ~= rail.tab) then
+				kept.elsewhere += 1
 			else
-				local edge = nil
-				if rail.pane then
-					local read, arrangement = pcall(cx.session.layout, cx.session, rail.tab)
-					if read and arrangement then edge = layout.edgeOf(arrangement.root, rail.pane) end
+				local there, heading = false, false
+				if connected then
+					local edge = nil
+					if rail.pane then
+						local read, arrangement = pcall(cx.session.layout, cx.session, rail.tab)
+						if read and arrangement then edge = layout.edgeOf(arrangement.root, rail.pane) end
+					end
+					there = rail.phase == "ready" and saved.placement == nil and edge ~= nil
+						and placement.positionOf[edge] == position
+					heading = (rail.phase == "placing" or rail.phase == "recovering") and saved.position == position
+				else
+					there = saved.position == position and saved.placement == nil
 				end
-				local there = rail.phase == "ready" and saved.placement == nil and edge ~= nil
-					and placement.positionOf[edge] == position
-				local heading = (rail.phase == "placing" or rail.phase == "recovering") and saved.position == position
 				if not there and not heading then candidate.moveTo, marked = position, marked + 1 end
 			end
 			if not deepEqual(candidate, saved) then table.insert(changes, { rail = rail, saved = candidate }) end
-		elseif not saved.retiring and rail.phase ~= "closing" and rail.phase ~= "retired" then
-			kept += 1
 		end
 	end
 	for _, change in ipairs(changes) do
@@ -3560,20 +3996,22 @@ function placement.markAll(cx, data, selected, position)
 	savePreferences(cx, fresh)
 	for _, change in ipairs(changes) do
 		local saved = change.rail.saved
-		saved.moveTo, saved.position, saved.share, saved.shares =
-			change.saved.moveTo, change.saved.position, change.saved.share, change.saved.shares
+		saved.moveTo, saved.position = change.saved.moveTo, change.saved.position
 	end
 	local failure = nil
 	local host = selected and data.hosts[selected.host]
 	local current = if host then rails[instanceKey(host.key, selected.tab)] else nil
-	if current and current.saved.moveTo then
+	local selectedMarked = current ~= nil and current.saved.moveTo ~= nil
+	if selectedMarked then
 		local started, problem = pcall(placement.consume, cx, current, data, selected)
 		if not started then failure = problem end
 	end
+	-- The selected tab moves now only when consume began its placement; a zoomed, floating or unready tab keeps its marker.
+	local movesNow = selectedMarked and current.saved.moveTo == nil and current.phase == "recovering"
 	cx:toast("info", "Attention · " .. string.upper(string.sub(position, 1, 1)) .. string.sub(position, 2) .. " for all tabs",
-		string.format("Marked %d %s · %d left as they are", marked, if marked == 1 then "tab" else "tabs", kept))
+		markSummary(movesNow, marked - (if movesNow then 1 else 0), kept))
 	if failure then report(cx, failure, true) end
-	schedule(32)
+	schedule(placement.PASS_MS)
 end
 
 
@@ -3667,7 +4105,31 @@ local function enableAttention(cx)
 	openAttention(cx)
 end
 
-local function disableAttention(cx)
+-- Disable stops Attention and leaves every rail pane where it is. With `closeRails` it first retires every rail
+-- through the ordinary retire path, so a rail whose closure is not yet confirmed stays marked `retiring` in the store
+-- and finishes on the next Enable; the disable itself still happens and the failure is reported.
+local function disableAttention(cx, closeRails)
+	requireOwner(cx)
+	local retireFailure = nil
+	if closeRails then
+		local data = refresh(cx, true)
+		assert(data, "Native inventory is unavailable; nothing was closed or disabled")
+		for key, rail in pairs(rails) do
+			local host = data.hosts[rail.host]
+			if host and host.connected then
+				local ran, retired = pcall(retire, cx, rail, data)
+				if not ran then
+					retireFailure = retireFailure or tostring(retired)
+				elseif retired then
+					removeInstance(cx, rail)
+					rails[key] = nil
+				end
+			elseif not rail.saved.retiring then
+				rail.saved.retiring = true
+				saveInstance(cx, rail)
+			end
+		end
+	end
 	requireOwner(cx)
 	local repaintFailure = nil
 	local listed, canvases = pcall(function() return array(cx.canvas:list(), "Canvases") end)
@@ -3698,6 +4160,7 @@ local function disableAttention(cx)
 	notice = "Attention is disabled"
 	intents.publishDisabled(cx)
 	if repaintFailure then report(cx, "Disabled; an unavailable canvas could not be repainted: " .. repaintFailure, true) end
+	if retireFailure then report(cx, "Disabled; a rail could not be closed: " .. retireFailure, true) end
 end
 
 
@@ -3789,10 +4252,15 @@ runPass = function(cx, shared, sharedMigrate)
 			finishVisit(cx, data)
 			reconcileFocusHistory(cx, data)
 			local _, saved = project(cx, data, prefs, true)
-			workspace = intents.projectWorkspace(cx, data, projection.rows)
-			view.normalize(logical, projection, { workspace = workspace })
+			workspace = intents.projectWorkspace(cx, data, projection.rows, prefs.sessionOrder)
+			view.normalize(logical, projection)
 			intents.publish(cx, saved)
-			if saved then arrived = observeArrivals() end
+			local started = false
+			if saved then arrived, started = observeArrivals() end
+			-- An arrival opens its folded section: why make the user click to see what just came in.
+			local revealed = arrived and view.revealQueue(logical, "attention")
+			revealed = (started and view.revealQueue(logical, "working")) or revealed
+			if revealed then saveUi(cx, view.ui(logical)) end
 			reserveArrival(cx, data, arrived)
 			stage = "maintain"
 			maintainInstances(cx, data, prefs)
@@ -3810,6 +4278,7 @@ runPass = function(cx, shared, sharedMigrate)
 	end)
 	placement.observations, placement.projections, instanceBatch = nil, nil, nil
 	busy = false
+	catchup.passStartedAt = nil
 	durationIndex = durationIndex % 128 + 1
 	durations[durationIndex] = tern.now() - started
 	if paused then
@@ -3865,12 +4334,13 @@ for _, position in ipairs({ "bottom", "right", "left" }) do
 end
 tern.command({ id = "next", title = "Attention: Next attention", run = safeCommand(nextAttention) })
 tern.command({ id = "previous", title = "Attention: Previous pane", run = safeCommand(previousPane) })
-tern.command({ id = "snooze-next", title = "Attention: Defer next attention", run = safeCommand(snoozeNext) })
 tern.command({ id = "search", title = "Attention: Search workspace", run = safeCommand(intents.searchWorkspace) })
 tern.command({ id = "focus-navigator", title = "Attention: Focus navigator", run = safeCommand(focusNavigator) })
 tern.command({ id = "reveal", title = "Attention: Reveal current", run = safeCommand(intents.revealCurrent) })
 tern.command({ id = "new", title = "Attention: New…", run = safeCommand(intents.newMenu) })
-tern.command({ id = "disable", title = "Attention: Disable", run = safeCommand(disableAttention) })
+tern.command({ id = "disable", title = "Attention: Disable", run = safeCommand(function(cx) disableAttention(cx, false) end) })
+tern.command({ id = "disable-and-close-rails", title = "Attention: Disable and close rails",
+	run = safeCommand(function(cx) disableAttention(cx, true) end) })
 
 local function queueEvent(kind, ev, cx)
 	local ok, failure = pcall(function()
@@ -3884,6 +4354,9 @@ local function queueEvent(kind, ev, cx)
 			identityRequest.dirty[paneId] = true
 		elseif kind == "agent_state" or kind == "agent_finished" then
 			if paneId then invalidateIdentity(paneId) else identityNeeded = true end
+		end
+		if kind == "agent_state" or kind == "agent_finished" or kind == "pane_created" or kind == "pane_closed" then
+			agentCensus.dirty = true
 		end
 		if paneId and (kind == "title" or kind == "agent_finished" or kind == "agent_state") then
 			sourceDirty[paneId] = true
@@ -3926,8 +4399,25 @@ local function queueEvent(kind, ev, cx)
 				if rail.tab == ev.tab then rail.saved.retiring, rail.phase = true, "closing" end
 			end
 			if changed then savePreferences(cx, prefs) end
+			placement.createdTabs[ev.tab] = nil
 		end
-		schedule(32)
+		if kind == "tab_created" and type(ev) == "table" and id(ev.tab) then
+			local recorded = 0
+			for _ in pairs(placement.createdTabs) do recorded += 1 end
+			if recorded < placement.MAX_CREATED_TABS then placement.createdTabs[ev.tab] = true end
+		end
+		-- Native timers advance only while the window gets input, so a tab's rail mounting (new tab) or leaving (its
+		-- last content pane closed) happens inside the event itself, not on a pass the next keystroke wakes. A new tab
+		-- is focused after its tab_created, so focus runs at once while one awaits its rail; otherwise focus keeps its
+		-- deferred pass (a visit lands on the pass after focus, so Next then Previous stays a non-visit).
+		if kind == "tab_created" or kind == "pane_created" or kind == "pane_closed" or kind == "tab_closed"
+			or (kind == "focus" and next(placement.createdTabs) ~= nil) then
+			local inside = busy
+			runPass(cx)
+			if kind == "tab_closed" and not inside then intents.leaveEmptySession(cx) end
+		else
+			schedule(32)
+		end
 	end)
 	if not ok then report(cx, failure, false) end
 end
@@ -3996,11 +4486,16 @@ tern.on("canvas_action", function(ev, cx)
 		origin.action, origin.acceptedAt = ev.act, acceptedAt
 		if repeatedNavigation(origin, nil) then return end
 		local binding = rail.publishedBindings and rail.publishedBindings[ev.act]
-		assert(binding, "That action is no longer published; choose its current control")
-		assert(rail.publishedLogicalRevision == logical.revision
-			and (binding.logicalRevision == nil or binding.logicalRevision == logical.revision),
-			"Attention selection changed; choose its current control")
-		validateOrigin(cx, origin, data)
+		-- A view change paints on the next timer pass, so a click can land on a canvas that still shows the state before
+		-- it. Paint what is current, then act only if the same action is still shown; a control that is gone does nothing.
+		if rail.publishedLogicalRevision ~= logical.revision then
+			render(cx, data, prefs)
+			binding = rail.publishedBindings and rail.publishedBindings[ev.act]
+		end
+		if binding == nil or rail.publishedLogicalRevision ~= logical.revision then
+			schedule(32)
+			return
+		end
 		if binding.op == "cancel-navigation" then
 			local navigation = if pendingVisit then pendingVisit.navigation else pendingNavigation
 			if navigation and binding.token == navigation.token and binding.workId == navigation.workId
@@ -4017,35 +4512,21 @@ tern.on("canvas_action", function(ev, cx)
 		if binding.op == "reveal" then intents.revealCurrent(cx, data); return end
 		if binding.op == "workspace-open" then intents.openWorkspaceKey(cx, binding.key, binding.signature, data); return end
 		if binding.op == "route-open" then intents.routeOpen(cx, binding, data); return end
-		if binding.op == "native-menu" then intents.nativeMenu(cx, binding); return end
+		if binding.op == "native-menu" then intents.nativeMenu(cx, rail, binding); return end
+		if binding.op == "queue-menu" then intents.queueMenu(cx, binding); return end
 		if binding.op == "section" then
 			view.section(logical, binding.section)
 			saveUi(cx, view.ui(logical))
 		elseif binding.op == "workspace-toggle" then
-			view.toggleGroup(logical, binding.key)
+			view.toggleGroup(logical, binding.key, binding.expanded)
 			saveUi(cx, view.ui(logical))
-		elseif binding.op == "workspace-aside" then
-			view.toggleAside(logical, binding.key)
-			saveUi(cx, view.ui(logical))
-		elseif binding.op == "page" then
-			assert(binding.section == logical.section, "Attention queue changed")
-			view.page(logical, binding.delta)
+		elseif binding.op == "workspace-minimize" then view.minimizeWorkspace(logical)
 		elseif binding.op == "settings" then view.section(logical, "settings")
 		elseif binding.op == "default" then
+			-- The Settings placement row is the all-tabs move: it sets the default AND marks every eligible rail
+			-- (this tab's moves now, the rest on their next eligible visit) — the same path the palette action runs.
 			assert(placement.positions[binding.position], "Invalid default placement")
-			local prefs = preferences()
-			if prefs.defaults.position ~= binding.position then
-				prefs.defaults.position = binding.position
-				savePreferences(cx, prefs)
-			end
-		elseif binding.op == "position" then
-			assert((binding.reset == true and binding.all == nil) or placement.positions[binding.position], "Invalid placement action")
-			if binding.all == true then placement.markAll(cx, data, selectedContent(cx, data), binding.position)
-			else resetPlacement(cx, rail, binding.position) end
-		elseif binding.op == "age" then
-			assert(BACKLOG_AGES[binding.seconds], "Invalid automatic Later age")
-			prefs.backlogAfterSeconds = binding.seconds
-			savePreferences(cx, prefs)
+			placement.useForAll(cx, binding.position)
 		elseif binding.op == "menu" then workMenu(cx, rail, binding)
 		elseif binding.op == "details" or binding.op == "open" then
 			local row = workRow(binding.workId)
@@ -4060,6 +4541,9 @@ tern.on("canvas_action", function(ev, cx)
 				navigate(cx, target, data)
 			end
 		else error("Unknown Attention action") end
+		-- The action may have changed the canvas, and a pass request can wait behind a pending timer (a native budget
+		-- pause, for one). Paint what the action left now, so the click shows its result without waiting for that timer.
+		if rail.publishedLogicalRevision ~= logical.revision then render(cx, data, prefs) end
 		schedule(32)
 	end)
 	if not ok then
@@ -4090,7 +4574,7 @@ local function writeDiagnostics(cx)
 				if rail.pane then table.insert(canvasIds, rail.pane) end
 				table.insert(layoutStatus, { host = rail.host, hostKey = rail.key, pane = rail.pane, tab = rail.tab,
 					session = rail.session, phase = rail.phase, position = rail.saved.position,
-					share = if rail.saved.position then rail.saved.shares[rail.saved.position] else nil,
+					share = if ok and rail.saved.position then (prefs.defaults.shares[rail.saved.position][rail.key] or INITIAL_SHARE) else nil,
 					userHidden = rail.saved.userHidden, status = bounded(rail.status, 128), pending = rail.pending,
 					remnants = if rail.saved.remnants then tern.json.array(table.clone(rail.saved.remnants)) else nil })
 			end
@@ -4109,15 +4593,26 @@ local function writeDiagnostics(cx)
 		table.sort(timings)
 		local presentation = projection or model.current(store)
 		local window = cx:window_key()
+		local stages = {}
+		for _, pane in ipairs(counters.stages.order) do
+			local entry = counters.stages.panes[pane]
+			if entry ~= nil then
+				stages[tostring(pane)] = { membershipAt = entry.membershipAt, modelAt = entry.modelAt,
+					sourceAt = entry.sourceAt, identityAt = entry.identityAt, claimedAt = entry.claimedAt }
+			end
+		end
+		-- The stage recorder and its tables are machinery, not metrics: the payload's counters stay the plain numbers.
+		local countersPayload = table.clone(counters)
+		countersPayload.stages, countersPayload.stage = nil, nil
 		local diagnostics = { owner = if ok then prefs.owner else nil, enabled = if ok then prefs.enabled else nil,
 			preferenceError = if ok then nil else bounded(prefs, 512), window = window, availability = where,
 			capturedAtMonotonicMs = tern.now(), active = ok and prefs.enabled and prefs.owner == window,
 			status = presentation.status, rows = #presentation.rows, count = presentation.count, knownCount = presentation.knownCount,
-			attentionCount = presentation.attentionCount, laterCount = presentation.laterCount, allCount = presentation.allCount,
+			attentionCount = presentation.attentionCount, allCount = presentation.allCount,
 			workingCount = #view.queue(presentation, "working"),
 			reachableCount = presentation.reachableCount, awaitingHeaderCount = presentation.awaitingHeaderCount,
 			logical = { section = logical.section, settings = logical.settings, revision = logical.revision,
-				expandedWorkId = logical.expandedWorkId, pages = logical.pages },
+				expandedWorkId = logical.expandedWorkId },
 			sourcePending = sourceRequest ~= nil, sourceProofPending = sourceProofAfter ~= nil,
 			sourceFailure = bounded(sourceFailure, 512),
 			helperOperation = if sourceRequest then (if sourceRequest.action then sourceRequest.payload.op else "source") else nil,
@@ -4126,8 +4621,8 @@ local function writeDiagnostics(cx)
 			sourceKeys = { dirty = countKeys(sourceDirty), pollPending = countKeys(sourcePollPending),
 				locatorEpochs = countKeys(sourceLocatorEpochs), facts = countKeys(sourceFacts),
 				observations = countKeys(sourceObservations), headers = countKeys(sourceHeaders) },
-			backlogAfterSeconds = if ok then prefs.backlogAfterSeconds else nil,
-			canvasIds = canvasIds, instances = layoutStatus, instanceCount = total, counters = table.clone(counters),
+			agentStages = stages,
+			canvasIds = canvasIds, instances = layoutStatus, instanceCount = total, counters = countersPayload,
 			timings = { samples = #timings, maxMs = timings[#timings], p95Ms = timings[math.max(1, math.ceil(#timings * 0.95))] },
 			notice = bounded(notice, 512), shortcut = nextChord, navigationPending = pendingVisit ~= nil or pendingNavigation ~= nil,
 			previousDepth = #focusHistory.stack,

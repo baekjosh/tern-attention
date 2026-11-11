@@ -47,6 +47,10 @@ class WaitTimeout(HarnessError):
     pass
 
 
+class LoadBudgetPause(HarnessError):
+    """Tern paused a plugin's load hook past its budget; that serve process will not load the plugin, so Tern is relaunched."""
+
+
 # ---------------------------------------------------------------------------------------------
 # Pure helpers (unit-tested without launching Tern)
 # ---------------------------------------------------------------------------------------------
@@ -112,6 +116,8 @@ def parse_reply(stdout):
 PUMP_KEY = "ctrl+shift+f12"
 FRESH_STATE_NOTE = "(fresh Lua state"
 TRUNCATION = re.compile(r"\n\u2026 (\d+) bytes cut \u2026\n")
+# Tern pauses a plugin whose load hook overruns its budget; the paused plugin then stays unloaded in that serve process.
+LOAD_BUDGET_PAUSE = re.compile(r'exceeded its budget; paused plugin="(?P<plugin>[^"]+)" hook="load"')
 
 
 def parse_lua_answer(last_tool):
@@ -160,11 +166,11 @@ def flatten_texts(nodes):
 
 def rail_rendered(buttons):
     """True when `button` tree nodes show a rendered rail: the Attention mode button and Search are present, plus the
-    gear (`More ·`) or the owner-recovery `Return to` button. Matches by `title`, as native_journeys.rail_ready does."""
+    gear (`More ·`, or `Back to <queue>` while Settings is open) or the owner-recovery `Return to` button. Matches by `title`, as native_journeys.rail_ready does."""
     titles = [str(node.get("title", "")) for node in buttons or [] if isinstance(node, dict)]
     def has(prefix):
         return any(title.startswith(prefix) for title in titles)
-    return has("Attention \u00b7") and has("Search") and (has("More \u00b7") or has("Return to"))
+    return has("Attention \u00b7") and has("Search") and (has("More \u00b7") or has("Back to") or has("Return to"))
 
 
 def plugin_id(package):
@@ -228,7 +234,7 @@ class IsolatedTern:
 
     def __init__(self, package_dir, extra_plugins=(), settings=None, seed_files=None, env=None,
                  width=1280, height=800, scale=None, keep=False, tern="tern", ready_timeout=60.0,
-                 command_timeout=30.0, start_attempts=3, await_actions=True, load_attempts=3, load_wait=8.0):
+                 command_timeout=30.0, start_attempts=3, await_actions=True, load_attempts=6, load_wait=8.0):
         self.packages = [Path(package_dir).expanduser().resolve(),
                          *[Path(path).expanduser().resolve() for path in extra_plugins]]
         self.settings = settings
@@ -251,6 +257,7 @@ class IsolatedTern:
         self.plugin_ids = []
         self._log = None
         self._closed = False
+        self.launches = 0
 
     # -- lifecycle ---------------------------------------------------------------------------
 
@@ -301,31 +308,47 @@ class IsolatedTern:
         self._prepare_root()
         env = build_env(self.root, extra=self.extra_env)
         last = None
-        for attempt in range(self.start_attempts):
+        for launch in range(self.start_attempts):
             self.port = free_port()
-            self._log = open(self.log_path, "ab")
+            # Each launch gets its own serve.log: a relaunch must not see the paused launch's breach lines.
+            self._log = open(self.log_path, "wb")
             self.proc = subprocess.Popen(serve_command(self.tern, self.port, self.root / "shots"),
                                          cwd=self.root, env=env, stdin=subprocess.DEVNULL,
                                          stdout=self._log, stderr=subprocess.STDOUT, start_new_session=True)
+            self.launches = launch + 1
             try:
                 self._wait_ready()
-                break
             except HarnessError as error:
                 last = error
-                terminate(self.proc)
-                self.proc = None
-        else:
-            raise HarnessError(f"tern serve never became ready after {self.start_attempts} attempts: {last}")
-        if self.scale is None:
-            self.ctl("size", self.width, self.height)
-        else:
-            self.ctl("size", self.width, self.height, self.scale)
-        self._load_plugins()
+                self._stop_process()
+                continue
+            if self.scale is None:
+                self.ctl("size", self.width, self.height)
+            else:
+                self.ctl("size", self.width, self.height, self.scale)
+            try:
+                self._load_plugins()
+                return
+            except LoadBudgetPause as pause:
+                last = pause
+                self._stop_process()
+                if launch + 1 < self.start_attempts:
+                    print(f"NOTE native harness: {pause}; relaunching Tern ({launch + 2} of {self.start_attempts})",
+                          file=sys.stderr)
+        raise HarnessError(f"tern serve did not start with plugins loaded in {self.start_attempts} launches: {last}")
+
+    def _stop_process(self):
+        terminate(self.proc)
+        self.proc = None
+        if self._log is not None:
+            self._log.close()
+            self._log = None
 
     def _load_plugins(self):
-        """`plugins fixtures` replies before plugin VMs register commands, and a window entry that takes
-        longer than Tern's 500 ms load budget is paused for 5 s (then silently never loads). Retry past
-        the pause; `loadAttempts` records how many it took."""
+        """`plugins fixtures` replies before plugin VMs register commands, so a send may need retrying. A window entry
+        that loads past Tern's 500 ms budget is paused for 5 s and stays unloaded in that process: in both traced
+        failures a re-send in the same process did not load it, so a recorded pause raises LoadBudgetPause and the
+        caller relaunches Tern. `loadAttempts` records how many sends it took."""
         self.load_attempts_used = 0
         for _ in range(self.load_attempts):
             self.load_attempts_used += 1
@@ -337,10 +360,17 @@ class IsolatedTern:
                               what=f"plugin actions for {self.plugin_ids}")
                 return
             except WaitTimeout:
-                continue
-        warnings = [line for line in read_tail(self.log_path, 20000).splitlines() if "plugin" in line and "WARN" in line]
+                paused = self._paused_plugins()
+                if paused:
+                    raise LoadBudgetPause(f"Tern paused {', '.join(paused)} past its load budget")
         raise HarnessError(f"Plugins {self.plugin_ids} never loaded in {self.load_attempts} attempts.\n"
-                           + "\n".join(warnings[-6:]))
+                           + "\n".join(self.plugin_warnings()[-6:]))
+
+    def _paused_plugins(self):
+        """Our plugin ids that this launch's serve.log records as paused for exceeding the load budget."""
+        found = {match.group("plugin") for line in self.plugin_warnings()
+                 if (match := LOAD_BUDGET_PAUSE.search(line))}
+        return sorted(found & set(self.plugin_ids))
 
     def _plugins_loaded(self):
         loaded = set(self.lua_json("local ids = {}\n"
@@ -376,9 +406,7 @@ class IsolatedTern:
                 self._run(ctl_command(self.tern, self.port, "quit"), timeout=5)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 self.proc.wait(timeout=5)
-        terminate(self.proc)
-        if self._log is not None:
-            self._log.close()
+        self._stop_process()
         if self.root is not None and not self.keep:
             shutil.rmtree(self.root, ignore_errors=True)
 

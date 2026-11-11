@@ -1,6 +1,6 @@
 local phone = require("./phone")
 
--- Block `attention.queue`: Attention, Later and Currently working as a touch-sized list for the iOS client, which mirrors
+-- Block `attention.queue`: Attention and Currently working as a touch-sized list for the iOS client, which mirrors
 -- host blocks. The owner window on the Mac publishes `phone.json`; this block only reads it and, on a tap, asks the
 -- attached windows to open the row's jump URL (the phone's window half claims it).
 local function bootstrap(tern, clockUtc)
@@ -12,8 +12,8 @@ local REFRESH_MS = 30000
 local MAX_BYTES = 1048576
 -- A snapshot that fails to read once is most likely caught mid-write; two failures in a row are shown.
 local SHOWN_AFTER_FAILURES = 2
-local SECTIONS = { attention = "Attention", later = "Later", working = "Currently working" }
-local SECTION_ORDER = { "attention", "later", "working" }
+local SECTIONS = { attention = "Attention", working = "Currently working" }
+local SECTION_ORDER = { "attention", "working" }
 
 local function blankCodepoint(cp)
 	return cp <= 0x20 or (cp >= 0x7F and cp <= 0xA0) or cp == 0x2028 or cp == 0x2029

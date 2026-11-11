@@ -727,8 +727,8 @@ end)
 
 test("a tap on the mirrored rail opens the working queue and is consumed", function()
 	local record = world({ queuePane(40) }, { blockTypes = QUEUE_TYPES, focused = 3 })
-	local taken = record.canvasAction({ owner = "attention", act = "section:later", pane = 12, node = "rail.later",
-		text = "Later 2", mods = {} })
+	local taken = record.canvasAction({ owner = "attention", act = "section:working", pane = 12, node = "rail.working",
+		text = "Working 2", mods = {} })
 	assert(taken == true)
 	assert(#record.focuses == 1 and record.focuses[1] == 40 and record.focused == 40 and #record.blocks == 0)
 	assert(#record.toasts == 1 and lastToast(record).level == "info" and lastToast(record).text == "Attention queue")

@@ -288,7 +288,7 @@ local function settle(state, cx, world, intent)
 		intent.now += 32
 		local writes = world.writes
 		result = layout.reconcile(state, cx, intent)
-		assert(world.writes - writes <= 2, "Each resumed callback must retain the native operation bound")
+		assert(world.writes - writes <= 4, "Each resumed callback must retain the native operation bound")
 		assert(type(result) == "table" and type(result.again) == "boolean", "Reconcile must expose bounded continuation")
 		safety(world, focused)
 		if not result.again then
@@ -301,6 +301,27 @@ end
 
 local function assertRail(world, destination, expected, share, forEdge)
 	assertTree(world.tabs[destination].root, attach(expected, share, forEdge), world.width, world.height, "outer rail")
+end
+
+-- A placement pass issues up to four native operations, so a multi-step reconstruction needs fewer passes; the bound
+-- is on operations per pass, never more.
+for _, wanted in EDGES do
+	edge = wanted
+	local original = content()
+	local cx, world = native({ [1] = tab(1, opened(original, 14), 14) }, 14)
+	local state, intent = layout.new({ tab = 1, root = original }), request(14, 1)
+	local most, passes, result = 0, 0, nil
+	for _ = 1, 160 do
+		intent.now += 32
+		local writes = world.writes
+		result = layout.reconcile(state, cx, intent)
+		most, passes = math.max(most, world.writes - writes), passes + 1
+		assert(world.writes - writes <= 4, wanted .. ": a pass never exceeds four native operations")
+		if not result.again then break end
+	end
+	assert(result ~= nil and not result.again and result.settled, wanted .. ": the multi-step placement settles within 160 passes")
+	assert(most > 2 and most <= 4, wanted .. ": a pass uses more than the old two-operation batch")
+	assertRail(world, 1, original, 0.25)
 end
 
 -- Pure helpers preserve their inputs and collapse only the removed leaf's parent.
@@ -641,7 +662,12 @@ for _, wanted in EDGES do
 		local cx, world = native({ [1] = tab(1, split("right", 0.30, attach(leaf(11), 0.5), original[2]), 13) }, 13)
 		local state = layout.new({ tab = 1, root = original })
 		local intent = request(13, 1)
-		assert(layout.reconcile(state, cx, intent).again)
+		local batch = layout.BATCH
+		layout.BATCH = 2
+		local ran, interrupted = pcall(layout.reconcile, state, cx, intent)
+		layout.BATCH = batch
+		assert(ran, interrupted)
+		assert(interrupted.again)
 		local temporary = world.tabs[1].root[1]
 		assert(temporary.split == axis(edge) and has(temporary, 90), "Exercise an operation-owned temporary divider")
 		temporary.ratio = 0.5272987484931946
@@ -1222,6 +1248,56 @@ for _, wanted in EDGES do
 			near(result.share, 0.25, 1.5 / extentOf(world), wanted .. ": the rail lands within a cell and a half of its requested size")
 			assertRail(world, 1, grid(), result.share)
 		end
+	end
+
+	-- Native's first write after a placement can move the divider several times the cells it asked for, because it
+	-- converts with the geometry it last drew. Sizing measures that move and still lands the rail within a cell and a half.
+	for _, stale in { 5, 6 } do
+		local original = content()
+		local cx, world = native({ [1] = tab(1, attach(original, 0.5), 13) }, 13)
+		local resize, calls = cx.layout.resize, 0
+		cx.layout.resize = function(self, pane, direction, cells)
+			calls += 1
+			return resize(self, pane, direction, if calls == 1 then cells * stale else cells)
+		end
+		local result = settle(layout.new(), cx, world, request(13, 1, 0.25))
+		assert(result.settled and not result.degraded, wanted .. ": a stale first write settles cleanly: " .. tostring(result.reason))
+		near(result.share, 0.25, 1.5 / extentOf(world), wanted .. ": a stale first write lands the rail within a cell and a half")
+		assertRail(world, 1, original, result.share)
+	end
+
+	-- A stale first write can carry the divider past its target. Sizing corrects that rather than accepting the nearest
+	-- attainable size it measured while stale, which here is about two cells away.
+	do
+		local original = content()
+		local cx, world = native({ [1] = tab(1, attach(original, 0.262), 13) }, 13)
+		local resize, calls = cx.layout.resize, 0
+		cx.layout.resize = function(self, pane, direction, cells)
+			calls += 1
+			return resize(self, pane, direction, if calls == 1 then cells * 5 else cells)
+		end
+		local result = settle(layout.new(), cx, world, request(13, 1, 0.25))
+		assert(result.settled and not result.degraded, wanted .. ": a stale overshoot settles cleanly: " .. tostring(result.reason))
+		near(result.share, 0.25, 1.5 / extentOf(world), wanted .. ": a stale overshoot lands the rail within a cell and a half")
+		assertRail(world, 1, original, result.share)
+	end
+
+	-- The first two writes after a placement can both measure geometry native has not drawn yet. Here the first moves the
+	-- divider five times the cells it asked for and the second about 4.4 times, the pattern traced on a 700 px left edge.
+	-- Sizing must not stop on those sizes: the third write measures the drawn geometry.
+	do
+		local original = content()
+		local cx, world = native({ [1] = tab(1, attach(original, 0.5), 13) }, 13, { width = 80, height = 80 })
+		local resize, calls = cx.layout.resize, 0
+		cx.layout.resize = function(self, pane, direction, cells)
+			calls += 1
+			local factor = if calls == 1 then 5 elseif calls == 2 then 4.375 else 1
+			return resize(self, pane, direction, math.round(cells * factor))
+		end
+		local result = settle(layout.new(), cx, world, request(13, 1, 0.25))
+		assert(result.settled and not result.degraded, wanted .. ": two stale writes settle cleanly: " .. tostring(result.reason))
+		near(result.share, 0.25, 1.5 / extentOf(world), wanted .. ": two stale writes land the rail within a cell and a half")
+		assertRail(world, 1, original, result.share)
 	end
 end
 

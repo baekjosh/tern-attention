@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only, finite OMP source projection. JSON protocol 1 on stdin/stdout.
 
-Only schema 3 and explicitly observed writer record shapes are qualified.
+Only schema 3 and explicitly observed record shapes are read.
 Selection is persisted disk replay, never a claim about an in-memory branch.
 An observation revision is a stat fingerprint, not a producer generation or
 protection against an arbitrary mutation that preserves all observed metadata.
@@ -10,54 +10,78 @@ Producer replay reference: @oh-my-pi/pi-coding-agent@18.14.0
 src/session/session-entries.ts, resolveSessionLeafId. Version-matched published
 source plus observed records is not an attestation of the installed binary.
 
-Qualified writers (SUPPORTED_WRITERS). A version is listed only when (1) real
-sessions it alone wrote parse with no issue and every consumed fact (ask
-questions, answers, clocks, lastFinal) equals an independent minimal reader of the
-raw JSONL, and (2) the producer's session-entries.ts and ask.ts at that tag differ
-from a qualified version only by fields this helper does not read. 18.12.3 and
-older are excluded: their loader honors activeLeafId on model_usage entries only.
-18.16.0 qualified 2026-11-02: six sessions written by 18.16.0 alone under an isolated
-HOME (print-mode read tool call; rpc-ui ask select, multi-question select+multi,
-custom input, cancelled, and a tool-not-found failure) and one real 18.13.2 session
-resumed under 18.16.0 (mixed 18.13.2+18.16.0) parse with no issue and equal the raw
-reader in tools/qualify_writer.py; producer 18.16.0 vs 18.15.0 differs in
-session-entries.ts only by session_init.mountedTools and ask.ts is identical. A new
-version stays unqualified (selectionSupport "unknown", writerSupport "unknown") until
-both hold; `python3 tools/qualify_writer.py <version>` runs the cross-check.
-Not exercised against real sessions: ask results under 18.14.1, 18.12.5 and
-18.13.1 (producer ask.ts identical or additive only), and the 18.14.2+
-"Ask interrupted by message" result, which this helper reports as status failed.
-A host-cancelled ask (producer "Ask tool was cancelled by the user", isError, empty
-details; observed under 18.16.0) is likewise reported as status failed, never answered.
+Per-field trust (coverage.fields). Every consumed fact belongs to one field:
+  clock      lastHuman, lastAssistant, lastTerminal, lastFinal, lastInteraction*,
+             lastActivityAtUtc, lastError
+  questions  questions, questionOutcomes, questionCoverage
+A field is "supported" when every record it reads parsed under a known shape and
+the selected ancestry was replayed whole; otherwise "unknown". A record whose
+shape is unrecognised demotes the fields it may carry: an ask call or ask result
+that does not parse demotes `questions` only (its assistant clock still counts);
+any other unparseable record, a missing parent or an output excerpt that had to be
+dropped demotes both. Any such problem also makes the result partial
+(complete=false), so question authority is withheld; the clock may still be shown.
 
-Date mode request: {protocol:1,requestId,op:"date",civilDate:"YYYY-MM-DD",
-civilTime?:"HH:MM",zone?:IANA,nowUtc?:number}. Date-only resolves local start
-of day in zone (default: the system zone, reported as zoneSource "system").
-Result status ready|invalid|ambiguous. A local time inside a DST gap
-(problem "nonexistent") or repeated by a fold (status ambiguous, problem
-"repeated") is refused with a specific error and never shifted. ready carries
-resolvedUTC, display (local date time zone), utcDisplay (ISO instant), and
-confirmation (the one user-facing statement); with nowUtc it also carries
-past, and a past confirmation says the conversation returns on the next refresh.
+Writer versions are an advisory, not a gate. writerSupport is "qualified" when
+every runtime.version is in SUPPORTED_WRITERS and "unknown" otherwise (missing or
+unlisted). It never demotes a field or completeness: a new omp release that writes
+the same record shapes is read like the last one, and a release that changes a
+shape demotes the field that shape feeds. (Gating the clock on this list dashed
+every row after the 18.16.0 and 18.18.x updates; docs/PAPERCUTS.md.) A version is
+listed after `python3 tools/qualify_writer.py <version>` passes: real sessions it
+alone wrote parse with no issue and every consumed fact equals an independent
+minimal reader of the raw JSONL. 18.12.3 and older are excluded: their loader
+honors activeLeafId on model_usage entries only. 18.16.0 qualified 2026-11-02
+(isolated-HOME sessions: print-mode tool call, rpc-ui ask select/multi/custom/
+cancelled, tool-not-found failure, one 18.13.2 session resumed under 18.16.0).
+18.18.0/.1/.2/.3/.5/.6/.7 qualified 2026-11-10 on read-only copies of the real
+sessions they wrote (56/305/22/78/4/36/29 written by each alone), including five
+answered HTML-form asks whose parsed wording equals the producer's own: every
+comparable file passed; the only failures were not shapes (one >8 MiB record,
+two files with more than 32 questions, one malformed 18.14.0-written ask). The
+producer source diff was not run: the installed 18.18.8 is a compiled binary,
+read only for the html-form and ask strings this docstring cites.
+
+Ask shapes. `arguments.questions` (18.12-18.16) carries question/options per
+question; results carry selectedOptions/customInput (single or `results` batch).
+`arguments.html` (18.18) is a <form>; each named control is one question, worded
+as the producer words it (packages/tui/src/html-form at 18.18.8: the control's
+label, else the text block just before it, else its fieldset legend, else its
+lone option, else its name) and the result is `details.answers` [{name, question,
+answer}] in control order. A host-cancelled ask ("Ask tool was cancelled by the
+user", isError) and "Ask interrupted by message" are reported as status failed,
+never answered.
+
+Approval prompts: omp 18.18.8 emits tool_approval_requested/resolved only to
+extensions and the terminal notifier (OSC 777 permission_request); no session
+record carries a pending approval, so none is reported here.
+
+Provider errors. An assistant turn with stopReason "error" sets lastError
+{kind, atUtc}; any later assistant turn on the selected branch clears it. kind is
+"usage_limit" (producer flag UsageLimit 0x80000 in errorId, packages/ai/src/error/
+flags.ts, or "usage limit" in errorMessage), "rate_limit" (errorStatus 429 or "rate
+limit"/"at capacity" in errorMessage), "api_error" (another HTTP errorStatus) or
+"provider" (network, stall, overload).
 """
 from __future__ import annotations
 
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime
 import hashlib
+from html.parser import HTMLParser
 import json
 import math
 import os
-from pathlib import Path
 import re
 import stat
 import sys
 import time
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-ADAPTER = "omp-facts-v2"
+ADAPTER = "omp-facts-v3"
 SUPPORTED_WRITERS = frozenset(("18.12.5", "18.12.6", "18.13.0", "18.13.1", "18.13.2", "18.13.3",
-                               "18.14.0", "18.14.1", "18.14.2", "18.15.0", "18.16.0"))
+                               "18.14.0", "18.14.1", "18.14.2", "18.15.0", "18.16.0",
+                               "18.18.0", "18.18.1", "18.18.2", "18.18.3", "18.18.5", "18.18.6", "18.18.7"))
+FIELDS = ("clock", "questions")
 MAX_TARGETS = 64
 MAX_RECORD_BYTES = 8 * 1024 * 1024
 MAX_SOURCE_BYTES = 1024 * 1024 * 1024
@@ -67,14 +91,23 @@ HEADER_BYTES = 64 * 1024
 HEADER_RECORDS = 8
 HEADER_SECONDS = 1
 MAX_TEXT = 2000
+# Replies keep only the excerpt the rail shows (view.luau source details, model.luau REPLY_TEXT_CHARS); the whole reply
+# stays in the session file. Human input is shown only by its time, so its text is not carried.
+REPLY_TEXT = 300
 MAX_QUESTIONS = 32
 MAX_TRACKED_QUESTIONS = 512
 MAX_RESULT_BYTES = 128 * 1024
 MAX_REQUEST_BYTES = 256 * 1024
+# An HTML-form ask larger or deeper than this is not parsed; its questions field reads unknown.
+MAX_FORM_CHARS = 256 * 1024
+MAX_FORM_DEPTH = 64
 METADATA_TYPES = frozenset(("model_change", "thinking_level_change", "service_tier_change",
     "model_usage", "custom", "custom_message", "label", "title_change", "credential_pin",
     "ttsr_injection", "compaction", "branch_summary", "reset_boundary", "mode_change", "session_init"))
 TERMINALS = frozenset(("stop", "length", "error", "aborted"))
+USAGE_LIMIT_FLAG = 0x80000
+USAGE_LIMIT_TEXT = re.compile(r"usage[ _]limit", re.IGNORECASE)
+RATE_LIMIT_TEXT = re.compile(r"\b429\b|rate[ _-]?limit|at capacity", re.IGNORECASE)
 
 
 class SourceProblem(Exception):
@@ -152,7 +185,423 @@ def allowed_question(raw, entry_id, call_id, index, at):
             "textChars": len(raw["question"])}
 
 
+# HTML-form asks (omp 18.18). A port of the producer's question wording (packages/tui/src/html-form at 18.18.8:
+# _G.build and Ou): blocks are text, fields and opaque media; a field's question is its label, else the text block
+# just before it, else its section (fieldset legend) title, else its lone option's label, else its name.
+FORM_VOID = frozenset(("area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+                       "source", "track", "wbr"))
+FORM_SKIPPED = frozenset(("button", "head", "iframe", "link", "meta", "noscript", "script", "style", "template", "title"))
+FORM_BLOCKS = frozenset(("address", "article", "aside", "blockquote", "dd", "details", "div", "dl", "dt", "figure",
+                         "figcaption", "footer", "header", "li", "main", "nav", "p", "section"))
+FORM_HEADINGS = frozenset(("h1", "h2", "h3", "h4", "h5", "h6", "summary"))
+FORM_CONTROLS = frozenset(("input", "select", "textarea"))
+FORM_UNANSWERED_INPUTS = frozenset(("button", "file", "image", "reset", "submit"))
+# An open <p> ends where one of these starts; an open <li>/<option> ends at the next sibling of its kind.
+FORM_CLOSES_P = FORM_BLOCKS | FORM_HEADINGS | frozenset(("fieldset", "form", "hr", "ol", "ul", "pre", "table", "legend"))
+
+
+class FormNode:
+    __slots__ = ("tag", "attrs", "children", "parent")
+
+    def __init__(self, tag, attrs, parent):
+        self.tag, self.attrs, self.children, self.parent = tag, attrs, [], parent
+
+    def elements(self):
+        return [child for child in self.children if isinstance(child, FormNode)]
+
+    def descendants(self, tags):
+        found, stack = [], list(reversed(self.elements()))
+        while stack:
+            node = stack.pop()
+            if node.tag in tags:
+                found.append(node)
+            stack.extend(reversed(node.elements()))
+        return found
+
+    def closest(self, tag):
+        node = self
+        while node is not None and node.tag != tag:
+            node = node.parent
+        return node
+
+    def contains(self, other):
+        while other is not None and other is not self:
+            other = other.parent
+        return other is self
+
+    def text_content(self):
+        return "".join(child if isinstance(child, str) else child.text_content() for child in self.children)
+
+
+class FormTree(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = FormNode("#document", {}, None)
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        self.open(tag, attrs, tag in FORM_VOID)
+
+    def handle_startendtag(self, tag, attrs):
+        self.open(tag, attrs, True)
+
+    def open(self, tag, attrs, void):
+        if tag in FORM_CLOSES_P:
+            self.close_open("p", ("button", "fieldset", "form", "table", "td", "th", "li"))
+        if tag in ("li", "option"):
+            self.close_open(tag, ("ul", "ol") if tag == "li" else ("select", "datalist", "optgroup"))
+        values = {}
+        for name, value in attrs:
+            values.setdefault(name, "" if value is None else value)
+        node = FormNode(tag, values, self.stack[-1])
+        self.stack[-1].children.append(node)
+        if not void:
+            if len(self.stack) > MAX_FORM_DEPTH:
+                raise SourceProblem("partial", "unsupported-ask-form")
+            self.stack.append(node)
+
+    def close_open(self, tag, scope):
+        for index in range(len(self.stack) - 1, 0, -1):
+            name = self.stack[index].tag
+            if name == tag:
+                del self.stack[index:]
+                return
+            if name in scope:
+                return
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.stack) - 1, 0, -1):
+            if self.stack[index].tag == tag:
+                del self.stack[index:]
+                return
+
+    def handle_data(self, data):
+        self.stack[-1].children.append(data)
+
+
+def form_words(text):
+    return " ".join(text.split())
+
+
+def form_text(node):
+    """Visible text of a node, without controls, media or skipped elements (producer #g)."""
+    parts = []
+
+    def walk(current):
+        for child in current.children:
+            if isinstance(child, str):
+                parts.append(child)
+                continue
+            tag = child.tag
+            if tag in FORM_SKIPPED or tag in FORM_CONTROLS or tag == "svg":
+                continue
+            if tag == "br":
+                parts.append("\n")
+                continue
+            if tag == "img":
+                parts.append(child.attrs.get("alt", ""))
+                continue
+            if tag in FORM_BLOCKS or tag in FORM_HEADINGS:
+                parts.append(" ")
+            walk(child)
+
+    walk(node)
+    return "".join(parts).strip()
+
+
+class FormQuestions:
+    """Named form controls in producer order, each with the question text the producer shows for it."""
+
+    def __init__(self, root):
+        self.root = root
+        self.section = {"title": "", "blocks": []}
+        self.sections = [self.section]
+        self.pending, self.depth, self.groups, self.fields = [], 0, {}, []
+        ids = {control.attrs["id"] for control in root.descendants(FORM_CONTROLS) if control.attrs.get("id")}
+        self.labels = {}
+        for label in root.descendants(("label",)):
+            target = label.attrs.get("for")
+            if target and target in ids and target not in self.labels:
+                self.labels[target] = label
+
+    def build(self):
+        self.children(self.root)
+        self.flush()
+        questions = []
+        for section in self.sections:
+            before = ""
+            for block in section["blocks"]:
+                if block["kind"] == "field":
+                    field = block["field"]
+                    lone = field["options"][0] if field["kind"] == "choice" and len(field["options"]) == 1 else ""
+                    field["question"] = form_words(field["label"] or before or section["title"] or lone or field["name"])
+                    before = ""
+                else:
+                    before = block.get("text", "")
+        for field in self.fields:
+            if field["name"]:
+                questions.append({"name": field["name"], "question": field["question"] or field["name"]})
+        return questions
+
+    def flush(self):
+        text = "".join(self.pending).strip()
+        self.pending = []
+        if text:
+            self.section["blocks"].append({"kind": "text", "text": text})
+
+    def opaque(self):
+        self.section["blocks"].append({"kind": "opaque"})
+
+    def start_section(self, title):
+        if not self.section["blocks"] and not self.section["title"]:
+            self.section["title"] = title
+            return
+        self.section = {"title": title, "blocks": []}
+        self.sections.append(self.section)
+
+    def children(self, node):
+        for child in node.children:
+            self.node(child)
+
+    def node(self, node):
+        if isinstance(node, str):
+            self.pending.append(node)
+            return
+        tag = node.tag
+        if tag in FORM_SKIPPED:
+            return
+        if tag == "br":
+            self.pending.append("\n")
+        elif tag == "hr":
+            self.flush()
+        elif tag in FORM_CONTROLS:
+            self.control(node, "")
+        elif tag == "label":
+            target = node.attrs.get("for")
+            if target and self.labels.get(target) is node:
+                return
+            controls = node.descendants(FORM_CONTROLS)
+            if not controls:
+                self.children(node)
+                return
+            self.flush()
+            text = form_text(node)
+            for control in controls:
+                self.control(control, text)
+        elif tag == "fieldset":
+            self.flush()
+            legend = next((child for child in node.elements() if child.tag == "legend"), None)
+            if self.depth > 0:
+                if legend is not None:
+                    self.node(legend)
+            else:
+                self.start_section(form_text(legend) if legend is not None else "")
+            self.depth += 1
+            for child in node.children:
+                if child is not legend:
+                    self.node(child)
+            self.flush()
+            self.depth -= 1
+            if self.depth == 0:
+                self.start_section("")
+        elif tag in ("ul", "ol"):
+            self.flush()
+            if node.descendants(FORM_CONTROLS):
+                self.children(node)
+                self.flush()
+            elif any(form_text(item) for item in node.elements() if item.tag == "li"):
+                self.opaque()
+        elif tag in ("pre", "svg"):
+            self.flush()
+            self.opaque()
+        elif tag == "img":
+            self.flush()
+            if node.attrs.get("src", "").strip():
+                self.opaque()
+        elif tag == "table":
+            self.table(node)
+        elif tag == "legend" or tag in FORM_HEADINGS or tag in FORM_BLOCKS:
+            self.flush()
+            self.children(node)
+            self.flush()
+        else:
+            self.children(node)
+
+    def table(self, table):
+        self.flush()
+        rows = [row for row in table.descendants(("tr",)) if row.closest("table") is table]
+        if not table.descendants(FORM_CONTROLS):
+            if any(form_text(cell) for row in rows for cell in row.elements() if cell.tag in ("td", "th")):
+                self.opaque()
+            return
+        headers = []
+        for row in rows:
+            cells = [cell for cell in row.elements() if cell.tag in ("td", "th")]
+            if all(cell.tag == "th" for cell in cells) and not row.descendants(FORM_CONTROLS):
+                headers = [form_text(cell) for cell in cells]
+                continue
+            words = [form_text(cell) for cell in cells if not cell.descendants(FORM_CONTROLS)]
+            line = " · ".join(word for word in words if word)
+            if line:
+                self.section["blocks"].append({"kind": "text", "text": line})
+            for position, cell in enumerate(cells):
+                for control in cell.descendants(FORM_CONTROLS):
+                    label = control.closest("label")
+                    text = form_text(label) if label is not None and cell.contains(label) else form_text(cell)
+                    self.control(control, text or (headers[position] if position < len(headers) else ""))
+
+    def control(self, node, label):
+        self.flush()
+        if not label:
+            target = self.labels.get(node.attrs.get("id")) if node.attrs.get("id") else None
+            label = form_text(target) if target is not None else (node.attrs.get("aria-label") or node.attrs.get("title") or "").strip()
+        name = node.attrs.get("name", "")
+        derived = re.sub(r"[_-]+", " ", name)
+        if node.tag == "select":
+            options = [form_words(option.text_content()) for option in node.descendants(("option",))]
+            self.add({"kind": "choice", "name": name, "label": label, "options": options})
+            return
+        if node.tag == "textarea":
+            self.add({"kind": "text", "name": name, "label": label or derived, "options": []})
+            return
+        kind = node.attrs.get("type", "text").lower()
+        if kind in FORM_UNANSWERED_INPUTS or kind == "hidden":
+            return
+        if kind in ("radio", "checkbox"):
+            option = label or node.attrs.get("value", name)
+            group = self.groups.get((kind, name))
+            if group is not None:
+                group["options"].append(option)
+                return
+            group = {"kind": "choice", "name": name, "label": "", "options": [option]}
+            self.groups[(kind, name)] = group
+            self.add(group)
+            return
+        self.add({"kind": "text", "name": name, "label": label or derived, "options": []})
+
+    def add(self, field):
+        self.fields.append(field)
+        self.section["blocks"].append({"kind": "field", "field": field})
+
+
+def form_questions(html):
+    """[{name, question}] for each named control of an ask form, in the order the producer answers them."""
+    if len(html) > MAX_FORM_CHARS:
+        raise SourceProblem("partial", "unsupported-ask-form")
+    tree = FormTree()
+    try:
+        tree.feed(html)
+        tree.close()
+    except (AssertionError, ValueError) as error:
+        raise SourceProblem("partial", "unsupported-ask-form") from error
+    forms = tree.root.descendants(("form",))
+    return FormQuestions(forms[0] if forms else tree.root).build()
+
+
+def form_question(raw, entry_id, call_id, index, at):
+    text = raw["question"]
+    question = {"id": json.dumps([entry_id, call_id, raw["name"], index], separators=(",", ":")),
+                "callId": call_id, "index": index, "text": text[:MAX_TEXT], "status": "open", "questionId": raw["name"]}
+    with_time(question, "askedAtUtc", at)
+    return {"fact": question, "options": [], "multi": False, "form": True, "textChars": len(text)}
+
+
+def ask_questions(arguments, entry_id, call_id, at):
+    if isinstance(arguments.get("html"), str):
+        raws = form_questions(arguments["html"])
+        if len(raws) > MAX_QUESTIONS:
+            raise SourceProblem("partial", "unsupported-ask-questions")
+        make = form_question
+    else:
+        raws = arguments.get("questions")
+        if not isinstance(raws, list) or not raws or len(raws) > MAX_QUESTIONS:
+            raise SourceProblem("partial", "unsupported-ask-questions")
+        make = allowed_question
+    asks, seen = [], set()
+    for index, raw in enumerate(raws):
+        q = make(raw, entry_id, call_id, index, at)
+        qid = q["fact"].get("questionId")
+        if qid is not None and qid in seen:
+            raise SourceProblem("partial", "duplicate-question-id")
+        seen.add(qid)
+        asks.append(q)
+    return asks
+
+
+def provider_error_kind(message):
+    flags, status, text = message.get("errorId"), message.get("errorStatus"), message.get("errorMessage")
+    text = text if isinstance(text, str) else ""
+    if (type(flags) is int and flags & USAGE_LIMIT_FLAG) or USAGE_LIMIT_TEXT.search(text):
+        return "usage_limit"
+    if status == 429 or RATE_LIMIT_TEXT.search(text):
+        return "rate_limit"
+    if type(status) is int:
+        return "api_error"
+    return "provider"
+
+
+def ask_answer(message, ident, at):
+    call_id, details = message.get("toolCallId"), message.get("details")
+    if not isinstance(call_id, str):
+        raise SourceProblem("partial", "unsupported-ask-result")
+    if details is None and message.get("isError") is True:
+        details = {}
+    if not isinstance(details, dict):
+        raise SourceProblem("partial", "unsupported-ask-result")
+    # Only this exact producer cancellation sentinel is decoded. Never expose raw tool text.
+    content = message.get("content", [])
+    cancellation = (message.get("isError") is True and isinstance(content, (str, list))
+                    and text_content(content) == "Ask input was cancelled")
+    if "timedOut" in details and not isinstance(details["timedOut"], bool):
+        raise SourceProblem("partial", "unsupported-answer-timeout-provenance")
+    answers = details.get("answers")
+    if answers is not None:
+        # HTML-form result: one {name, question, answer} per named control; timedOut covers the whole form.
+        if not isinstance(answers, list) or len(answers) > MAX_QUESTIONS:
+            raise SourceProblem("partial", "unsupported-form-result")
+        cleaned = []
+        for raw in answers:
+            if not isinstance(raw, dict) or not isinstance(raw.get("name"), str) or not isinstance(raw.get("answer"), str):
+                raise SourceProblem("partial", "unsupported-form-result")
+            cleaned.append({"id": raw["name"], "formAnswer": bounded_text(raw["answer"]),
+                            "timedOut": details.get("timedOut") is True})
+        result = {"kind": "answer", "id": ident, "callId": call_id, "batch": True, "results": cleaned,
+                  "cancelled": cancellation, "error": message.get("isError") is True}
+        return with_time(result, "atUtc", at)
+    def outcome(raw):
+        if not isinstance(raw, dict):
+            return None
+        return {name: raw[name] for name in ("id", "selectedOptions", "customInput", "multi", "timedOut") if name in raw}
+    raw_results = details.get("results")
+    if raw_results is not None and (not isinstance(raw_results, list) or len(raw_results) > MAX_QUESTIONS):
+        raise SourceProblem("partial", "unsupported-batch-result")
+    results = [outcome(raw) for raw in raw_results] if isinstance(raw_results, list) else [outcome(details)]
+    # Project only supported factual fields, never raw tool output.
+    cleaned = []
+    for raw in results:
+        if raw is None:
+            cleaned.append({})
+            continue
+        clean = {}
+        if "timedOut" in raw and not isinstance(raw["timedOut"], bool):
+            raise SourceProblem("partial", "unsupported-answer-timeout-provenance")
+        clean["timedOut"] = raw.get("timedOut") is True
+        if isinstance(raw.get("id"), str):
+            clean["id"] = raw["id"]
+        if isinstance(raw.get("customInput"), str):
+            clean["customInput"] = bounded_text(raw["customInput"])
+        selected = raw.get("selectedOptions")
+        if isinstance(selected, list) and len(selected) <= MAX_QUESTIONS and all(isinstance(x, str) for x in selected):
+            clean["selectedOptions"] = selected
+        cleaned.append(clean)
+    result = {"kind": "answer", "id": ident, "callId": call_id, "batch": isinstance(raw_results, list),
+              "results": cleaned, "cancelled": cancellation, "error": message.get("isError") is True}
+    return with_time(result, "atUtc", at)
+
+
 def normalize(entry):
+    """One record's facts, or None. Raises SourceProblem("partial") when the record's shape is unknown, which demotes
+    every field; a shape problem confined to ask questions/answers is returned in `problems` as (field, reason)."""
     kind, ident = entry.get("type"), entry["id"]
     if kind != "message":
         if kind not in METADATA_TYPES:
@@ -187,69 +636,30 @@ def normalize(entry):
         text = text_content(message.get("content", []))
         result = {"kind": "assistant", "id": ident, "stopReason": stop,
                   "timeKind": "completed" if completed is not None else "recorded", **bounded_text(text), "asks": []}
+        if stop == "error":
+            result["errorKind"] = provider_error_kind(message)
         with_time(result, "atUtc", assistant_at)
         content = message.get("content")
-        for part in content if isinstance(content, list) else []:
-            if not isinstance(part, dict) or part.get("type") != "toolCall" or part.get("name") != "ask":
-                continue
-            arguments, call_id = part.get("arguments"), part.get("id")
-            if not isinstance(arguments, dict) or not isinstance(call_id, str) or not call_id:
-                raise SourceProblem("partial", "unsupported-ask-call")
-            questions = arguments.get("questions")
-            if not isinstance(questions, list) or not questions or len(questions) > MAX_QUESTIONS:
-                raise SourceProblem("partial", "unsupported-ask-questions")
-            seen = set()
-            for index, raw in enumerate(questions):
-                q = allowed_question(raw, ident, call_id, index, assistant_at)
-                qid = q["fact"].get("questionId")
-                if qid is not None and qid in seen:
-                    raise SourceProblem("partial", "duplicate-question-id")
-                seen.add(qid)
-                result["asks"].append(q)
+        try:
+            for part in content if isinstance(content, list) else []:
+                if not isinstance(part, dict) or part.get("type") != "toolCall" or part.get("name") != "ask":
+                    continue
+                arguments, call_id = part.get("arguments"), part.get("id")
+                if not isinstance(arguments, dict) or not isinstance(call_id, str) or not call_id:
+                    raise SourceProblem("partial", "unsupported-ask-call")
+                result["asks"].extend(ask_questions(arguments, ident, call_id, assistant_at))
+        except SourceProblem as problem:
+            result["asks"], result["problems"] = [], [("questions", problem.reason)]
         return result
     if role == "toolResult":
+        tool = with_time({"kind": "tool", "id": ident}, "atUtc", at)
         if message.get("toolName") != "ask":
-            return None
-        call_id, details = message.get("toolCallId"), message.get("details")
-        if not isinstance(call_id, str):
-            raise SourceProblem("partial", "unsupported-ask-result")
-        if details is None and message.get("isError") is True:
-            details = {}
-        if not isinstance(details, dict):
-            raise SourceProblem("partial", "unsupported-ask-result")
-        # Only this exact producer cancellation sentinel is decoded. Never expose raw tool text.
-        content = message.get("content", [])
-        cancellation = (message.get("isError") is True and isinstance(content, (str, list))
-                        and text_content(content) == "Ask input was cancelled")
-        def outcome(raw):
-            if not isinstance(raw, dict):
-                return None
-            return {name: raw[name] for name in ("id", "selectedOptions", "customInput", "multi", "timedOut") if name in raw}
-        raw_results = details.get("results")
-        if raw_results is not None and (not isinstance(raw_results, list) or len(raw_results) > MAX_QUESTIONS):
-            raise SourceProblem("partial", "unsupported-batch-result")
-        results = [outcome(raw) for raw in raw_results] if isinstance(raw_results, list) else [outcome(details)]
-        # Project only supported factual fields, never raw tool output.
-        cleaned = []
-        for raw in results:
-            if raw is None:
-                cleaned.append({})
-                continue
-            clean = {}
-            if "timedOut" in raw and not isinstance(raw["timedOut"], bool):
-                raise SourceProblem("partial", "unsupported-answer-timeout-provenance")
-            clean["timedOut"] = raw.get("timedOut") is True
-            if isinstance(raw.get("id"), str):
-                clean["id"] = raw["id"]
-            if isinstance(raw.get("customInput"), str):
-                clean["customInput"] = bounded_text(raw["customInput"])
-            selected = raw.get("selectedOptions")
-            if isinstance(selected, list) and len(selected) <= MAX_QUESTIONS and all(isinstance(x, str) for x in selected):
-                clean["selectedOptions"] = selected
-            cleaned.append(clean)
-        result = {"kind": "answer", "id": ident, "callId": call_id, "batch": isinstance(raw_results, list),
-                  "results": cleaned, "cancelled": cancellation, "error": message.get("isError") is True}
-        return with_time(result, "atUtc", at)
+            return tool
+        try:
+            return ask_answer(message, ident, at)
+        except SourceProblem as problem:
+            tool["problems"] = [("questions", problem.reason)]
+            return tool
     # Known producer synthetic roles are deliberately not human input.
     if role in ("bashExecution", "branchSummary", "compactionSummary", "hookMessage"):
         return None
@@ -287,7 +697,13 @@ def resolve_answer(question, result, at):
     fact.update(answerProvenance="automatic" if automatic else "user", timedOut=automatic)
     custom = raw.get("customInput")
     selected = raw.get("selectedOptions")
-    if custom is not None and custom["text"].strip():
+    form = raw.get("formAnswer")
+    if form is not None and question.get("form"):
+        # A submitted form answers every named control; a blank text field is answered with "".
+        answer_text = form["text"]
+        answer_chars = form["textChars"]
+        answer_kind = "form"
+    elif custom is not None and custom["text"].strip():
         answer_text = custom["text"]
         answer_chars = custom["textChars"]
         answer_kind = "custom"
@@ -328,24 +744,29 @@ def project(chain, complete, coverage):
             summary_count += 1
             continue
         at, ident = record.get("atUtc"), record["id"]
+        if kind in ("assistant", "tool", "answer") and at is not None:
+            facts["lastActivityAtUtc"] = max(at, facts.get("lastActivityAtUtc", at))
         if kind == "user":
-            text = record["text"]
-            human = with_time({"id": ident, "text": text, "provenance": record["provenance"],
-                               "textTruncated": record["textChars"] > len(text)}, "atUtc", at)
+            human = with_time({"id": ident, "provenance": record["provenance"]}, "atUtc", at)
             if record["provenance"] == "user" or "lastHuman" not in facts:
                 facts["lastHuman"] = human
             if record["provenance"] == "user" and at is not None:
                 facts.update(lastInteractionAtUtc=at, lastInteractionId=ident)
         elif kind == "assistant":
             text, stop = record["text"], record["stopReason"]
-            clipped = record["textChars"] > len(text)
-            facts["lastAssistant"] = with_time({"id": ident, "text": text, "stopReason": stop,
+            excerpt, clipped = text[:REPLY_TEXT], record["textChars"] > REPLY_TEXT
+            facts["lastAssistant"] = with_time({"id": ident, "text": excerpt, "stopReason": stop,
                                                "textTruncated": clipped}, "atUtc", at)
             if stop in TERMINALS:
                 facts["lastTerminal"] = with_time({"id": ident, "stopReason": stop}, "atUtc", at)
             if stop == "stop" and text:
-                facts["lastFinal"] = with_time({"id": ident, "text": text, "timeKind": record["timeKind"],
+                facts["lastFinal"] = with_time({"id": ident, "text": excerpt, "timeKind": record["timeKind"],
                                                "textTruncated": clipped}, "atUtc", at)
+            # Only the newest assistant turn's ending counts: a later turn of any kind clears a provider error.
+            if stop == "error":
+                facts["lastError"] = with_time({"id": ident, "kind": record["errorKind"]}, "atUtc", at)
+            else:
+                facts.pop("lastError", None)
             for question in record["asks"]:
                 q = {**question, "fact": dict(question["fact"])}
                 questions.append(q)
@@ -391,13 +812,11 @@ def project(chain, complete, coverage):
                 if q["fact"]["answerProvenance"] == "user":
                     if at is not None:
                         facts.update(lastInteractionAtUtc=at, lastInteractionId=ident)
-                    text = ("[]" if q["answerKind"] == "selection" and raw.get("selectedOptions") == []
-                            else q["fact"]["answer"])
                     facts["lastHuman"] = with_time({
-                        "id": ident + ":" + str(q["fact"]["index"]), "text": text, "provenance": "user",
+                        "id": ident + ":" + str(q["fact"]["index"]), "provenance": "user",
                         "questionId": q["fact"]["id"], "callId": q["fact"]["callId"], "sourceEntryId": ident,
                         "answerKind": q["answerKind"], "structuredAnswer": True, "answerProvenance": "user",
-                        "timedOut": False, "textTruncated": q["answerChars"] > len(q["fact"]["answer"]),
+                        "timedOut": False,
                     }, "atUtc", at)
     selected = [q for q in questions if q["fact"]["status"] in ("open", "unknown")][-MAX_QUESTIONS:]
     if len(selected) < MAX_QUESTIONS:
@@ -496,6 +915,7 @@ def fit_output(result):
             issues = result["coverage"]["issues"]
             if "output-excerpt-limit" not in issues:
                 issues.append("output-excerpt-limit")
+            result["coverage"]["fields"]["clock"] = "unknown"
             continue
         if outcomes:
             _, length = outcomes.popleft()
@@ -614,6 +1034,8 @@ def read_target(target, now):
             result.update(status="unchanged", reusable=True)
             return result
         entries, header, versions, issues = {}, None, set(), set()
+        # scoped: reason -> the one field it demotes; whole: a record failed in a way that may hide any field.
+        writer_unknown, scoped, whole = False, {}, False
         selected, last_self = None, None
         with os.fdopen(fd, "rb") as stream:
             fd = None
@@ -675,22 +1097,26 @@ def read_target(target, now):
                 if writer is not None and not isinstance(writer, str):
                     raise SourceProblem("unsupported", "unsupported-runtime-identity")
                 if writer is None:
-                    issues.add("missing-writer-version")
+                    writer_unknown = True
                 else:
                     versions.add(writer)
-                    if writer not in SUPPORTED_WRITERS:
-                        issues.add("unqualified-writer-version")
+                    writer_unknown = writer_unknown or writer not in SUPPORTED_WRITERS
                 line_hash = hashlib.sha256(line).hexdigest()
                 if ident in entries and entries[ident][2] != line_hash:
                     raise SourceProblem("malformed", "conflicting-entry-id")
                 try:
-                    normalize(record)
+                    normalized = normalize(record)
                 except UnicodeError:
                     raise SourceProblem("malformed", "invalid-unicode-text")
                 except SourceProblem as problem:
                     if problem.status != "partial":
                         raise
                     issues.add(problem.reason)
+                    whole = True
+                else:
+                    for field, reason in (normalized or {}).get("problems", ()):
+                        issues.add(reason)
+                        scoped.setdefault(reason, field)
                 entries[ident] = (parent, offset, line_hash)
                 selected = record.get("activeLeafId", ident)
                 if selected == ident:
@@ -702,12 +1128,13 @@ def read_target(target, now):
             issues.add("source-changed-during-read")
         records_complete = not issues.intersection(("source-deadline", "source-limit", "partial-line",
                                                     "oversized-record", "source-changed-during-read"))
+        writer_support = "unknown" if writer_unknown else "qualified"
         if not records_complete:
             result.update(status="partial", sessionId=header["id"], schemaVersion=header["version"],
                           writerVersions=sorted(versions), selectedLeafId=None, selection="unknown", complete=False,
                           coverage={"records": metrics["recordsRead"], "entries": len(entries), "recordsComplete": False,
-                                    "historyScope": "unavailable", "selectionSupport": "unknown",
-                                    "writerSupport": "unknown" if issues.intersection(("missing-writer-version", "unqualified-writer-version")) else "qualified",
+                                    "historyScope": "unavailable", "fields": {field: "unknown" for field in FIELDS},
+                                    "writerSupport": writer_support,
                                     "schemaSupport": "schema3-observed-writers", "issues": sorted(issues),
                                     "liveLeaf": "not-observed"})
             result["questionCoverage"] = {"status": "unknown", "knownTotal": 0, "included": 0, "omitted": 0}
@@ -738,10 +1165,11 @@ def read_target(target, now):
             cursor = parent
         complete = not issues
         history_scope = "selected-ancestry"
+        damaged = set(FIELDS) if whole or issues.difference(scoped) else set(scoped.values())
         coverage = {"records": metrics["recordsRead"], "entries": len(entries), "ancestryEntries": len(chain),
                     "offBranchEntries": len(entries) - len(chain), "ancestryComplete": ancestry_complete,
-                    "writerSupport": "unknown" if issues.intersection(("missing-writer-version", "unqualified-writer-version")) else "qualified",
-                    "selectionSupport": "unknown" if issues.intersection(("missing-writer-version", "unqualified-writer-version")) else "schema3-replayed",
+                    "writerSupport": writer_support,
+                    "fields": {field: "unknown" if field in damaged else "supported" for field in FIELDS},
                     "schemaSupport": "schema3-observed-writers", "issues": sorted(issues),
                     "selectionFallback": selection_fallback, "liveLeaf": "not-observed"}
         coverage.update(recordsComplete=True, historyScope=history_scope)
@@ -760,6 +1188,7 @@ def read_target(target, now):
             result["complete"] = False
             if "coverage" in result:
                 result["coverage"]["issues"] = sorted(set(result["coverage"]["issues"]) | {problem.reason})
+                result["coverage"]["fields"] = {field: "unknown" for field in FIELDS}
             result["questionCoverage"] = {"status": "unknown", "knownTotal": 0, "included": 0, "omitted": 0}
         return result
     except FileNotFoundError:
@@ -774,85 +1203,10 @@ def read_target(target, now):
             os.close(fd)
 
 
-def local_zone():
-    configured = os.environ.get("TZ", "").lstrip(":")
-    if configured and not configured.startswith("/"):
-        try:
-            ZoneInfo(configured)
-            return configured
-        except (ZoneInfoNotFoundError, ValueError):
-            pass
-    try:
-        target = str(Path("/etc/localtime").resolve())
-        marker = "/zoneinfo/"
-        if marker in target:
-            return target.split(marker, 1)[1]
-    except OSError:
-        pass
-    try:
-        return Path("/etc/timezone").read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-
-
-def resolve_date(request):
-    date, civil_time = request.get("civilDate"), request.get("civilTime", "00:00")
-    zone_explicit = "zone" in request
-    zone_name = request.get("zone") if zone_explicit else local_zone()
-    now = request.get("nowUtc")
-    result = {"protocol": 1, "requestId": request["requestId"], "status": "invalid",
-              "civilDate": date, "civilTime": civil_time}
-    if isinstance(zone_name, str):
-        result["zone"] = zone_name
-        result["zoneSource"] = "request" if zone_explicit else "system"
-    try:
-        if not isinstance(date, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
-            raise ValueError("civilDate must be YYYY-MM-DD")
-        if not isinstance(civil_time, str) or not re.fullmatch(r"\d{2}:\d{2}", civil_time):
-            raise ValueError("civilTime must be HH:MM")
-        if now is not None and not finite(now):
-            raise ValueError("nowUtc must be finite")
-        if not isinstance(zone_name, str) or not zone_name or zone_name.startswith("/"):
-            raise ValueError("local IANA time zone unavailable; supply zone")
-        try:
-            zone = ZoneInfo(zone_name)
-        except ZoneInfoNotFoundError:
-            raise ValueError("unknown time zone " + zone_name + "; use an IANA name such as America/New_York")
-        civil = datetime.fromisoformat(date + "T" + civil_time)
-        local = date + " " + civil_time + " " + zone_name
-        candidates = set()
-        for fold in (0, 1):
-            aware = civil.replace(tzinfo=zone, fold=fold)
-            utc = aware.astimezone(timezone.utc)
-            if utc.astimezone(zone).replace(tzinfo=None) == civil:
-                candidates.add(utc.timestamp())
-        if not candidates:
-            result["problem"] = "nonexistent"
-            raise ValueError(local + " does not exist: clocks skip forward at that time. Choose another time.")
-        if len(candidates) != 1:
-            result.update(status="ambiguous", problem="repeated",
-                          error=local + " happens twice: clocks fall back at that time. Choose another time.")
-            return result
-        instant = candidates.pop()
-        utc_text = datetime.fromtimestamp(instant, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        result.update(status="ready", resolvedUTC=instant, display=local, utcDisplay=utc_text)
-        text = "Bring back " + local + (" (system time zone)" if not zone_explicit else "") + " = " + utc_text + " UTC"
-        if now is not None:
-            result["past"] = instant <= now
-            if result["past"]:
-                text += ". That time has already passed: the conversation returns to Attention on the next refresh."
-        result["confirmation"] = text
-    except (ValueError, OverflowError) as error:
-        result["error"] = str(error)
-    return result
-
-
 def respond(request):
     if (not isinstance(request, dict) or type(request.get("protocol")) is not int or request["protocol"] != 1
             or not isinstance(request.get("requestId"), str)):
         raise ValueError("protocol 1 and string requestId required")
-    if request.get("op") == "date":
-        return resolve_date(request)
     if request.get("op") not in (None, "source", "header"):
         raise ValueError("unsupported operation")
     targets, now = request.get("targets"), request.get("nowUtc")

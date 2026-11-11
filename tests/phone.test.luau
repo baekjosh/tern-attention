@@ -58,27 +58,25 @@ end
 
 local function paneOf(title) return census.agentPanes(title)[1] end
 
-test("attention and later split follows the desktop queue", function()
+test("queue sections follow the desktop queue", function()
 	local snapshot = build(nil, function(rows)
 		row(rows, "Tide ledger").attention = true
 		row(rows, "Buoy audit").attention = true
 		row(rows, "Pier schedule").attention = true
 		row(rows, "Pier schedule").priority = 0
-		-- A deferred row never counts as Attention even when it carries the flag.
-		row(rows, "Vibration limits").attention = true
 	end)
 	assert(snapshot.schema == 2 and snapshot.status == "ok" and snapshot.revision == 7 and snapshot.generatedUtc == NOW
 		and snapshot.host == "Workbench", "header fields")
 	assert(snapshot.reason == nil, "an ok snapshot carries no reason")
-	assert(snapshot.counts.attention == 4 and snapshot.counts.later == 1 and snapshot.counts.working == 0, "counts are queue denominators")
+	assert(snapshot.counts.attention == 4 and snapshot.counts.working == 0 and snapshot.counts.later == nil, "counts are queue denominators")
 	local sections = {}
 	for _, published in ipairs(snapshot.rows) do table.insert(sections, published.section) end
-	assert(table.concat(sections, ",") == "attention,attention,attention,attention,later", "attention first, then later")
+	assert(table.concat(sections, ",") == "attention,attention,attention,attention", "only Attention rows are published")
 	-- Desktop order: priority first, then creation order.
 	assert(snapshot.rows[1].title == "Pier schedule", "priority orders the queue like the desktop")
-	assert(byTitle(snapshot, "Vibration limits").section == "later", "deferred conversation is in Later")
-	assert(byTitle(snapshot, "Bale counting") == nil and byTitle(snapshot, "Kettle seam") == nil,
-		"reference and finished conversations are not published")
+	for _, title in ipairs({ "Vibration limits", "Bale counting", "Kettle seam", "omp" }) do
+		assert(byTitle(snapshot, title) == nil, title .. " is in no queue, so it is not published")
+	end
 	assert(byTitle(snapshot, "Core samples") == nil, "an idle active conversation is not in the queue")
 end)
 
@@ -177,10 +175,10 @@ test("rows are capped but counts still total", function()
 		copy.pane = paneOf("Tide ledger")
 		table.insert(rows, copy)
 	end
-	local presentation = { rows = rows, attentionCount = 999, laterCount = 999, workingCount = 999 }
+	local presentation = { rows = rows, attentionCount = 999, workingCount = 999 }
 	local snapshot = phone.snapshot(presentation, nil, { nowUtc = NOW, hostName = "Workbench", view = view })
 	assert(#snapshot.rows == 60 and phone.MAX_ROWS == 60, "at most 60 rows")
-	assert(snapshot.counts.attention == 75 and snapshot.counts.later == 0 and snapshot.counts.working == 75,
+	assert(snapshot.counts.attention == 75 and snapshot.counts.working == 75,
 		"uncapped queue totals ignore invented presentation counters even when no Working rows fit")
 	assert(phone.validate(clone(snapshot)) ~= nil, "a capped snapshot validates")
 end)
@@ -225,7 +223,7 @@ test("sameContent ignores the write counter and the write time only", function()
 	third.rows[1].state = "Working"
 	assert(not phone.sameContent(first, third), "a row change is content")
 	local fourth = clone(first)
-	fourth.counts.later = 3
+	fourth.counts.working = 3
 	assert(not phone.sameContent(first, fourth), "a count change is content")
 	local fifth = clone(first)
 	fifth.status, fifth.rows = "disabled", {}
@@ -272,7 +270,7 @@ test("validate rejects hostile, oversized and wrong-typed input without throwing
 	assert(phone.validate(booby) == nil, "an erroring table never throws")
 	local lying = setmetatable({}, { __len = function() error("boom") end, __index = function() error("boom") end })
 	assert(phone.validate({ schema = 2, revision = 1, generatedUtc = 1, status = "ok", host = "m",
-		counts = { attention = 0, later = 0, working = 0 }, rows = lying }) == nil, "an erroring row list never throws")
+		counts = { attention = 0, working = 0 }, rows = lying }) == nil, "an erroring row list never throws")
 	rejects("old schema", function(raw) raw.schema = 1 end)
 	rejects("future schema", function(raw) raw.schema = 3 end)
 	rejects("string revision", function(raw) raw.revision = "7" end)
@@ -285,7 +283,6 @@ test("validate rejects hostile, oversized and wrong-typed input without throwing
 	rejects("long reason", function(raw) raw.reason = string.rep("r", 201) end)
 	rejects("missing counts", function(raw) raw.counts = nil end)
 	rejects("negative count", function(raw) raw.counts.attention = -1 end)
-	rejects("fractional count", function(raw) raw.counts.later = 0.5 end)
 	rejects("missing working count", function(raw) raw.counts.working = nil end)
 	rejects("string working count", function(raw) raw.counts.working = "1" end)
 	rejects("negative working count", function(raw) raw.counts.working = -1 end)
@@ -442,7 +439,7 @@ test("ages and clock chips use one wording", function()
 	assert(phone.clockText({ recorded = false }, NOW) == nil and phone.clockText(nil, NOW) == nil, "no kind, no chip")
 end)
 
-test("working publishes live work after Later with explicit overlapping row sections", function()
+test("working publishes live work after Attention with explicit overlapping row sections", function()
 	local snapshot, rows, presentation, workspace = build(nil, function(items)
 		for _, title in ipairs({ "Tide ledger", "Vibration limits", "Bale counting", "Kettle seam" }) do
 			local item = row(items, title)
@@ -453,30 +450,32 @@ test("working publishes live work after Later with explicit overlapping row sect
 		row(items, "Core samples").stale = true
 	end)
 	local working = view.queue(presentation, "working")
-	assert(snapshot.counts.working == 4 and snapshot.counts.working == #working)
-	assert(snapshot.counts.attention == #view.queue(presentation, "attention")
-		and snapshot.counts.later == #view.queue(presentation, "later"), "existing queue counts stay unchanged")
-	local rank, previous, deferred, liveDeferred = { attention = 1, later = 2, working = 3 }, 0, nil, nil
+	-- Core samples is stale (its source proof is pending), but its pane is live, so it still works.
+	assert(snapshot.counts.working == 5 and snapshot.counts.working == #working)
+	assert(snapshot.counts.attention == #view.queue(presentation, "attention"), "existing queue counts stay unchanged")
+	local rank, previous, tideSections = { attention = 1, working = 2 }, 0, {}
 	local seenWorking = {}
 	for _, published in ipairs(snapshot.rows) do
-		assert(rank[published.section] >= previous, "Attention, then Later, then Working")
+		assert(rank[published.section] >= previous, "Attention, then Working")
 		previous = rank[published.section]
 		if published.section == "working" then
 			table.insert(seenWorking, published.workId)
-			assert(published.state == "Working", "runtime remains live even for set-aside work")
+			assert(published.state == "Working", "runtime stays live")
 		end
-		if published.title == "Vibration limits" then
-			if published.section == "later" then deferred = published else liveDeferred = published end
+		if published.title == "Tide ledger" then tideSections[published.section] = published end
+		if published.title == "Vibration limits" or published.title == "Bale counting" or published.title == "Kettle seam" then
+			assert(published.section == "working", "set-aside work is published only as live Working, never in Attention")
 		end
 	end
 	for index, item in ipairs(working) do assert(seenWorking[index] == item.workId, "phone reuses desktop order") end
-	assert(deferred and liveDeferred and deferred.workId == liveDeferred.workId and deferred.serial == liveDeferred.serial,
-		"the same live deferred conversation is deliberately present in both modes")
+	assert(tideSections.attention and tideSections.working and tideSections.attention.workId == tideSections.working.workId
+		and tideSections.attention.serial == tideSections.working.serial,
+		"the same live attention conversation is deliberately present in both modes")
 	assert(equal(phone.validate(clone(snapshot)), snapshot), "schema 2 round-trips overlapping identities across modes")
-	local pending = row(rows, "Bale counting")
+	local pending = row(rows, "Core samples")
 	pending.identityKey, pending.navigable, pending.retryableHeaderRoute = nil, false, false
 	local unproven = phone.snapshot(presentation, workspace, { nowUtc = NOW, hostName = "Workbench", view = view })
-	assert(unproven.counts.working == 4 and byTitle(unproven, "Bale counting").jumpable == false,
+	assert(unproven.counts.working == #working and byTitle(unproven, "Core samples").jumpable == false,
 		"missing source proof cannot hide live work or invent a jump")
 	local old = clone(snapshot)
 	old.schema = 1
@@ -492,11 +491,12 @@ test("a Working-only cap keeps the full eligible total", function()
 		table.insert(rows, item)
 	end
 	rows[75].nativeState = "idle"
-	rows[74].pane = nil
+	rows[74].pane, rows[74].live = nil, false
 	local snapshot = phone.snapshot({ rows = rows }, nil, { nowUtc = NOW, hostName = "Workbench", view = view })
 	assert(#snapshot.rows == phone.MAX_ROWS and snapshot.counts.working == 73
-		and snapshot.counts.attention == 0 and snapshot.counts.later == 0)
-	assert(snapshot.rows[1].section == "working" and snapshot.rows[60].workId == "work:60")
+		and snapshot.counts.attention == 0)
+	assert(snapshot.rows[1].section == "working" and snapshot.rows[1].workId == "work:1"
+		and snapshot.rows[60].workId == "work:60")
 	assert(phone.validate(clone(snapshot)), "capped Working validates with honest totals")
 end)
 

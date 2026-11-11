@@ -64,13 +64,13 @@ test("restored duplicate routes preserve canonical identity and merged review wi
 	table.insert(live.agents, { pane = 11, state = "waiting_input", deliveryError = "delivery" })
 	local first = model.reconcile(state, live, {}, context(1001)).rows[1]
 	assert(first.pane == 22 and first.reviewKind == "update" and first.condition == "waiting")
-	assert(model.setDisposition(state, first.workId, "later", 1002))
+	assert(model.setDisposition(state, first.workId, "finished", 1002))
 	local saved = model.snapshot(state)
 	assert(#saved.items == 1 and saved.items[1].waiting and saved.items[1].delivery and saved.items[1].alert)
 	state = model.new(saved)
 	live.now = 1
 	local restored = model.reconcile(state, live, {}, context(1003))
-	assert(#restored.rows == 1 and restored.knownCount == 1 and restored.attentionCount == 0 and restored.laterCount == 1)
+	assert(#restored.rows == 1 and restored.knownCount == 1 and restored.attentionCount == 0 and restored.rows[1].disposition == "finished")
 	local selected = restored.rows[1]
 	assert(selected.pane == 22 and selected.title == "Preferred" and selected.navigable and not selected.stale)
 	assert(selected.workId == first.workId and selected.identityKey == first.identityKey)
@@ -83,11 +83,11 @@ test("restored duplicate routes preserve canonical identity and merged review wi
 	assert(model.visit(state, selected.pane, selected.reviewRevision, selected.serial))
 	local acknowledged = model.current(state)
 	assert(#acknowledged.rows == 1 and acknowledged.rows[1].reviewRevision == nil)
-	assert(acknowledged.rows[1].condition == "waiting" and acknowledged.laterCount == 1)
+	assert(acknowledged.rows[1].condition == "waiting" and acknowledged.rows[1].disposition == "finished")
 	state = model.new(model.snapshot(state))
 	local again = model.reconcile(state, live, {}, context(1005))
 	assert(#again.rows == 1 and again.rows[1].pane == 22 and again.rows[1].reviewRevision == nil)
-	assert(again.rows[1].condition == "waiting" and again.attentionCount == 0 and again.laterCount == 1)
+	assert(again.rows[1].condition == "waiting" and again.attentionCount == 0 and again.rows[1].disposition == "finished")
 end)
 
 test("superseded unread revisions survive offline restore and idle without reentering Attention", function()
@@ -210,7 +210,7 @@ test("a current result with lagging working inventory survives reload and enters
 	end
 end)
 
-test("pending-record loss: reload preserves two P0 records and snoozed Chrome Backlog", function()
+test("pending-record loss: reload preserves two P0 records and the Finished Chrome row", function()
 	local state = model.new()
 	local original = model.reconcile(state, snapshot(1000, true), {
 		{ kind = "finished", pane = 11, result = "done", at = 1000 },
@@ -218,7 +218,7 @@ test("pending-record loss: reload preserves two P0 records and snoozed Chrome Ba
 	}, context(1000))
 	assert(original.status == "ready" and original.count == 3)
 	assert(row(original, 11).reviewRevision ~= nil and row(original, 22).reviewRevision ~= nil)
-	assert(model.setDisposition(state, "work:" .. tostring(row(original, 33).serial), "later", 1000))
+	assert(model.setDisposition(state, "work:" .. tostring(row(original, 33).serial), "finished", 1000))
 	local saved = model.snapshot(state)
 	assert(saved.schema == 3 and #saved.items == 3)
 	local reloaded = model.new(saved)
@@ -228,9 +228,9 @@ test("pending-record loss: reload preserves two P0 records and snoozed Chrome Ba
 	local done, failed, chrome = row(restored, 11), row(restored, 22), row(restored, 33)
 	assert(done ~= nil and done.disposition == "active" and done.reviewRevision == row(original, 11).reviewRevision)
 	assert(failed ~= nil and failed.disposition == "active" and failed.reviewRevision == row(original, 22).reviewRevision)
-	assert(chrome ~= nil and chrome.disposition == "later")
+	assert(chrome ~= nil and chrome.disposition == "finished")
 	assert(restored.status == "ready" and restored.count == 3 and restored.knownCount == 3)
-	assert(restored.attentionCount == 2 and restored.laterCount == 1)
+	assert(restored.attentionCount == 2)
 	assert(restored.attentionTargets[11] and restored.attentionTargets[22] and not restored.attentionTargets[33])
 end)
 
@@ -240,11 +240,11 @@ test("a captured visit revision cannot acknowledge a newer completion", function
 		{ kind = "finished", pane = 22, result = "failed", at = 1000 },
 	}, context(1000))
 	local selected = row(first, 22)
-	local later = model.reconcile(state, snapshot(2000, false), {
+	local after = model.reconcile(state, snapshot(2000, false), {
 		{ kind = "state", pane = 22, new = "working", old = "idle", at = 1500 },
 		{ kind = "finished", pane = 22, result = "failed", at = 2000 },
 	}, context(1001))
-	local newer = row(later, 22)
+	local newer = row(after, 22)
 	assert(newer.reviewRevision ~= selected.reviewRevision and newer.serial == selected.serial)
 	assert(not visit(state, selected))
 	assert(row(model.current(state), 22).reviewRevision == newer.reviewRevision)
@@ -481,7 +481,7 @@ for _, condition in ipairs({ "waiting", "delivery", "startup" }) do
 			data.panes[11].startupError = if condition == "startup" then "not started" else nil
 			local first = row(model.reconcile(state, data, {}, context(1000)), 11)
 			assert(first and first.reviewRevision == nil)
-			assert(model.setDisposition(state, "work:" .. tostring(first.serial), "later", 1000))
+			assert(model.setDisposition(state, "work:" .. tostring(first.serial), "finished", 1000))
 			if gap == "restart" then
 				state = model.new(model.snapshot(state))
 			else
@@ -499,7 +499,7 @@ for _, condition in ipairs({ "waiting", "delivery", "startup" }) do
 			assert(row(model.reconcile(state, awaitingProof, {}, context(1001)), 11) ~= nil)
 			local historical = row(model.reconcile(state, snapshot(1, false), {}, context(1002)), 11)
 			assert(historical and (historical.reviewRevision ~= nil) == (gap ~= "missing") and historical.navigable)
-			assert(historical.serial == first.serial and historical.disposition == "later")
+			assert(historical.serial == first.serial and historical.disposition == "finished")
 			assert(historical.firstSeenUtc == first.firstSeenUtc and historical.queueOrder == first.queueOrder)
 			assert(historical.reason ~= first.reason, "historical obligation must not claim a current live condition")
 			local again = row(model.reconcile(state, snapshot(2, false), {}, context(1003)), 11)
@@ -682,20 +682,20 @@ test("work deferred after a completion retains causal order across another reloa
 end)
 
 for _, restart in ipairs({ "none", "reload", "reload-pending" }) do
-	test("a new input request deferred between unchanged waiting snapshots promotes Backlog after proof with restart " .. restart, function()
+	test("a new input request deferred between unchanged waiting snapshots is applied once after proof without reactivating Finished with restart " .. restart, function()
 		local state = model.new()
 		local waiting = snapshot(100, false)
 		waiting.agents[1].state = "waiting_input"
 		local first = row(model.reconcile(state, waiting, {}, context(1000)), 11)
 		assert(first and first.reviewRevision == nil and first.disposition == "active")
-		assert(model.setDisposition(state, "work:" .. tostring(first.serial), "later", 1001))
+		assert(model.setDisposition(state, "work:" .. tostring(first.serial), "finished", 1001))
 		local pending = snapshot(200, false)
 		pending.agents[1].state, pending.identityReady = "waiting_input", false
 		local held = row(model.reconcile(state, pending, {
 			{ kind = "state", pane = 11, old = "waiting_input", new = "working", at = 150 },
 			{ kind = "state", pane = 11, old = "working", new = "waiting_input", at = 160 },
 		}, context(1002)), 11)
-		assert(held and held.disposition == "later" and held.attentionRevision == first.attentionRevision,
+		assert(held and held.disposition == "finished" and held.attentionRevision == first.attentionRevision,
 			"identity proof must gate the new request")
 		if restart ~= "none" then
 			local saved = model.snapshot(state)
@@ -709,15 +709,15 @@ for _, restart in ipairs({ "none", "reload", "reload-pending" }) do
 			if restart == "reload-pending" then
 				local again = snapshot(1, false)
 				again.agents[1].state, again.identityReady = "waiting_input", false
-				assert(row(model.reconcile(state, again, {}, context(1003)), 11).disposition == "later")
+				assert(row(model.reconcile(state, again, {}, context(1003)), 11).disposition == "finished")
 			end
 		end
 		local proven = snapshot(if restart == "none" then 300 else 2, false)
 		proven.agents[1].state = "waiting_input"
 		local promoted = row(model.reconcile(state, proven, {}, context(1004)), 11)
-		assert(promoted and promoted.serial == first.serial and promoted.disposition == "active",
-			"the confirmed new request must promote the snoozed row")
-		assert(promoted.attentionRevision > first.attentionRevision and promoted.queueOrder > first.queueOrder)
+		assert(promoted and promoted.serial == first.serial and promoted.disposition == "finished" and not promoted.attention,
+			"the confirmed new request is recorded but never reactivates the Finished row")
+		assert(promoted.attentionRevision > first.attentionRevision)
 		assert(promoted.firstSeenUtc == 1002 and promoted.reviewRevision == nil)
 		local settled = snapshot(if restart == "none" then 301 else 3, false)
 		settled.agents[1].state = "waiting_input"
@@ -832,11 +832,11 @@ test("a keyless restored row binds after proof and new attention joins it instea
 	assert(bound.navigable and not bound.stale and not bound.orphaned and bound.identityKey == "conversation:done")
 	assert(bound.reviewRevision > original.reviewRevision, "the held completion replays onto the bound record")
 	assert(model.next(state, 33) == 11, "the bound record is a navigation target")
-	local later = model.reconcile(state, snapshot(5, false), {
+	local after = model.reconcile(state, snapshot(5, false), {
 		{ kind = "state", pane = 11, old = "idle", new = "working", at = 4 },
 		{ kind = "finished", pane = 11, result = "failed", at = 5 },
 	}, context(1003))
-	assert(#later.rows == 3 and row(later, 11).serial == original.serial and row(later, 11).reviewRevision > bound.reviewRevision)
+	assert(#after.rows == 3 and row(after, 11).serial == original.serial and row(after, 11).reviewRevision > bound.reviewRevision)
 	state = model.new(model.snapshot(state))
 	local reloaded = model.reconcile(state, snapshot(1, false), {}, context(1004))
 	assert(#reloaded.rows == 3 and row(reloaded, 11).serial == original.serial and row(reloaded, 11).navigable
@@ -1086,7 +1086,8 @@ test("durable snapshot reuse keeps persisted output exact and re-copies only cha
 	assert(#opening.rows == 3, "the fixture opens three conversations")
 	local stored = model.snapshot(state)
 	assert(stored.items[1].pane == 11 and stored.items[1].source ~= nil
-		and #stored.items[1].source.lastFinal.text > 4096, "the first record carries large retained evidence")
+		and utf8.len(stored.items[1].source.lastFinal.text) == 300 and stored.items[1].source.lastFinal.textTruncated == true,
+		"a stored reply keeps only the excerpt the rail shows, marked truncated")
 
 	local unchanged = model.snapshot(state)
 	assert(same(unchanged, stored), "an unchanged store persists the same document")
@@ -1124,6 +1125,61 @@ test("durable snapshot reuse keeps persisted output exact and re-copies only cha
 	assert(same(rehydrated, created), "a hydrated store persists the same document")
 	assert(rehydrated.items[1] ~= created.items[1] and rehydrated.items[3] ~= created.items[3],
 		"hydration resets the durable-copy cache so restored stores never serve shared snapshots")
+
+	-- A store saved before replies were bounded (full reply text, human text, in both the source and its last-known
+	-- ledger) loads bounded and is marked for one rewrite.
+	local legacy = copy(created)
+	local legacySource = legacy.items[1].source
+	legacySource.lastFinal.text, legacySource.lastFinal.textTruncated = string.rep("é", 400), nil
+	legacySource.lastHuman = { id = "human", atUtc = 800, provenance = "user", text = "private prompt" }
+	legacySource.lastKnown = { lastAssistant = { id = "older", atUtc = 700, stopReason = "stop", text = string.rep("a", 301) } }
+	local migrated = model.new(legacy)
+	local loaded = model.snapshot(migrated).items[1].source
+	assert(migrated.persistenceRevision > 0, "a store holding unbounded replies is rewritten once")
+	assert(loaded.lastFinal.text == string.rep("é", 300) and loaded.lastFinal.textTruncated == true
+		and loaded.lastKnown.lastAssistant.text == string.rep("a", 300) and loaded.lastHuman.text == nil
+		and loaded.lastHuman.atUtc == 800, "stored replies keep the shown excerpt (whole characters) and human input keeps its time")
+	assert(model.new(model.snapshot(migrated)).persistenceRevision == 0, "a bounded store loads without another rewrite")
+end)
+
+test("retired Later records and legacy Backlog buckets load as retained Finished without their dates", function()
+	local state = model.new()
+	local first = row(model.reconcile(state, snapshot(1000, false), {}, context(1000)), 33)
+	local saved = model.snapshot(state)
+	local input
+	for _, item in ipairs(saved.items) do if item.serial == first.serial then input = item end end
+	input.disposition, input.retained = "later", nil
+	input.untilUtc, input.availableOn, input.availableTime, input.zone = 5000, "2026-11-03", "09:00", "UTC"
+	input.blockerEpisode, input.laterEpisode, input.laterUtc = 3, 2, 1500
+	local loaded = model.new(saved)
+	assert(loaded.persistenceRevision > 0, "a record carrying retired Later state is rewritten")
+	local migrated = model.current(loaded).rows
+	for _, entry in ipairs(migrated) do
+		if entry.serial == first.serial then
+			assert(entry.disposition == "finished" and entry.retained and not entry.attention)
+			for _, retired in ipairs({ "untilUtc", "availableOn", "availableTime", "zone" }) do assert(entry[retired] == nil) end
+		end
+	end
+	local resaved = model.snapshot(loaded)
+	for _, item in ipairs(resaved.items) do
+		if item.serial == first.serial then
+			assert(item.disposition == "finished" and item.retained == true)
+			for _, retired in ipairs({ "untilUtc", "availableOn", "availableTime", "zone", "blockerEpisode", "laterEpisode", "laterUtc" }) do
+				assert(item[retired] == nil, retired)
+			end
+		end
+	end
+	assert(model.new(resaved).persistenceRevision == 0, "the migrated store loads without further rewrites")
+
+	for _, bucketRecords in ipairs({
+		{ schema = 1, records = { { window = "", host = "local", pane = 11, firstSeenUtc = 100, bucket = "backlog" } } },
+		{ schema = 2, serial = 5, queueOrder = 5, attentionRevision = 5, cursors = {}, records = {
+			record({ serial = 5, pane = 11, tab = 10, title = "Legacy", bucket = "backlog", firstSeenUtc = 100,
+				queueOrder = 5, attentionRevision = 5, reviewRevision = 5, reviewKind = "update" }) } },
+	}) do
+		local items = model.snapshot(model.new(bucketRecords)).items
+		assert(#items == 1 and items[1].disposition == "finished" and items[1].retained == true and items[1].firstSeenUtc == 100)
+	end
 end)
 
 return true

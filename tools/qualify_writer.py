@@ -3,9 +3,11 @@
 
     python3 tools/qualify_writer.py <version> [--dir DIR]... [--since-days N]
 
-Chore for every omp update (see the SUPPORTED_WRITERS docstring in
-source_facts.py): until a version is listed there, every session it writes or
-resumes degrades to selectionSupport "unknown". Steps:
+Chore for every omp update (see the per-field trust notes in the source_facts.py
+docstring). An unlisted version only reads writerSupport "unknown"; it never
+dashes a clock. What this tool proves is that the record shapes a version writes
+still parse into the same facts, so a changed shape is caught here rather than
+surfacing as a field reading "unknown". Steps:
 
 1. Produce real sessions of that version. Disk history only has them after the
    update has run for a while. Otherwise run the new omp under an isolated HOME
@@ -13,12 +15,15 @@ resumes degrades to selectionSupport "unknown". Steps:
    print mode with a tool call, once in --mode rpc-ui with set_ask_dialog to
    answer an `ask` select/custom/multi/cancelled, and once resuming an older
    session so a mixed-version file exists; pass those session dirs via --dir.
-2. Run this tool. A file is PASS when the helper (with the version allowlisted
-   in memory only) reports ready/complete with no issues and its lastFinal and
-   ask question/answer outcomes equal the minimal raw-JSONL reader below.
+2. Run this tool. A file is PASS when the helper reports ready/complete with no
+   issues and every field supported, and its lastFinal and ask question/answer
+   outcomes equal the minimal raw-JSONL reader below. For HTML-form asks the
+   reader takes each answered question's wording from the producer's own
+   `details.answers`, so the helper's form parsing is checked against it; an
+   unanswered form question is compared by status only.
 3. Diff the producer at the new tag against the last qualified tag
-   (src/session/session-entries.ts, src/tools/ask.ts); only fields this helper
-   does not read may differ.
+   (src/session/session-entries.ts, src/tools/ask.ts, packages/tui/src/html-form);
+   only fields this helper does not read may differ.
 4. Add the version to SUPPORTED_WRITERS, extend the allowlist test, and record
    the evidence in the source_facts.py docstring.
 
@@ -42,7 +47,33 @@ from datetime import datetime
 
 HELPER = Path(__file__).resolve().parents[1] / "source_facts.py"
 MAX_TEXT = 2000
+# The helper keeps only this much of a reply (source_facts.REPLY_TEXT); the reader compares the same excerpt.
+REPLY_TEXT = 300
 MAX_QUESTIONS = 32
+# Named controls of an HTML-form ask, by a regex independent of the helper's parser: radio/checkbox groups count
+# once per (type, name); hidden and button-like inputs are not questions.
+FORM_CONTROL = re.compile(r"<(input|select|textarea)\b([^>]*)>", re.IGNORECASE)
+FORM_UNANSWERED = frozenset(("hidden", "button", "file", "image", "reset", "submit"))
+
+
+def form_attribute(attrs, name):
+    match = re.search(r"\b%s\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))" % name, attrs, re.IGNORECASE)
+    return None if match is None else next(group for group in match.groups() if group is not None)
+
+
+def form_names(html):
+    names, groups = [], set()
+    for tag, attrs in FORM_CONTROL.findall(html):
+        name = form_attribute(attrs, "name")
+        kind = (form_attribute(attrs, "type") or "text").lower() if tag.lower() == "input" else tag.lower()
+        if not name or kind in FORM_UNANSWERED:
+            continue
+        if kind in ("radio", "checkbox"):
+            if (kind, name) in groups:
+                continue
+            groups.add((kind, name))
+        names.append(name)
+    return names
 
 
 def load_helper(version):
@@ -101,18 +132,25 @@ def minimal_reader(path):
     chain.reverse()
     final, questions, calls = None, [], {}
     for record in chain:
+        if record.get("type") == "reset_boundary":
+            # A reset starts the conversation's facts over, as in the helper.
+            final, questions, calls = None, [], {}
+            continue
         message = record.get("message")
         if not isinstance(message, dict):
             continue
         if message.get("role") == "assistant":
             text = text_of(message.get("content", []))
             if message.get("stopReason") == "stop" and text:
-                final = {"id": record["id"], "text": text[:MAX_TEXT], "atUtc": instant(message, record)}
+                final = {"id": record["id"], "text": text[:REPLY_TEXT], "atUtc": instant(message, record)}
             for part in message.get("content", []) if isinstance(message.get("content"), list) else []:
                 if part.get("type") == "toolCall" and part.get("name") == "ask":
                     calls[part["id"]] = []
-                    for raw in part["arguments"]["questions"]:
-                        question = {"text": raw["question"], "status": "open", "answer": None, "qid": raw.get("id")}
+                    arguments = part["arguments"]
+                    raws = ([{"question": None} for _ in form_names(arguments["html"])]
+                            if "html" in arguments else arguments["questions"])
+                    for raw in raws:
+                        question = {"text": raw["question"], "status": "open", "answer": None}
                         questions.append(question)
                         calls[part["id"]].append(question)
         elif message.get("role") == "toolResult" and message.get("toolName") == "ask":
@@ -123,13 +161,19 @@ def minimal_reader(path):
                 for question in asked:
                     question["status"] = state
                 continue
+            if isinstance(details.get("answers"), list):
+                # The producer words each answered form question itself; the helper's parsed wording must equal it.
+                for question, result in zip(asked, details["answers"]):
+                    question.update(text=result["question"], status="answered", answer=result["answer"][:MAX_TEXT])
+                continue
             results = details.get("results") if isinstance(details.get("results"), list) else [details]
             for question, result in zip(asked, results):
-                custom = (result.get("customInput") or "").strip()
+                custom = result.get("customInput") or ""
                 chosen = result.get("selectedOptions") or []
                 question["status"] = "answered"
-                question["answer"] = custom[:MAX_TEXT] if custom else ", ".join(chosen)[:MAX_TEXT]
-    return {"final": final, "questions": [(q["text"][:MAX_TEXT], q["status"], q["answer"]) for q in questions]}
+                question["answer"] = custom[:MAX_TEXT] if custom.strip() else ", ".join(chosen)[:MAX_TEXT]
+    return {"final": final, "questions": [(None if q["text"] is None else q["text"][:MAX_TEXT], q["status"], q["answer"])
+                                          for q in questions]}
 
 
 def check(helper, path):
@@ -137,8 +181,9 @@ def check(helper, path):
                              "targets": [{"key": "qualify", "path": str(path)}]})["results"][0]
     if result["status"] != "ready" or result.get("complete") is not True:
         return "helper %s: %s" % (result["status"], result.get("reason") or result["coverage"]["issues"])
-    if result["coverage"]["issues"] or result["coverage"]["selectionSupport"] != "schema3-replayed":
-        return "helper issues %s" % result["coverage"]["issues"]
+    fields = result["coverage"]["fields"]
+    if result["coverage"]["issues"] or any(support != "supported" for support in fields.values()):
+        return "helper issues %s fields %s" % (result["coverage"]["issues"], fields)
     expected = minimal_reader(path)
     if len(expected["questions"]) > MAX_QUESTIONS:
         return "more than %d questions: not comparable" % MAX_QUESTIONS
@@ -147,7 +192,10 @@ def check(helper, path):
     if got != expected["final"]:
         return "lastFinal differs: helper %r reader %r" % (got, expected["final"])
     questions = [(q["text"], q["status"], q.get("answer")) for q in result["questions"]]
-    if questions != expected["questions"]:
+    # An unanswered form question has no producer wording to compare; its status still must match.
+    reader = [(questions[index][0] if index < len(questions) and text is None else text, status, answer)
+              for index, (text, status, answer) in enumerate(expected["questions"])]
+    if questions != reader:
         return "questions differ: helper %r reader %r" % (questions, expected["questions"])
     return None
 

@@ -8,7 +8,7 @@ local function test(name, body)
 	assert(ok, name .. ": " .. tostring(failure))
 end
 
-local DISPOSITIONS = { "active", "later", "reference", "finished" }
+local DISPOSITIONS = { "active", "reference", "finished" }
 
 local function context(now, fields)
 	local value = { window = "", hostKeys = { [1] = "local", [2] = "ssh:forge" }, connected = { ["local"] = true },
@@ -55,13 +55,12 @@ local function conversation(disposition, fields)
 	return state, model.current(state).rows[1]
 end
 
--- Attention counts only active attention rows; Later counts only deferred rows; the total counts everything.
+-- Attention counts only active attention rows; the total counts everything.
 local function expectCounts(state, disposition, attention, label)
 	local presentation = model.current(state)
 	assert(presentation.attentionCount == (if attention then 1 else 0),
 		label .. ": attention count " .. tostring(presentation.attentionCount))
-	assert(presentation.laterCount == (if disposition == "later" then 1 else 0),
-		label .. ": later count " .. tostring(presentation.laterCount))
+	assert(presentation.laterCount == nil, label .. ": there is no Later count")
 	assert(presentation.allCount == #presentation.rows, label .. ": total counts every row")
 end
 
@@ -87,25 +86,22 @@ test("every disposition transition applies the same row, count and ordering rule
 			assert(row.retained == (to ~= "active" or before.retained), label .. ": every non-active disposition is retained")
 			assert(row.attention == (to == "active"), label .. ": only active work needs Attention")
 			expectCounts(state, to, to == "active", label)
-			if from == "later" and to == "active" then
-				assert(row.reviewKind == "manual" and row.reviewRevision > before.reviewRevision
-					and row.queueOrder > before.queueOrder, label .. ": resuming from Later is a fresh manual revisit")
-			else
-				assert(row.reviewRevision == before.reviewRevision and row.queueOrder == before.queueOrder,
-					label .. ": other transitions invent no review and keep their place")
-			end
+			assert(row.reviewRevision == before.reviewRevision and row.queueOrder == before.queueOrder,
+				label .. ": transitions invent no review and keep their place")
 			assert(reachable(state) == (to == "active"), label .. ": only active work is a Next target")
 		end
 	end
 end)
 
-test("Reference and Finished clear a resumed manual revisit", function()
+test("Reference and Finished clear a brought-back manual revisit", function()
 	for _, settled in ipairs({ "reference", "finished" }) do
-		local state, later = conversation("later")
-		assert(model.setDisposition(state, later.workId, "active", 200))
+		local state, parked = conversation(settled)
+		assert(model.setDisposition(state, parked.workId, "active", 200, { bringBack = true }))
 		local resumed = model.current(state).rows[1]
 		assert(resumed.reviewKind == "manual" and resumed.attention, settled)
-		assert(model.setDisposition(state, later.workId, settled, 201))
+		assert(resumed.reviewRevision > parked.reviewRevision and resumed.queueOrder > parked.queueOrder,
+			settled .. ": bringing back is a fresh manual revisit")
+		assert(model.setDisposition(state, parked.workId, settled, 201))
 		local row = model.current(state).rows[1]
 		assert(row.disposition == settled and row.reviewRevision == nil and row.reviewKind == nil and not row.attention, settled)
 		expectCounts(state, settled, false, settled)
@@ -134,23 +130,18 @@ test("ordinary completion advances review evidence but never changes the disposi
 	end
 end)
 
-test("a new direct blocker returns only Later; Reference, Finished and active keep their disposition", function()
+test("a new direct blocker keeps every disposition; only active work needs Attention", function()
 	for _, disposition in ipairs(DISPOSITIONS) do
 		local state, first = conversation(disposition)
 		model.reconcile(state, data("working", { now = 20 }), {}, context(102))
 		local row = model.reconcile(state, data("waiting_input", { now = 30 }), {}, context(103)).rows[1]
-		local expected = if disposition == "later" then "active" else disposition
-		assert(row.workId == first.workId and row.disposition == expected, disposition .. " -> " .. row.disposition)
+		assert(row.workId == first.workId and row.disposition == disposition, disposition .. " -> " .. row.disposition)
 		assert(row.condition == "waiting", disposition .. ": the live condition is always recorded")
-		assert(row.attention == (expected == "active"), disposition .. ": condition counts only on active work")
+		assert(row.attention == (disposition == "active"), disposition .. ": condition counts only on active work")
 		assert(row.reviewRevision == first.reviewRevision, disposition .. ": a blocker is not a review revision")
-		if disposition == "later" then
-			assert(row.queueOrder > first.queueOrder, "the returned conversation queues behind existing work")
-		else
-			assert(row.queueOrder == first.queueOrder, disposition .. ": no reordering")
-		end
-		expectCounts(state, expected, expected == "active", disposition)
-		assert(reachable(state) == (expected == "active"), disposition)
+		assert(row.queueOrder == first.queueOrder, disposition .. ": no reordering")
+		expectCounts(state, disposition, disposition == "active", disposition)
+		assert(reachable(state) == (disposition == "active"), disposition)
 	end
 end)
 
@@ -207,22 +198,24 @@ test("an offline host retains each disposition's last-known facts and never clos
 	for _, disposition in ipairs(DISPOSITIONS) do
 		local remote = { host = 2, pane = 22 }
 		local state, first = conversation(disposition, remote)
-		local function retained(presentation, reason, label)
-			assert(#presentation.rows == 1, label .. ": the record is never closed by an outage")
-			local row = presentation.rows[1]
-			assert(row.workId == first.workId and row.disposition == disposition and row.stale and not row.navigable, label)
-			assert(row.unavailableReason == reason, label .. ": " .. tostring(row.unavailableReason))
-			assert(row.attentionRevision == first.attentionRevision and row.reviewRevision == first.reviewRevision,
-				label .. ": an outage mints no revision")
-			assert(row.attention == (disposition == "active"), label .. ": last-known Attention is unchanged")
-			assert(presentation.status == "partial" and #presentation.offlineHosts == 1, label)
-			assert(presentation.reachableCount == 0 and not reachable(state), label .. ": offline work is never a target")
-			expectCounts(state, disposition, disposition == "active", label)
-		end
-		retained(model.reconcile(state, data("idle", { host = 2, pane = 22, connected = false }), {}, context(110)),
-			"disconnected", disposition .. " listed")
-		retained(model.reconcile(state, data(nil, { host = 2, pane = 22, connected = false }), {}, context(111)),
-			"Forge offline", disposition .. " absent")
+	local function retained(presentation, reason, label)
+		assert(#presentation.rows == 1, label .. ": the record is never closed by an outage")
+		local row = presentation.rows[1]
+		assert(row.workId == first.workId and row.disposition == disposition and row.stale and not row.navigable, label)
+		assert(row.unavailableReason == reason, label .. ": " .. tostring(row.unavailableReason))
+		assert(row.attentionRevision == first.attentionRevision and row.reviewRevision == first.reviewRevision,
+			label .. ": an outage mints no revision")
+		assert(row.attention == (disposition == "active"), label .. ": last-known Attention is unchanged")
+		assert(presentation.status == "partial" and #presentation.offlineHosts == 1, label)
+		assert(presentation.reachableCount == 0 and not reachable(state), label .. ": offline work is never a target")
+		assert(presentation.attentionCount == (if disposition == "active" then 1 else 0),
+			label .. ": attention count " .. tostring(presentation.attentionCount))
+		assert(presentation.allCount == #presentation.rows, label .. ": total counts every row")
+	end
+	retained(model.reconcile(state, data("idle", { host = 2, pane = 22, connected = false }), {}, context(110)),
+		"disconnected", disposition .. " listed")
+	retained(model.reconcile(state, data(nil, { host = 2, pane = 22, connected = false }), {}, context(111)),
+		"Forge offline", disposition .. " absent")
 		local back = model.reconcile(state, data("idle", remote), {}, context(120))
 		assert(back.status == "ready" and #back.rows == 1, disposition)
 		local row = back.rows[1]
@@ -249,72 +242,8 @@ test("a replaced conversation never inherits the old record's disposition or rev
 		assert(fresh.disposition == "active" and fresh.navigable and not fresh.attention and fresh.reviewRevision == nil,
 			disposition .. ": the new conversation starts neutral")
 		assert(presentation.attentionCount == (if disposition == "active" then 1 else 0), disposition)
-		assert(presentation.laterCount == (if disposition == "later" then 1 else 0), disposition)
 		assert(presentation.reachableCount == 0 and not reachable(state), disposition .. ": the unreachable old record is no target")
 	end
-end)
-
-test("age-to-Later moves only eligible active work and leaves every other disposition alone", function()
-	for _, disposition in ipairs(DISPOSITIONS) do
-		local state, first = conversation(disposition)
-		local early = model.reconcile(state, data("idle"), {}, context(100 + 10799, { afterSeconds = 10800 })).rows[1]
-		assert(early.disposition == disposition and early.attention == (disposition == "active"), disposition .. ": below the threshold")
-		local aged = model.reconcile(state, data("idle"), {}, context(100 + 10800, { afterSeconds = 10800 })).rows[1]
-		local expected = if disposition == "active" then "later" else disposition
-		assert(aged.workId == first.workId and aged.disposition == expected, disposition .. " -> " .. aged.disposition)
-		assert(aged.retained and not aged.attention and aged.reviewRevision == first.reviewRevision
-			and aged.firstSeenUtc == first.firstSeenUtc, disposition .. ": aging keeps evidence and age")
-		expectCounts(state, expected, false, disposition)
-		assert(not reachable(state), disposition)
-	end
-	local quiet = model.new()
-	assert(not model.reconcile(quiet, data("idle"), {}, context(100)).rows[1].attention)
-	local later = model.reconcile(quiet, data("idle"), {}, context(1000000, { afterSeconds = 10800 })).rows[1]
-	assert(later.disposition == "active", "work that needs nothing never ages into Later")
-end)
-
-test("a due Later reminder returns once as a manual revisit", function()
-	local state, first = conversation("active")
-	assert(model.setDisposition(state, first.workId, "later", 101, { untilUtc = 200 }))
-	local waiting = model.reconcile(state, data("idle"), {}, context(199)).rows[1]
-	assert(waiting.disposition == "later" and not waiting.attention and waiting.untilUtc == 200)
-	expectCounts(state, "later", false, "not yet due")
-	local due = model.reconcile(state, data("idle"), {}, context(200)).rows[1]
-	assert(due.disposition == "active" and due.attention and due.reviewKind == "manual" and due.untilUtc == nil)
-	assert(due.reviewRevision > first.reviewRevision and due.queueOrder > first.queueOrder and due.firstSeenUtc == 200)
-	expectCounts(state, "active", true, "due")
-	assert(reachable(state))
-	local later = model.reconcile(state, data("idle"), {}, context(300)).rows[1]
-	assert(later.reviewRevision == due.reviewRevision and later.queueOrder == due.queueOrder, "a due reminder never refires")
-end)
-
-test("a reminder that falls due while the agent works stays passive-hidden until it stops", function()
-	local state = model.new()
-	local first = model.reconcile(state, data("working"), {}, context(100)).rows[1]
-	assert(first.nativeState == "working" and not first.attention)
-	assert(model.setDisposition(state, first.workId, "later", 101, { untilUtc = 200 }))
-	local due = model.reconcile(state, data("working", { now = 2 }), {}, context(250)).rows[1]
-	assert(due.disposition == "active" and due.reviewKind == "manual" and not due.attention, "working hides the due reminder")
-	expectCounts(state, "active", false, "due while working")
-	assert(not reachable(state))
-	local idle = model.reconcile(state, data("idle", { now = 3 }), {}, context(251)).rows[1]
-	assert(idle.attention and idle.reviewKind == "manual" and idle.reviewRevision == due.reviewRevision)
-	expectCounts(state, "active", true, "idle after due")
-end)
-
-test("a due reminder without an open pane stays retained and unreachable", function()
-	local state, first = conversation("active")
-	assert(model.setDisposition(state, first.workId, "later", 101, { untilUtc = 200 }))
-	local shut = model.reconcile(state, data(nil), { closed(11) }, context(102))
-	assert(#shut.rows == 1 and shut.rows[1].pane == nil and shut.rows[1].retained and shut.rows[1].disposition == "later")
-	local due = model.reconcile(state, data(nil), {}, context(250))
-	assert(#due.rows == 1, "the due record is never dropped for lacking a pane")
-	local row = due.rows[1]
-	assert(row.workId == first.workId and row.pane == nil and row.retained and not row.navigable, "still no pane")
-	assert(row.disposition == "active" and row.reviewKind == "manual" and row.attention)
-	assert(due.reachableCount == 0 and not reachable(state), "it cannot be a Next target")
-	local saved = model.snapshot(state).items[1]
-	assert(saved.noOpenPane == true and saved.disposition == "active" and saved.retained == true)
 end)
 
 test("closing one of several proven routes keeps the same record on the survivor in every disposition", function()

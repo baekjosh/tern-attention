@@ -1,5 +1,5 @@
 -- Pure workspace navigation: native inventory validation, the destination hierarchy, the conversation
--- overlay, the flattened visible rows, and the complete search inventory. No `tern`, no `cx`, no clock:
+-- overlay, the visible rows, and the complete search inventory. No `tern`, no `cx`, no clock:
 -- everything arrives as an argument, and nothing here mutates tracking state.
 local navigation = {}
 
@@ -14,7 +14,7 @@ local KIND_LABELS = {
 	screen = "Screen", profile = "Profile", carly = "Carly",
 }
 
-local DISPOSITION_MARKERS = { later = "Later", reference = "Reference", finished = "Finished" }
+local DISPOSITION_MARKERS = { reference = "Reference", finished = "Finished" }
 
 local REASON_MARKERS = {
 	["no-open-pane"] = "No open pane", offline = "Offline", unverified = "Unverified", missing = "Missing",
@@ -50,6 +50,20 @@ local function clean(value, limit)
 	spaced = string.gsub(string.gsub(spaced, "^ ", ""), " $", "")
 	if spaced == "" then return nil end
 	return bounded(spaced, limit or TITLE_LIMIT)
+end
+
+-- A native title that is only dashes, dots, underscores, ellipses or middle dots, or only a path ("~", "~/src",
+-- "/tmp": what a fresh shell shows), is a placeholder, not a name; the derived program · folder title says more.
+local function meaningful(title)
+	if type(title) ~= "string" then return nil end
+	local rest = string.gsub(title, "\u{2013}", "")
+	rest = string.gsub(rest, "\u{2014}", "")
+	rest = string.gsub(rest, "\u{2026}", "")
+	rest = string.gsub(rest, "\u{00B7}", "")
+	rest = string.gsub(rest, "[%c%s%-%._]", "")
+	if rest == "" then return nil end
+	if string.match(title, "^%s*~?/?[^%s]*%s*$") and string.match(title, "^%s*[~/]") then return nil end
+	return title
 end
 
 -- Non-blank native string, or nil; unlike the validated fields this never asserts.
@@ -138,7 +152,6 @@ local function sessionNodeKey(hostKey, id) return "session:" .. hostKey .. "#" .
 local function tabNodeKey(hostKey, id) return "tab:" .. hostKey .. "#" .. tostring(id) end
 local function paneNodeKey(hostKey, id) return "pane:" .. hostKey .. "#" .. tostring(id) end
 local function retainedNodeKey(workId) return "retained:" .. workId end
-local function asideKey(tabKey) return "aside:" .. tabKey end
 local function sectionKey(kind, hostKey) return "section:" .. kind .. ":" .. (hostKey or "") end
 
 -- Inventory -----------------------------------------------------------------------------------------
@@ -241,6 +254,8 @@ function navigation.inventory(raw, options)
 		if not canvases[source.pane] then
 			assert(panes[source.pane], "Agent pane membership is pending")
 			assert(type(source.state) == "string" and states[source.state], "Native agent state unavailable")
+			-- Display-only: the model rides on the pane record and never enters a signature or key.
+			panes[source.pane].model = clean(source.model)
 			table.insert(agents, { pane = source.pane, state = source.state, deliveryError = optionalText(source.delivery_error) })
 		end
 	end
@@ -270,17 +285,17 @@ local function conversationLink(row, preferred, proof, routeCount)
 	return { workId = row.workId, serial = row.serial, identityKey = row.identityKey,
 		disposition = row.disposition or "active", attention = row.attention == true,
 		nativeState = row.nativeState or "unknown", reviewRevision = row.reviewRevision,
-		setAside = row.disposition == "later", routeCount = routeCount, preferred = preferred, proof = proof }
+		routeCount = routeCount, preferred = preferred, proof = proof }
 end
 
 local function newDestination(pane, hostKey, tab, placement)
 	local paneKind = pane.kind or "unknown"
-	local title, titleSource = clean(pane.nativeTitle), "native"
+	local title, titleSource = clean(meaningful(pane.nativeTitle)), "native"
 	if title == nil then title, titleSource = derivedTitle(paneKind, pane), "derived" end
 	return { key = paneNodeKey(hostKey, pane.pane), kind = "pane", paneKind = paneKind, hostKey = hostKey, pane = pane.pane,
 		tabId = if tab then tab.id else nil, sessionId = if tab then tab.sessionId else nil,
 		title = title, titleSource = titleSource, placement = placement, focused = pane.focused == true, current = false,
-		path = pane.path, url = pane.url, cwd = pane.cwd, program = pane.program }
+		path = pane.path, url = pane.url, cwd = pane.cwd, program = pane.program, model = pane.model }
 end
 
 local function destinationSignature(destination)
@@ -316,8 +331,32 @@ function navigation.project(data, overlay)
 			tabs = {}, empty = true }
 		table.insert(host.sessions, node)
 		sessionById[sessionId] = node
-	end
+end
 
+-- Manual session order (overlay.sessionOrder: host key → session ids). Native has no session-reorder
+-- route, so this is Attention's own display order per host: ordered sessions keep the stored order,
+-- every session not in the list keeps its native order after them, and ids with no live session are
+-- ignored (they drop out of the stored order the next time a move is saved).
+local manualOrder = overlay.sessionOrder or {}
+for _, host in ipairs(hostNodes) do
+	local order = manualOrder[host.hostKey]
+	if order ~= nil then
+		local present, taken = {}, {}
+		for _, session in ipairs(host.sessions) do present[session.id] = session end
+		local reordered = {}
+		for _, sessionId in ipairs(order) do
+			local session = present[sessionId]
+			if session ~= nil and not taken[sessionId] then
+				taken[sessionId] = true
+				table.insert(reordered, session)
+			end
+		end
+		for _, session in ipairs(host.sessions) do
+			if not taken[session.id] then table.insert(reordered, session) end
+		end
+		host.sessions = reordered
+	end
+end
 	-- Tabs follow native position inside their session; without a complete set of positions the native tab order stands.
 	local pendingTabs = {}
 	for ordinal, tabId in ipairs(data.tabOrder) do
@@ -344,11 +383,10 @@ function navigation.project(data, overlay)
 			local source = entry.source
 			local node = { key = tabNodeKey(host.hostKey, source.id), kind = "tab", hostKey = host.hostKey, id = source.id,
 				sessionId = sessionId, name = clean(source.name), position = source.position or index, color = source.color,
-				destinations = {}, flattened = false, focusedPane = source.focusedPane, nativeTitle = source.title }
+				destinations = {}, focusedPane = source.focusedPane }
 			table.insert(session.tabs, node)
 			tabById[source.id] = node
 		end
-		session.empty = false
 	end
 
 	-- Destinations: every non-owned native pane exactly once, in tab order else ascending pane id.
@@ -418,8 +456,8 @@ function navigation.project(data, overlay)
 			end
 		end
 	end
-	local counts = { hosts = #hostNodes, sessions = #data.sessionOrder, tabs = #data.tabOrder, destinations = #paneIds,
-		conversations = #linked, retained = #unrouted, setAside = 0 }
+	local counts = { hosts = #hostNodes, sessions = #data.sessionOrder, tabs = 0, destinations = #paneIds,
+		conversations = #linked, retained = #unrouted }
 	for _, entry in ipairs(linked) do
 		local row, routes = entry.row, #entry.leaves
 		for index, leaf in ipairs(entry.leaves) do
@@ -430,7 +468,6 @@ function navigation.project(data, overlay)
 			end
 			leaf.conversation = conversationLink(row, index == 1, proof, routes)
 		end
-		if row.disposition == "later" then counts.setAside += 1 end
 	end
 
 	local retained = {}
@@ -442,7 +479,7 @@ function navigation.project(data, overlay)
 			reason = entry.reason, identityKey = row.identityKey, reviewRevision = row.reviewRevision })
 	end
 
-	-- Finalize: tab titles, flattening, signatures, key index.
+	-- Finalize: tab targets and titles, visible-tab counts, signatures, key index.
 	local parts = {}
 	local function register(node)
 		byKey[node.key] = node
@@ -450,17 +487,20 @@ function navigation.project(data, overlay)
 	end
 	local coverage = {}
 	for _, host in ipairs(hostNodes) do
+		host.visibleTabs = 0
 		for _, session in ipairs(host.sessions) do
+			session.visibleTabs = 0
 			for _, tab in ipairs(session.tabs) do
-				local first = tab.destinations[1]
-				local title = tab.name
-				if title == nil and tab.focusedPane ~= nil and not data.canvases[tab.focusedPane] then
-					title = clean(tab.nativeTitle)
+				-- The target is the focused pane when it is a content pane of this tab, else the first content pane.
+				local target = tab.destinations[1]
+				local current = false
+				for _, destination in ipairs(tab.destinations) do
+					if tab.focusedPane ~= nil and destination.pane == tab.focusedPane then target = destination end
+					if destination.current then current = true end
 				end
-				tab.title = title or ("Tab " .. tostring(tab.position))
-				tab.nativeTitle = nil
-				tab.flattened = tab.name == nil and #tab.destinations == 1
-					and not (first.conversation ~= nil and first.conversation.setAside)
+				tab.target, tab.current = target, current
+				tab.title = tab.name or (if target ~= nil then target.title else nil)
+				if target ~= nil then session.visibleTabs += 1 end
 				local paneList = {}
 				for _, destination in ipairs(tab.destinations) do
 					destination.signature = destinationSignature(destination)
@@ -468,8 +508,11 @@ function navigation.project(data, overlay)
 				end
 				tab.signature = enc("tab", tab.hostKey, tab.id, tab.sessionId, table.concat(paneList, ","))
 			end
+			session.empty = session.visibleTabs == 0
+			host.visibleTabs += session.visibleTabs
 			session.signature = enc("session", session.hostKey, session.id)
 		end
+		if host.connected then counts.tabs += host.visibleTabs end
 		for _, list in ipairs({ host.parked, host.unattached }) do
 			for _, destination in ipairs(list) do destination.signature = destinationSignature(destination) end
 		end
@@ -494,8 +537,15 @@ function navigation.project(data, overlay)
 		for _, destination in ipairs(host.unattached) do register(destination) end
 	end
 	for _, node in ipairs(retained) do register(node) end
+-- Repaint component: exposed conversation models change the rendered sub-line, so the workspace digest tracks them
+-- for catchup. Per-node signatures stay model-free (§3.1), so a model change never invalidates a captured target.
+local renderedModels = {}
+for _, paneId in ipairs(paneIds) do
+	local destination = destinations[paneId]
+	if destination.conversation ~= nil then table.insert(renderedModels, paneId .. "=" .. tostring(destination.model)) end
+end
 
-	return { signature = digest(table.concat(parts, "\n")), hosts = hostNodes, retained = retained, counts = counts,
+return { signature = digest(table.concat(parts, "\n") .. "\nmodel:" .. table.concat(renderedModels, ",")), hosts = hostNodes, retained = retained, counts = counts,
 		byKey = byKey, byPane = destinations, currentPane = if destinations[data.focused] then data.focused else nil,
 		coverage = coverage }
 end
@@ -519,6 +569,57 @@ local function markers(destination, host)
 	return list
 end
 
+-- Tile icons from Tern's built-in icon set (the native Cmd+B sidebar's tiles), keyed by the program's basename.
+-- Only names with an icon in the installed Tern binary are listed (vim's is `app-vim`; top, lua, php, zig and nix
+-- have none); anything else is the shell tile, as native shows it.
+local PROGRAM_TILES = {
+	vim = "app-vim", nvim = "app-vim", vi = "app-vim", helix = "tile-helix", hx = "tile-helix",
+	emacs = "tile-emacs", editor = "tile-editor", btop = "tile-btop", htop = "tile-htop",
+	monitor = "tile-monitor", lazygit = "tile-lazygit", claude = "tile-claude", codex = "tile-codex",
+	hermes = "tile-hermes", gemini = "tile-gemini", copilot = "tile-copilot", ["cursor-agent"] = "tile-cursor-agent",
+	opencode = "tile-opencode", agent = "tile-agent", cargo = "tile-cargo", node = "tile-node", deno = "tile-deno",
+	ruby = "tile-ruby", java = "tile-java", docker = "tile-docker", go = "tile-go",
+	elixir = "tile-elixir", haskell = "tile-haskell", swift = "tile-swift", julia = "tile-julia",
+	kubernetes = "tile-kubernetes", kubectl = "tile-kubernetes", k9s = "tile-kubernetes", terraform = "tile-terraform",
+	packages = "tile-packages", make = "tile-make", pager = "tile-pager", less = "tile-pager",
+	database = "tile-database", screen = "tile-screen", board = "tile-board", python = "tile-python",
+	python3 = "tile-python", omp = "app-omp",
+}
+local KIND_TILES = { agent = "app-omp", browser = "globe", database = "tile-database", board = "tile-board",
+	screen = "tile-screen", carly = "tile-carly" }
+
+-- The tile a destination shows: its kind's tile, a note or document for files, else its program's tile.
+local function tileIcon(destination)
+	local kind = destination.paneKind
+	if kind == "file" then
+		local path = destination.path
+		return if path ~= nil and string.sub(path, 1, 5) == "note:" then "tile-note" else "tile-document"
+	end
+	if KIND_TILES[kind] then return KIND_TILES[kind] end
+	local program = if destination.program then basename(destination.program) else nil
+	return (if program then PROGRAM_TILES[string.lower(program)] else nil) or "tile-shell"
+end
+
+-- An icon glyph at the head of a title (a private-use Nerd Font glyph or a pictograph/emoji, with an optional
+-- emoji presentation selector), followed by a space. Native draws it on the tile; the label drops it.
+local function iconGlyph(codepoint)
+	return codepoint >= 0xE000 and codepoint <= 0xF8FF or codepoint >= 0xF0000 and codepoint <= 0xFFFFD
+		or codepoint >= 0x1F300 and codepoint <= 0x1FAFF or codepoint >= 0x2600 and codepoint <= 0x27BF
+end
+
+-- The title without its leading glyph, and the glyph; a title that does not start with one comes back unchanged.
+local function splitGlyph(title)
+	if type(title) ~= "string" or title == "" or utf8.len(title) == nil then return title, nil end
+	local first = utf8.codepoint(title, 1)
+	if not iconGlyph(first) then return title, nil end
+	local after = utf8.offset(title, 2)
+	if after ~= nil and after <= #title and utf8.codepoint(title, after) == 0xFE0F then after = utf8.offset(title, 3) end
+	if after == nil or string.sub(title, after, after) ~= " " then return title, nil end
+	local rest = string.sub(title, after + 1)
+	if not string.find(rest, "%S") then return title, nil end
+	return rest, string.sub(title, 1, after - 1)
+end
+
 local function leafKey(destination)
 	local link = destination.conversation
 	if link == nil then return destination.key end
@@ -533,21 +634,15 @@ local function paneRef(destination)
 		key = destination.key }
 end
 
-local function destinationCount(host)
-	local count = #host.parked + #host.unattached
-	for _, session in ipairs(host.sessions) do
-		for _, tab in ipairs(session.tabs) do count += #tab.destinations end
-	end
-	return count
-end
-
+-- A host is listed when it has anything to show: a session (empty ones included, as the native sidebar lists them),
+-- a parked pane or an unattached one.
 local function hasContent(host)
 	return #host.sessions > 0 or #host.parked > 0 or #host.unattached > 0
 end
 
 function navigation.rows(snapshot, ui)
 	ui = ui or {}
-	local collapsed, asideOpen = ui.collapsed or {}, ui.setAsideOpen or {}
+	local collapsed = ui.collapsed or {}
 	local rows = {}
 	local contentful = 0
 	for _, host in ipairs(snapshot.hosts) do
@@ -570,7 +665,8 @@ function navigation.rows(snapshot, ui)
 			context = table.concat(label, " · "), ref = paneRef(destination), signature = destination.signature,
 			expandable = false, expanded = false,
 			leaf = { paneKind = destination.paneKind, placement = destination.placement, current = destination.current,
-				focused = destination.focused, conversation = destination.conversation, availability = availability } })
+				focused = destination.focused, conversation = destination.conversation, availability = availability,
+				model = if destination.conversation ~= nil then destination.model else nil } })
 	end
 
 	local function sectionRow(kind, title, host, count, depth)
@@ -587,59 +683,42 @@ function navigation.rows(snapshot, ui)
 		local open = true
 		if showHosts then
 			open = not collapsed[host.key]
+			-- The count is what the host shows: tabs in its minimized sessions sit behind the Minimized line, so
+			-- they are not counted here. The signature stays the snapshot's: bindings are checked against it.
+			local count = nil
+			if host.connected then
+				count = host.visibleTabs
+				for _, session in ipairs(host.sessions) do
+					if collapsed[session.key] and session.visibleTabs > 0 then count -= session.visibleTabs end
+				end
+			end
 			push({ key = host.key, kind = "host", depth = 0, title = host.name,
 				context = if host.connected then nil else "Host " .. host.state,
-				ref = { kind = "host", hostKey = host.hostKey, id = host.id, key = host.key }, signature = host.signature,
-				expandable = true, expanded = open, count = if host.connected then destinationCount(host) else nil })
+				ref = { kind = "host", hostKey = host.hostKey, id = host.id, key = host.key },
+				signature = host.signature,
+				expandable = true, expanded = open, count = count })
 			depth = 1
 		end
 		if not open then continue end
 		for _, session in ipairs(host.sessions) do
+			-- An empty session is listed like the native sidebar lists it: a name with nothing to expand, whose row
+			-- opens a tab there (Attention never lands you in a session it cannot show itself in).
+			local empty = session.visibleTabs == 0
 			local sessionOpen = not collapsed[session.key]
-			local sessionCount = nil
-			if host.connected then
-				sessionCount = 0
-				for _, tab in ipairs(session.tabs) do sessionCount += #tab.destinations end
-			end
 			push({ key = session.key, kind = "session", depth = depth, title = session.name,
-				context = if session.current then "Current" else nil,
+				current = session.current == true, empty = empty,
 				ref = { kind = "session", hostKey = session.hostKey, id = session.id, session = session.id, key = session.key },
-				signature = session.signature, expandable = not session.empty, expanded = sessionOpen and not session.empty,
-				count = sessionCount, empty = session.empty })
+				signature = session.signature, expandable = not empty, expanded = sessionOpen and not empty,
+				count = if host.connected and not empty then session.visibleTabs else nil })
 			if not sessionOpen then continue end
 			for _, tab in ipairs(session.tabs) do
-				if tab.flattened then
-					leafRow(tab.destinations[1], host, depth + 1)
-					continue
-				end
-				local tabOpen = not collapsed[tab.key]
-				local visible, deferred, deferredWork, deferredCount = {}, {}, {}, 0
-				for _, destination in ipairs(tab.destinations) do
-					local link = destination.conversation
-					if link ~= nil and link.setAside then
-						table.insert(deferred, destination)
-						if not deferredWork[link.workId] then deferredWork[link.workId] = true; deferredCount += 1 end
-					else
-						table.insert(visible, destination)
-					end
-				end
-				push({ key = tab.key, kind = "tab", depth = depth + 1, title = tab.title,
+				if tab.target == nil then continue end
+				-- The signature stays the snapshot's (bindings check it); only the displayed title loses its glyph.
+				local title, glyph = splitGlyph(tab.title)
+				push({ key = tab.key, kind = "tab", depth = depth + 1, title = title, glyph = glyph, icon = tileIcon(tab.target),
+					current = tab.current,
 					ref = { kind = "tab", hostKey = tab.hostKey, id = tab.id, tab = tab.id, session = tab.sessionId, key = tab.key },
-					signature = tab.signature, expandable = #tab.destinations > 0, expanded = tabOpen and #tab.destinations > 0,
-					count = if host.connected then #tab.destinations else nil,
-					setAsideCount = if deferredCount > 0 then deferredCount else nil, empty = #tab.destinations == 0 })
-				if not tabOpen then continue end
-				for _, destination in ipairs(visible) do leafRow(destination, host, depth + 2) end
-				if deferredCount > 0 then
-					local expanded = asideOpen[tab.key] == true
-					push({ key = asideKey(tab.key), kind = "aside", depth = depth + 2, title = "Set aside " .. deferredCount,
-						ref = { kind = "aside", hostKey = tab.hostKey, tab = tab.id, session = tab.sessionId, key = tab.key },
-						signature = enc("aside", tab.signature, deferredCount, expanded), expandable = true, expanded = expanded,
-						count = deferredCount, setAsideCount = deferredCount })
-					if expanded then
-						for _, destination in ipairs(deferred) do leafRow(destination, host, depth + 3) end
-					end
-				end
+					signature = tab.signature, expandable = false, expanded = false })
 			end
 		end
 		for _, section in ipairs({ { "parked", "Parked", host.parked }, { "unattached", "Unattached", host.unattached } }) do
@@ -650,20 +729,6 @@ function navigation.rows(snapshot, ui)
 		end
 	end
 
-	if #snapshot.retained > 0 then
-		if sectionRow("retained", "Saved conversations", nil, #snapshot.retained, 0) then
-			for _, node in ipairs(snapshot.retained) do
-				local context = {}
-				if node.hostName then table.insert(context, node.hostName) end
-				if node.sessionName then table.insert(context, node.sessionName) end
-				table.insert(context, REASON_MARKERS[node.reason])
-				if DISPOSITION_MARKERS[node.disposition] then table.insert(context, DISPOSITION_MARKERS[node.disposition]) end
-				push({ key = node.key, kind = "retained", depth = 1, title = node.title, context = table.concat(context, " · "),
-					ref = { kind = "retained", hostKey = node.hostKey, workId = node.workId, key = node.key },
-					signature = node.signature, expandable = false, expanded = false })
-			end
-		end
-	end
 	return { rows = rows, total = #rows }
 end
 
@@ -756,11 +821,21 @@ function navigation.signatureMatches(snapshot, key, signature)
 	return node ~= nil and signature ~= nil and node.signature == signature
 end
 
+-- The visible row that represents `key`: a pane inside a tab is reached through its tab row; any other key is its own row.
+function navigation.rowKey(snapshot, key)
+	local node = snapshot.byKey[key]
+	if node ~= nil and node.kind == "pane" and node.tabId ~= nil then
+		local tabKey = tabNodeKey(node.hostKey, node.tabId)
+		if snapshot.byKey[tabKey] ~= nil then return tabKey end
+	end
+	return key
+end
+
 -- Row keys to open, outermost first, so `Reveal current` can expand everything above a destination.
+-- A pane inside a tab ends at its tab row; the tab is the row that represents it.
 function navigation.ancestors(snapshot, key)
 	local node = snapshot.byKey[key]
 	if node == nil or node.kind == "host" then return {} end
-	if node.kind == "retained" then return { sectionKey("retained", nil) } end
 	if node.kind == "session" then return { hostNodeKey(node.hostKey) } end
 	if node.kind == "tab" then return { hostNodeKey(node.hostKey), sessionNodeKey(node.hostKey, node.sessionId) } end
 	local chain = { hostNodeKey(node.hostKey) }
@@ -768,10 +843,8 @@ function navigation.ancestors(snapshot, key)
 		table.insert(chain, sectionKey(node.placement, node.hostKey))
 		return chain
 	end
-	local tabKey = tabNodeKey(node.hostKey, node.tabId)
 	table.insert(chain, sessionNodeKey(node.hostKey, node.sessionId))
-	table.insert(chain, tabKey)
-	if node.conversation ~= nil and node.conversation.setAside then table.insert(chain, asideKey(tabKey)) end
+	table.insert(chain, tabNodeKey(node.hostKey, node.tabId))
 	return chain
 end
 

@@ -79,6 +79,21 @@ local function rowOfKind(result, kind, predicate)
 	return nil
 end
 
+local function tabRow(result, id)
+	return rowOfKind(result, "tab", function(row) return row.ref.tab == id end)
+end
+
+-- Parks every content pane so each one is a leaf row in the Parked section.
+local function parkedAll(edit)
+	edit = edit or {}
+	local inner = edit.raw
+	edit.raw = function(raw)
+		for _, pane in ipairs(raw.panes) do pane.parked = true end
+		if inner then inner(raw) end
+	end
+	return build(edit)
+end
+
 local function count(map)
 	local total = 0
 	for _ in pairs(map) do total += 1 end
@@ -94,16 +109,6 @@ end
 
 local function paneOf(title, index)
 	return census.agentPanes(title)[index or 1]
-end
-
-local function allAsideOpen(snapshot)
-	local open = {}
-	for _, host in ipairs(snapshot.hosts) do
-		for _, session in ipairs(host.sessions) do
-			for _, tab in ipairs(session.tabs) do open[tab.key] = true end
-		end
-	end
-	return open
 end
 
 local function rejects(raw, message)
@@ -139,8 +144,29 @@ test("absent optional native fields read as nil and never fail the inventory", f
 	local session = sessionNode(snapshot, census.session.harbor)
 	assert(session.tabs[1].id == 51 and session.tabs[2].id == 52 and session.tabs[4].id == 54,
 		"without native positions the native tab order stands")
-	assert(session.tabs[1].title == "Tab 1" and session.tabs[1].name == nil)
+	assert(session.tabs[1].title == "Agent" and session.tabs[1].name == nil, "an untitled tab takes its target's title")
 	assert(destination(snapshot, paneOf("Tide ledger")).title == "Agent", "an untitled agent with no program falls back to its kind")
+end)
+
+test("a placeholder or bare-path native title yields the derived title; a real title stays native", function()
+	local dash, hyphen, tilde, path, real = paneOf("Tide ledger"), paneOf("Basket weave"), paneOf("Kettle seam"),
+		paneOf("Buoy audit"), paneOf("Slab survey")
+	local titles = { [dash] = "\u{2013}", [hyphen] = "-", [tilde] = "~", [path] = "~/src/atlas", [real] = "~ vim notes" }
+	local snapshot = build({ raw = function(raw)
+		for _, pane in ipairs(raw.panes) do
+			if titles[pane.pane] then pane.title = titles[pane.pane] end
+		end
+	end })
+	for _, pane in ipairs({ dash, hyphen }) do
+		local node = destination(snapshot, pane)
+		assert(node.title == "omp · atlas" and node.titleSource == "derived", "placeholder title must derive: " .. tostring(node.title))
+	end
+	for _, pane in ipairs({ tilde, path }) do
+		local node = destination(snapshot, pane)
+		assert(node.titleSource == "derived" and node.title ~= titles[pane], "a bare path must derive: " .. tostring(node.title))
+	end
+	local kept = destination(snapshot, real)
+	assert(kept.title == "~ vim notes" and kept.titleSource == "native")
 end)
 
 test("existing inventory failures keep their messages", function()
@@ -164,7 +190,7 @@ test("existing inventory failures keep their messages", function()
 	end)(), "Unsupported canvas inventory")
 end)
 
-test("every census pane appears exactly once in the hierarchy, search, and fully expanded rows", function()
+test("every census pane appears once in the hierarchy and search, and is reached through its tab row", function()
 	local snapshot = build()
 	local expected = census.contentPanes()
 	assert(#expected == 30)
@@ -176,62 +202,147 @@ test("every census pane appears exactly once in the hierarchy, search, and fully
 	for _, item in ipairs(navigation.searchItems(snapshot)) do
 		if item.kind == "pane" then searched[item.ref.pane] = (searched[item.ref.pane] or 0) + 1 end
 	end
-	local rendered = {}
-	local result = navigation.rows(snapshot, { setAsideOpen = allAsideOpen(snapshot) })
+	local result = navigation.rows(snapshot, {})
+	local rowKeys, tabRows = {}, 0
 	for _, row in ipairs(result.rows) do
-		if row.kind == "leaf" then rendered[row.ref.pane] = (rendered[row.ref.pane] or 0) + 1 end
+		rowKeys[row.key] = true
+		assert(row.kind ~= "leaf", "the census has no parked or unattached panes")
+		if row.kind == "tab" then tabRows += 1 end
 	end
+	assert(tabRows == 22 and snapshot.counts.tabs == 22)
 	for _, pane in ipairs(expected) do
 		assert(searched[pane] == 1, "search must list pane " .. pane .. " once")
-		assert(rendered[pane] == 1, "expanded rows must list pane " .. pane .. " once")
+		assert(rowKeys[navigation.rowKey(snapshot, destination(snapshot, pane).key)], "pane " .. pane .. " has a tab row")
 	end
 end)
 
-test("empty sessions stay selectable everywhere", function()
+test("a tab is titled by its focused pane, a named tab by its name", function()
 	local snapshot = build()
-	for _, id in ipairs({ census.session.dune, census.session.fjord }) do
-		local session = sessionNode(snapshot, id)
-		assert(session.empty and #session.tabs == 0)
-		assert(navigation.resolve(snapshot, session.key) == session)
-		local row = rowOfKind(navigation.rows(snapshot, {}), "session", function(row) return row.ref.session == id end)
-		assert(row and row.empty == true and row.expandable == false and row.count == 0)
-		assert(navigation.signatureMatches(snapshot, session.key, row.signature))
+	local named = tabNode(snapshot, census.tab.multiNamed)
+	assert(named.title == "tide charts" and named.target.pane == census.tabPanes(51)[1])
+	local unnamed = tabNode(snapshot, census.tab.pair)
+	assert(unnamed.name == nil and unnamed.title == "Core samples" and unnamed.target.pane == census.tabPanes(66)[1])
+	local refocused = build({ raw = function(raw)
+		for _, tab in ipairs(raw.tabs) do
+			if tab.id == census.tab.pair then tab.pane = census.tabPanes(66)[2] end
+			if tab.id == census.tab.multiNamed then tab.pane = census.tabPanes(51)[2] end
+		end
+	end })
+	assert(tabNode(refocused, census.tab.pair).title == "Sketch pad"
+		and tabNode(refocused, census.tab.pair).target.pane == census.tabPanes(66)[2])
+	assert(tabNode(refocused, census.tab.multiNamed).title == "tide charts"
+		and tabNode(refocused, census.tab.multiNamed).target.pane == census.tabPanes(51)[2],
+		"a name outranks the pane title while the target still follows focus")
+	local row = tabRow(navigation.rows(refocused, {}), census.tab.pair)
+	assert(row.title == "Sketch pad" and row.expandable == false and row.count == nil)
+end)
+
+test("a tab row names the native tile of its focused pane", function()
+	local result = navigation.rows(build(), {})
+	for id, icon in pairs({ [census.tab.single] = "app-omp", [census.tab.namedNote] = "tile-note",
+		[census.tab.namedBrowser] = "globe", [census.tab.shell] = "tile-shell" }) do
+		assert(tabRow(result, id).icon == icon, "tab " .. id .. " shows " .. icon .. ", got " .. tostring(tabRow(result, id).icon))
 	end
+	local edited = navigation.rows(build({ raw = function(raw)
+		for _, pane in ipairs(raw.panes) do
+			if pane.tab == census.tab.shell and pane.kind == "terminal" then pane.program = "/opt/homebrew/bin/nvim" end
+			if pane.tab == 57 then pane.path = "/work/atlas/README.md" end
+			if pane.tab == census.tab.namedBrowser then pane.kind, pane.program = "canvas", nil end
+		end
+	end }), {})
+	assert(tabRow(edited, census.tab.shell).icon == "app-vim", "a terminal running nvim shows the vim tile")
+	assert(tabRow(edited, 57).icon == "tile-document", "a file that is not a note shows the document tile")
+	assert(tabRow(edited, census.tab.namedBrowser).icon == "tile-shell", "a canvas shows the shell tile, as native does")
+end)
+
+test("a leading title glyph moves to the tile; the signature stays the snapshot's", function()
+	local function rowTitled(name)
+		local snapshot = build({ raw = function(raw)
+			for _, tab in ipairs(raw.tabs) do
+				if tab.id == census.tab.multiNamed then tab.name = name end
+			end
+		end })
+		local row = tabRow(navigation.rows(snapshot, {}), census.tab.multiNamed)
+		local tab = tabNode(snapshot, census.tab.multiNamed)
+		assert(row.signature == tab.signature)
+		return row, tab.title
+	end
+	local nerd = rowTitled("\u{F0403} EXP: x")
+	assert(nerd.title == "EXP: x" and nerd.glyph == "\u{F0403}", "a private-use glyph and its space leave the title")
+	local emoji = rowTitled("\u{1F7E2} build")
+	assert(emoji.title == "build" and emoji.glyph == "\u{1F7E2}", "an emoji moves too")
+	for _, name in ipairs({ "x \u{F0403}", "plain title", "\u{F0403}x", "\u{F0403} ", "é tide" }) do
+		local row, title = rowTitled(name)
+		assert(row.title == title and row.glyph == nil, "unchanged: " .. name)
+	end
+end)
+
+test("a focus outside the tab falls back to the tab's first content pane", function()
+	local snapshot = build({ raw = function(raw)
+		for _, tab in ipairs(raw.tabs) do
+			if tab.id == census.tab.pair then tab.pane = census.tabPanes(52)[1] end
+			if tab.id == census.tab.mixed then tab.pane = census.rail.mixed end
+			if tab.id == 54 then tab.pane = nil end
+		end
+	end })
+	local pair = tabNode(snapshot, census.tab.pair)
+	assert(pair.target.pane == census.tabPanes(66)[1] and pair.title == "Core samples", "another tab's pane never targets")
+	local mixed = tabNode(snapshot, census.tab.mixed)
+	assert(mixed.target.pane == census.tabPanes(58)[1] and mixed.title == "Slab survey", "an owned rail never targets")
+	assert(tabNode(snapshot, 54).target.pane == census.tabPanes(54)[1], "no focused pane at all")
+end)
+
+test("empty tabs are hidden, sessions with no visible tab are listed empty, and counts.tabs counts visible tabs", function()
+	local snapshot = build({ raw = function(raw)
+		table.insert(raw.tabs, { id = 90, session = census.session.harbor, position = 5 })
+		table.insert(raw.sessions, { id = 77, host = 1, name = "Hollow", current = false })
+		table.insert(raw.tabs, { id = 91, session = 77, position = 1 })
+	end })
+	assert(tabNode(snapshot, 90).target == nil and tabNode(snapshot, 91).target == nil)
+	assert(snapshot.counts.tabs == 22, "tabs without a content pane are not visible")
+	local result = navigation.rows(snapshot, {})
+	assert(tabRow(result, 90) == nil and tabRow(result, 91) == nil)
+	local sessions = 0
+	for _, row in ipairs(result.rows) do
+		if row.kind == "session" then sessions += 1 end
+	end
+	assert(sessions == 12, "every session is listed, the empty census sessions and the hollow one included")
+	for _, id in ipairs({ census.session.dune, census.session.fjord, 77 }) do
+		assert(sessionNode(snapshot, id).empty)
+		local row = rowOfKind(result, "session", function(candidate) return candidate.ref.session == id end)
+		assert(row and row.empty and not row.expandable and row.count == nil, "an empty session is a row with nothing to expand")
+	end
+	local harbor = rowOfKind(result, "session", function(row) return row.ref.session == census.session.harbor end)
+	assert(harbor.count == 4 and harbor.context == nil and harbor.expandable == true, "a bare count of visible tabs, no Current text")
+	assert(navigation.signatureMatches(snapshot, harbor.ref.key, harbor.signature))
 	local found = 0
 	for _, item in ipairs(navigation.searchItems(snapshot)) do
-		if item.kind == "session" and (item.ref.session == census.session.dune or item.ref.session == census.session.fjord) then
-			found += 1
-		end
+		if item.kind == "session" and (item.ref.session == census.session.dune or item.ref.session == 77) then found += 1 end
 	end
-	assert(found == 2, "empty sessions are search results")
-	assert(snapshot.counts.sessions == 11)
+	assert(found == 2, "hidden sessions stay searchable")
+	assert(snapshot.counts.sessions == 12)
 end)
 
-test("flattening applies only to unnamed single non-deferred destinations", function()
-	local snapshot = build()
-	assert(tabNode(snapshot, census.tab.single).flattened, "an unnamed single-child tab flattens")
-	assert(not tabNode(snapshot, census.tab.namedNote).flattened, "a named one-child tab stays a parent")
-	assert(not tabNode(snapshot, census.tab.namedBrowser).flattened)
-	assert(not tabNode(snapshot, census.tab.multiNamed).flattened)
-	assert(not tabNode(snapshot, census.tab.mixed).flattened, "an agent plus a browser never flattens")
-	assert(not tabNode(snapshot, census.tab.pair).flattened, "an unnamed multi-child tab never flattens")
-	local tab = tabNode(snapshot, census.tab.single)
-	local result = navigation.rows(snapshot, {})
-	assert(rowOfKind(result, "tab", function(row) return row.ref.key == tab.key end) == nil)
-	local leaf = leafRow(result, tab.destinations[1].pane)
-	local session = rowOfKind(result, "session", function(row) return row.ref.session == tab.sessionId end)
-	assert(leaf and leaf.depth == session.depth + 1, "the flattened leaf takes the tab's place")
-
-	local deferred = build({ rows = function(rows) rowFor(rows, "Buoy audit").disposition = "later" end })
-	local parent = tabNode(deferred, census.tab.single)
-	assert(not parent.flattened, "a set-aside lone leaf keeps its tab visible")
-	local rows = navigation.rows(deferred, {})
-	assert(rowOfKind(rows, "tab", function(row) return row.ref.key == parent.key end), "the tab row remains")
-	assert(rowOfKind(rows, "aside", function(row) return row.ref.key == parent.key end).count == 1)
-	assert(leafRow(rows, parent.destinations[1].pane) == nil, "the deferred leaf is collapsed under Set aside")
+test("only the tab holding the current pane is marked current", function()
+	local function currentTabs(snapshot)
+		local marked = {}
+		for _, row in ipairs(navigation.rows(snapshot, {}).rows) do
+			if row.kind == "tab" then
+				assert(type(row.current) == "boolean")
+				if row.current then table.insert(marked, row.ref.tab) end
+			end
+		end
+		return marked
+	end
+	local marked = currentTabs(build())
+	assert(#marked == 1 and marked[1] == census.tab.single)
+	local background = build({ raw = function(raw) raw.focused = census.tabPanes(66)[2] end })
+	marked = currentTabs(background)
+	assert(#marked == 1 and marked[1] == census.tab.pair, "the current pane marks its tab even when it is not the tab's target")
+	assert(tabNode(background, census.tab.pair).target.pane == census.tabPanes(66)[1])
 end)
 
-test("one conversation on two routes never flattens a tab, and its deferral counts once", function()
+test("one conversation on two routes keeps both links and counts once", function()
 	local shared = paneOf("Core samples")
 	local second = paneOf("Sketch pad", 2)
 	local function edit(disposition)
@@ -253,67 +364,40 @@ test("one conversation on two routes never flattens a tab, and its deferral coun
 	local extra = destination(active, second)
 	assert(extra.conversation.workId == first.conversation.workId and not extra.conversation.preferred
 		and extra.conversation.proof == "proven")
-	assert(not tabNode(active, census.tab.pair).flattened)
 	assert(active.counts.conversations == 21, "distinct conversations, not routes")
 
-	local later = build(edit("later"))
-	assert(later.counts.setAside == 2, "the census Later plus this one; two routes count once")
-	local tab = tabNode(later, census.tab.pair)
-	local collapsed = navigation.rows(later, {})
-	local aside = rowOfKind(collapsed, "aside", function(row) return row.ref.key == tab.key end)
-	assert(aside and aside.count == 1 and aside.title == "Set aside 1", "both routes collapse under one count")
-	assert(leafRow(collapsed, shared) == nil and leafRow(collapsed, second) == nil)
-	local opened = navigation.rows(later, { setAsideOpen = { [tab.key] = true } })
-	local primary, secondary = leafRow(opened, shared), leafRow(opened, second)
-	assert(primary and secondary and primary.key == "r" .. first.conversation.serial
-		and secondary.key == "r" .. first.conversation.serial .. "@" .. second)
-	assert(primary.depth == rowOfKind(opened, "aside", function(row) return row.ref.key == tab.key end).depth + 1)
+	local finished = build(edit("finished"))
+	local rows = navigation.rows(finished, {})
+	assert(tabRow(rows, census.tab.pair) ~= nil, "a Finished conversation never removes its tab")
 end)
 
-test("set aside collapses only deferred conversations inside their group", function()
+test("Finished conversations are not rows; their tab stays", function()
 	local snapshot = build()
-	assert(snapshot.counts.setAside == 1)
-	local tab = tabNode(snapshot, census.tab.laterShared)
-	local later, active = paneOf("Vibration limits"), paneOf("Charge sizing")
-	local closed = navigation.rows(snapshot, {})
-	local tabRow = rowOfKind(closed, "tab", function(row) return row.ref.key == tab.key end)
-	assert(tabRow and tabRow.setAsideCount == 1 and tabRow.count == 3, "the tab keeps all three places in its count")
-	assert(leafRow(closed, active) and leafRow(closed, paneOf("Dust study")), "siblings stay visible")
-	assert(leafRow(closed, later) == nil)
-	local aside = rowOfKind(closed, "aside", function(row) return row.ref.key == tab.key end)
-	assert(aside and aside.title == "Set aside 1" and aside.expanded == false)
-	assert(aside.depth == leafRow(closed, active).depth)
-	local opened = navigation.rows(snapshot, { setAsideOpen = { [tab.key] = true } })
-	local revealed = leafRow(opened, later)
-	assert(revealed and revealed.depth == aside.depth + 1 and revealed.leaf.conversation.setAside)
-	assert(rowOfKind(opened, "aside", function(row) return row.ref.key == tab.key end).expanded == true)
-
-	local mixed = build({ rows = function(rows) rowFor(rows, "Slab survey").disposition = "later" end })
-	local mixedTab = tabNode(mixed, census.tab.mixed)
-	local browser = census.tabPanes(census.tab.mixed)[2]
-	local rows = navigation.rows(mixed, {})
-	assert(leafRow(rows, browser), "a non-conversation sibling never collapses with a deferred conversation")
-	assert(leafRow(rows, census.tabPanes(census.tab.mixed)[1]) == nil)
-	assert(rowOfKind(rows, "aside", function(row) return row.ref.key == mixedTab.key end).count == 1)
+	local tab = tabNode(snapshot, census.tab.finishedShared)
+	local rows = navigation.rows(snapshot, {})
+	assert(tabRow(rows, tab.id) ~= nil and #tab.destinations == 3)
+	for _, row in ipairs(rows.rows) do
+		assert(row.kind == "session" or row.kind == "tab" or row.kind == "section",
+			"the census tree holds only sessions, tabs, and Parked/Unattached sections")
+	end
+	local finished = build({ rows = function(rows) rowFor(rows, "Buoy audit").disposition = "finished" end })
+	assert(tabRow(navigation.rows(finished, {}), census.tab.single) ~= nil, "a Finished lone pane keeps its tab row")
 end)
 
-test("Reference and Finished conversations stay visible with their marker", function()
+test("Reference and Finished conversations keep their disposition and their tab row", function()
 	local snapshot = build()
 	local result = navigation.rows(snapshot, {})
 	for title, disposition in pairs({ ["Bale counting"] = "reference", ["Kettle seam"] = "finished" }) do
-		local pane = paneOf(title)
-		local row = leafRow(result, pane)
-		assert(row and row.leaf.conversation.disposition == disposition, title .. " stays a visible leaf")
-		assert(not row.leaf.conversation.setAside)
-		assert(rowOfKind(result, "aside", function(candidate) return candidate.ref.tab == destination(snapshot, pane).tabId end) == nil,
-			title .. " is never hidden under Set aside")
+		local node = destination(snapshot, paneOf(title))
+		assert(node.conversation.disposition == disposition)
+		assert(tabRow(result, node.tabId) ~= nil, title .. " stays reachable through its tab")
 	end
 end)
 
 test("offline and retained records stay separate from open panes with typed counts", function()
 	local snapshot = build({ rows = function(rows)
 		table.insert(rows, { workId = "work:101", serial = 101, pane = nil, host = 1, hostKey = "local", title = "Closed thread",
-			sessionName = "Harbor", hostName = "Workbench", disposition = "later", retained = true,
+			sessionName = "Harbor", hostName = "Workbench", disposition = "finished", retained = true,
 			identityKey = "conversation:gone", noOpenPane = true, orphaned = true, unavailableReason = "No open pane",
 			nativeState = "unknown", attention = false })
 		table.insert(rows, { workId = "work:102", serial = 102, pane = paneOf("Tide ledger"), host = 1, hostKey = "local",
@@ -337,16 +421,18 @@ test("offline and retained records stay separate from open panes with typed coun
 		assert(node.conversation == nil or node.conversation.workId ~= "work:23", "an offline record is never an open pane")
 	end
 	local result = navigation.rows(snapshot, {})
-	local section = rowOfKind(result, "section", function(row) return row.title == "Saved conversations" end)
-	assert(section and section.count == 10 and section.depth == 0)
-	local after = 0
-	local last = result.rows[#result.rows]
-	assert(last.kind == "retained" and last.depth == 1)
-	for index, row in ipairs(result.rows) do
-		if row.kind == "retained" then after += 1; assert(result.rows[index - 1].kind == "retained" or result.rows[index - 1] == section) end
+	assert(rowOfKind(result, "section", function(row) return row.title == "Saved conversations" end) == nil,
+		"the Saved conversations section is gone from the tree")
+	for _, row in ipairs(result.rows) do
+		assert(row.kind ~= "retained", "a retained record is not a Workspace row; Search and the queues reach it")
 	end
-	assert(after == 10)
 	assert(rowOfKind(result, "host") == nil, "an offline host with no live content forces no host row")
+	local closed
+	for _, item in ipairs(navigation.searchItems(snapshot)) do
+		if item.kind == "retained" and item.ref.key == byWork["work:101"].key then closed = item end
+	end
+	assert(closed and string.find(closed.label, "Closed thread", 1, true) == 1,
+		"Search lists a saved conversation that has no open pane")
 end)
 
 test("search labels disambiguate equal text and keys never collide on separators", function()
@@ -415,14 +501,8 @@ test("search items carry host qualifiers and exact refs for every inventory kind
 	end
 end)
 
-test("search and flattening are independent of collapse state", function()
+test("search is independent of collapse state", function()
 	local snapshot = build()
-	local before = {}
-	for _, host in ipairs(snapshot.hosts) do
-		for _, session in ipairs(host.sessions) do
-			for _, tab in ipairs(session.tabs) do before[tab.key] = tab.flattened end
-		end
-	end
 	local collapsed = {}
 	for key, node in pairs(snapshot.byKey) do
 		if node.kind == "host" or node.kind == "session" or node.kind == "tab" then collapsed[key] = true end
@@ -440,7 +520,6 @@ test("search and flattening are independent of collapse state", function()
 		if item.kind == "pane" then searched += 1 end
 	end
 	assert(searched == 30, "collapsed groups never remove search results")
-	for key, flattened in pairs(before) do assert(snapshot.byKey[key].flattened == flattened, "rows never change flattening") end
 end)
 
 test("signatures follow identity, placement, and disposition but not titles or focus", function()
@@ -465,7 +544,7 @@ test("signatures follow identity, placement, and disposition but not titles or f
 	assert(destination(floating, pane).placement == "floating" and floating.signature ~= base.signature)
 	local moved = build({ identities = function(identities) identities[pane] = "conversation:replaced" end })
 	assert(not navigation.signatureMatches(moved, key, signature), "identity proof changes the target")
-	local deferred = build({ rows = function(rows) rowFor(rows, "Tide ledger").disposition = "later" end })
+	local deferred = build({ rows = function(rows) rowFor(rows, "Tide ledger").disposition = "finished" end })
 	assert(not navigation.signatureMatches(deferred, key, signature), "disposition changes the target")
 	local revised = build({ rows = function(rows) rowFor(rows, "Tide ledger").reviewRevision = 9 end })
 	assert(not navigation.signatureMatches(revised, key, signature), "a new review revision changes the target")
@@ -473,6 +552,85 @@ test("signatures follow identity, placement, and disposition but not titles or f
 	assert(not navigation.signatureMatches(retargeted, key, signature), "a different record is a different target")
 	assert(not navigation.signatureMatches(base, "pane:local#99999", signature))
 	assert(not navigation.signatureMatches(base, key, nil))
+end)
+
+test("an agent's model rides onto its conversation row, display only", function()
+	local result = navigation.rows(parkedAll(), {})
+	local function model(title)
+		local row = leafRow(result, paneOf(title))
+		assert(row ~= nil and row.leaf.conversation ~= nil, title .. " is a conversation leaf")
+		return row.leaf.model
+	end
+	assert(model("Tide ledger") == "GPT-6 Astra" and model("Sketch pad") == "GPT-6 Astra", "present")
+	assert(model("Buoy audit") == nil and model("Pier schedule") == nil, "absent stays nil")
+	assert(model("Charge sizing") == "GPT-6 Astra" and model("Vibration limits") == "Claude Opus 4.6"
+		and model("Dust study") == nil, "each agent keeps its own model, nil included")
+	assert(leafRow(result, census.tabPanes(census.tab.namedNote)[1]).leaf.model == nil, "a note has no model")
+	assert(leafRow(result, census.tabPanes(census.tab.namedBrowser)[1]).leaf.model == nil, "a browser has no model")
+
+	local untracked = parkedAll({ rows = function(rows)
+		local kept = {}
+		for _, row in ipairs(rows) do
+			if row.title ~= "Tide ledger" then table.insert(kept, row) end
+		end
+		return kept
+	end })
+	local bare = leafRow(navigation.rows(untracked, {}), paneOf("Tide ledger"))
+	assert(bare ~= nil and bare.leaf.conversation == nil and bare.leaf.model == nil,
+		"the model belongs to conversation rows; an untracked agent pane keeps the kind sub-line")
+end)
+
+test("an unusable native model reads as absent and never fails the inventory", function()
+	for _, junk in ipairs({ "", "   ", "\n\t", 42, true, census.null, {} }) do
+		local snapshot = parkedAll({ raw = function(raw)
+			for _, agent in ipairs(raw.agents) do agent.model = junk end
+		end })
+		local leaves = 0
+		for _, row in ipairs(navigation.rows(snapshot, {}).rows) do
+			if row.kind == "leaf" then
+				leaves += 1
+				assert(row.leaf.model == nil, "junk model " .. tostring(junk) .. " reads as nil")
+			end
+		end
+		assert(leaves == 30)
+	end
+	local padded = parkedAll({ raw = function(raw)
+		for _, agent in ipairs(raw.agents) do
+			if agent.pane == paneOf("Buoy audit") then agent.model = "  GPT-6\n Astra  " end
+		end
+	end })
+	assert(leafRow(navigation.rows(padded, {}), paneOf("Buoy audit")).leaf.model == "GPT-6 Astra", "sanitized like any other native text")
+end)
+
+test("targets ignore the model; the workspace repaint digest tracks it", function()
+	local with = build()
+	local without = build({ raw = function(raw)
+		for _, agent in ipairs(raw.agents) do agent.model = nil end
+	end })
+	local flipped = build({ raw = function(raw)
+		for _, agent in ipairs(raw.agents) do agent.model = "Claude Opus 4.6" end
+	end })
+	for _, other in ipairs({ without, flipped }) do
+		assert(other.signature ~= with.signature, "the workspace digest follows the model so catchup repaints")
+		for index, left in ipairs(destinations(with)) do
+			local right = destinations(other)[index]
+			assert(left.key == right.key and left.signature == right.signature, "destination key and signature ignore the model")
+			assert(navigation.signatureMatches(other, left.key, left.signature), "a model change never refuses a captured target")
+		end
+		local leftRows, rightRows = navigation.rows(with, {}).rows, navigation.rows(other, {}).rows
+		assert(#leftRows == #rightRows)
+		for index, left in ipairs(leftRows) do
+			assert(left.key == rightRows[index].key and left.signature == rightRows[index].signature, "row key and signature ignore the model")
+		end
+		local leftItems, rightItems = navigation.searchItems(with), navigation.searchItems(other)
+		assert(#leftItems == #rightItems)
+		for index, left in ipairs(leftItems) do
+			local right = rightItems[index]
+			assert(left.id == right.id and left.label == right.label and left.detail == right.detail and left.signature == right.signature,
+				"search items ignore the model")
+		end
+	end
+	assert(without.signature ~= flipped.signature, "absent and replaced models digest differently")
 end)
 
 test("projection and rows are deterministic and independent of input order", function()
@@ -510,7 +668,8 @@ test("owned canvases are excluded while other canvases and unplaced panes stay v
 	})
 	assert(navigation.locate(snapshot, census.rail.multiNamed) == nil and navigation.locate(snapshot, census.rail.mixed) == nil)
 	assert(destination(snapshot, 850).title == "Carly notes" and destination(snapshot, 850).tabId == 52)
-	assert(not tabNode(snapshot, 52).flattened, "an extra canvas makes the tab a parent")
+	assert(tabNode(snapshot, 52).target.pane == census.tabPanes(52)[1] and tabNode(snapshot, 52).title == "Buoy audit",
+		"an extra canvas never changes the tab's target")
 	assert(destination(snapshot, 851).placement == "parked" and destination(snapshot, 851).tabId == nil)
 	assert(destination(snapshot, 852).placement == "unattached" and destination(snapshot, 853).placement == "unattached")
 	local local_ = snapshot.hosts[1]
@@ -522,6 +681,9 @@ test("owned canvases are excluded while other canvases and unplaced panes stay v
 	assert(parked and parked.count == 1 and unattached and unattached.count == 2)
 	assert(leafRow(result, 851).leaf.placement == "parked" and leafRow(result, 853).leaf.placement == "unattached")
 	assert(leafRow(result, 851).depth == parked.depth + 1)
+	assert(leafRow(result, census.tabPanes(52)[1]) == nil, "a pane inside a tab has no row of its own")
+	assert(navigation.rowKey(snapshot, destination(snapshot, 851).key) == destination(snapshot, 851).key,
+		"a parked pane is its own row")
 	assert(navigation.ancestors(snapshot, destination(snapshot, 851).key)[2] == parked.key)
 	local hidden = navigation.rows(snapshot, { collapsed = { [parked.key] = true } })
 	assert(leafRow(hidden, 851) == nil and leafRow(hidden, 852) ~= nil)
@@ -553,7 +715,7 @@ test("titles fall back by native kind and are sanitized and bounded", function()
 	assert(utf8.len(destination(snapshot, census.tabPanes(61)[1]).title) ~= nil, "bounding never splits a character")
 	assert(tabNode(snapshot, 51).title == "tide charts", "a named tab keeps its name")
 	assert(tabNode(snapshot, 52).title == "Buoy audit", "an unnamed tab shows its focused pane title")
-	assert(tabNode(snapshot, 58).title == "Tab 1", "an owned rail never names a tab")
+	assert(tabNode(snapshot, 58).title == "Slab survey", "an owned rail never names a tab; the first content pane does")
 	for _, item in ipairs(navigation.searchItems(snapshot)) do
 		assert(not string.find(item.label, "secret", 1, true) and not string.find(item.label, "token", 1, true))
 	end
@@ -570,8 +732,8 @@ test("conversation links follow proof, claim order, and never merge by title", f
 	local changed = build({ identities = function(identities) identities[first] = "conversation:other-file" end })
 	assert(destination(changed, first).conversation.proof == "unproven", "a different file at the same pane is not the record")
 	assert(destination(changed, first).conversation.workId == destination(snapshot, first).conversation.workId)
-	local row = leafRow(navigation.rows(pending, {}), first)
-	assert(row.leaf.availability == "unverified")
+	local parked = parkedAll({ pending = { [first] = true } })
+	assert(leafRow(navigation.rows(parked, {}), first).leaf.availability == "unverified")
 	assert(destination(snapshot, census.tabPanes(53)[1]).conversation == nil, "notes carry no conversation")
 	assert(snapshot.counts.conversations == 22)
 	local attention = destination(snapshot, paneOf("Slab survey")).conversation
@@ -580,14 +742,14 @@ end)
 
 test("rows keep unique keys, bounded depth, and targets that re-resolve exactly", function()
 	local snapshot = build()
-	local result = navigation.rows(snapshot, { setAsideOpen = allAsideOpen(snapshot) })
+	local result = navigation.rows(snapshot, {})
 	assert(result.total == #result.rows)
 	local keys = {}
 	for _, row in ipairs(result.rows) do
 		assert(keys[row.key] == nil, "duplicate row key " .. row.key)
 		keys[row.key] = true
 		assert(row.depth >= 0 and row.depth <= 3)
-		if row.kind ~= "aside" and row.kind ~= "section" then
+		if row.kind ~= "section" then
 			assert(navigation.resolve(snapshot, row.ref.key) ~= nil, "row targets resolve: " .. row.key)
 			assert(navigation.signatureMatches(snapshot, row.ref.key, row.signature))
 		end
@@ -617,12 +779,22 @@ test("host rows appear when several hosts hold live content and offline counts s
 	for _, row in ipairs(result.rows) do
 		if row.kind == "host" then table.insert(hostRows, row) end
 	end
-	assert(#hostRows == 2 and hostRows[1].depth == 0 and hostRows[1].count == 30 and hostRows[2].count == 1)
+	assert(#hostRows == 2 and hostRows[1].depth == 0 and hostRows[1].count == 22 and hostRows[2].count == 1,
+		"host counts are visible tabs")
 	local sessionRow = rowOfKind(result, "session", function(row) return row.ref.session == 31 end)
 	assert(sessionRow.depth == 1)
 	assert(count(live.byKey) == live.counts.hosts + live.counts.sessions + live.counts.tabs + live.counts.destinations + live.counts.retained)
 	local collapsed = navigation.rows(live, { collapsed = { [hostRows[1].key] = true } })
-	assert(leafRow(collapsed, 101) == nil and leafRow(collapsed, FAR) ~= nil)
+	assert(tabRow(collapsed, 52) == nil and tabRow(collapsed, 90) ~= nil)
+	-- A minimized session's tabs sit behind the Minimized line, so the host counts only what it shows.
+	local harborKey = sessionNode(live, census.session.harbor).key
+	local minimizedRows = navigation.rows(live, { collapsed = { [harborKey] = true } })
+	local hostOf = function(rows) return rowOfKind(rows, "host", function(row) return row.ref.hostKey == "local" end) end
+	assert(hostOf(minimizedRows).count == 18, "minimizing a 4-tab session drops it from its host's count: "
+		.. tostring(hostOf(minimizedRows).count))
+	assert(navigation.signatureMatches(live, hostOf(minimizedRows).ref.key, hostOf(minimizedRows).signature),
+		"the host row still binds to its snapshot node")
+	assert(hostOf(navigation.rows(live, { collapsed = {} })).count == 22, "restoring it brings the tabs back")
 
 	local offline = remote("reconnecting")
 	local offlineRows = navigation.rows(offline, {})
@@ -631,30 +803,75 @@ test("host rows appear when several hosts hold live content and offline counts s
 		if row.kind == "host" and row.ref.hostKey == "host-two.invalid" then far = row end
 	end
 	assert(far and far.count == nil and far.context == "Host reconnecting", "an unreachable host never reports zero")
-	assert(leafRow(offlineRows, FAR).leaf.availability == "offline")
+	assert(tabRow(offlineRows, 90) ~= nil, "an offline host's tabs stay listed")
+	assert(offline.counts.tabs == 22 and live.counts.tabs == 23, "counts.tabs covers connected hosts only")
 	assert(offline.coverage[2].connected == false and offline.coverage[1].connected == true)
 end)
 
-test("ancestors expand exactly the groups above a destination", function()
+test("ancestors end at the tab row and rowKey maps a pane to the row that represents it", function()
 	local snapshot = build()
 	local target = destination(snapshot, paneOf("Vibration limits"))
+	local tab = tabNode(snapshot, census.tab.finishedShared)
 	local chain = navigation.ancestors(snapshot, target.key)
-	assert(#chain == 4, "host, session, tab, and the Set aside disclosure")
-	local collapsed, asideOpen = {}, {}
+	assert(#chain == 3 and chain[1] == snapshot.hosts[1].key and chain[2] == sessionNode(snapshot, tab.sessionId).key
+		and chain[3] == tab.key, "host, session, tab")
+	local collapsed = {}
 	for key, node in pairs(snapshot.byKey) do
-		if node.kind == "host" or node.kind == "session" or node.kind == "tab" then collapsed[key] = true end
+		if node.kind == "host" or node.kind == "session" then collapsed[key] = true end
 	end
-	assert(leafRow(navigation.rows(snapshot, { collapsed = collapsed }), target.pane) == nil)
-	local tab = tabNode(snapshot, census.tab.laterShared)
-	for _, key in ipairs(chain) do
-		if string.sub(key, 1, 6) == "aside:" then asideOpen[string.sub(key, 7)] = true else collapsed[key] = nil end
-	end
-	assert(asideOpen[tab.key])
-	local revealed = leafRow(navigation.rows(snapshot, { collapsed = collapsed, setAsideOpen = asideOpen }), target.pane)
-	assert(revealed ~= nil, "opening the ancestors makes the destination reachable")
+	assert(tabRow(navigation.rows(snapshot, { collapsed = collapsed }), tab.id) == nil)
+	for _, key in ipairs(chain) do collapsed[key] = nil end
+	assert(tabRow(navigation.rows(snapshot, { collapsed = collapsed }), tab.id) ~= nil,
+		"opening the ancestors makes the tab row reachable")
 	assert(#navigation.ancestors(snapshot, tab.key) == 2 and #navigation.ancestors(snapshot, "missing") == 0)
 	assert(navigation.locate(snapshot, target.pane) == target.key and navigation.locate(snapshot, 99999) == nil)
 	assert(snapshot.currentPane == census.focusedPane() and destination(snapshot, census.focusedPane()).current)
+
+	assert(navigation.rowKey(snapshot, target.key) == tab.key, "a pane inside a tab maps to its tab row")
+	assert(navigation.rowKey(snapshot, tab.key) == tab.key)
+	assert(navigation.rowKey(snapshot, snapshot.retained[1].key) == snapshot.retained[1].key)
+	assert(navigation.rowKey(snapshot, "missing") == "missing")
+	assert(navigation.rowKey(snapshot, sessionNode(snapshot, tab.sessionId).key) == sessionNode(snapshot, tab.sessionId).key)
+end)
+
+-- Manual session order (overlay.sessionOrder): stored ids first in their stored order, unknown sessions of the
+-- host after them in native order, stored ids with no live session ignored, other hosts untouched.
+test("sessionOrder reorders one host, appends new sessions, ignores stale ids, and leaves other hosts native", function()
+	local plain = build()
+	local host = plain.hosts[1]
+	local other = plain.hosts[2]
+	assert(#host.sessions > 2, "fixture: the local host carries several sessions")
+	local nativeIds, stored = {}, { 999 }
+	for index = #host.sessions, 1, -1 do table.insert(stored, host.sessions[index].id) end
+	for _, session in ipairs(host.sessions) do table.insert(nativeIds, session.id) end
+	local raw, options = census.raw(), census.options()
+	local data = navigation.inventory(raw, options)
+	local rows, identities = census.rows(), census.identities()
+	local reordered = navigation.project(data, { rows = rows, identities = identities, identityPending = {},
+		window = "window", nowUtc = 1, sessionOrder = { [host.hostKey] = stored } })
+	local got = {}
+	for _, session in ipairs(reordered.hosts[1].sessions) do table.insert(got, session.id) end
+	local expected = {}
+	for index = #nativeIds, 1, -1 do table.insert(expected, nativeIds[index]) end
+	assert(#got == #expected, "a stale stored id adds no session")
+	for index, id in ipairs(expected) do
+		assert(got[index] == id, "the host shows its sessions in the stored order, reversed here")
+	end
+	local otherIds = {}
+	for _, session in ipairs(other.sessions) do table.insert(otherIds, session.id) end
+	local otherGot = {}
+	for _, session in ipairs(reordered.hosts[2].sessions) do table.insert(otherGot, session.id) end
+	assert(#otherIds == #otherGot, "a host without a stored order keeps every session")
+	for index, id in ipairs(otherIds) do
+		assert(otherGot[index] == id, "a host without a stored order keeps its native order")
+	end
+	-- A stored order listing only some sessions still shows them all: the unlisted ones append natively.
+	local partial = navigation.project(data, { rows = rows, identities = identities, identityPending = {},
+		window = "window", nowUtc = 1, sessionOrder = { [host.hostKey] = { nativeIds[2] } } })
+	local partialIds = {}
+	for _, session in ipairs(partial.hosts[1].sessions) do table.insert(partialIds, session.id) end
+	assert(partialIds[1] == nativeIds[2] and #partialIds == #nativeIds,
+		"the one stored session leads and the rest append in native order")
 end)
 
 return true

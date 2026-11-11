@@ -1,6 +1,6 @@
 -- Synthetic workspace census with invented names. Shape: 11 sessions (2 empty), 22 tabs (9 named; 5 with 2-3
 -- agents; 6 with no agent), 22 conversation panes, 5 notes, 2 browsers (one sharing a tab with an agent),
--- 1 shell, one Later conversation sharing a tab with an active one, and 8 offline remote last-known records
+-- 1 shell, one Finished conversation sharing a tab with an active one, and 8 offline remote last-known records
 -- (two titled `omp`, no identity). Two Attention rails (owned canvases) sit in tabs and are never destinations.
 local census = {}
 -- Stand-in for tern.json.null.
@@ -9,14 +9,14 @@ census.null = {}
 local LOCAL_HOST, REMOTE_HOST = 1, 2
 local REMOTE_ADDRESS = "host-two.invalid"
 
-local function agent(title) return { kind = "agent", title = title, program = "omp", cwd = "/work/atlas" } end
+local function agent(title, model) return { kind = "agent", title = title, program = "omp", cwd = "/work/atlas", model = model } end
 local function note(title) return { kind = "file", title = title or "", path = "note:ledger" } end
 local function browser(title, url) return { kind = "browser", title = title, url = url } end
 
 -- id ranges: sessions 31-41, tabs 51-72, panes 101+, rails 801+.
 local SESSIONS = {
 	{ id = 31, name = "Harbor", tabs = {
-		{ id = 51, name = "tide charts", panes = { agent("Tide ledger"), agent("Sketch pad") } },
+		{ id = 51, name = "tide charts", panes = { agent("Tide ledger", "GPT-6 Astra"), agent("Sketch pad", "GPT-6 Astra") } },
 		{ id = 52, panes = { agent("Buoy audit") } },
 		{ id = 53, name = "harbor notes", panes = { note("") } },
 		{ id = 54, panes = { agent("Pier schedule") } },
@@ -28,7 +28,7 @@ local SESSIONS = {
 	} },
 	{ id = 33, name = "Quarry", tabs = {
 		{ id = 58, panes = { agent("Slab survey"), browser("Stone catalogue", "https://stone.example.invalid/catalogue") } },
-		{ id = 59, name = "blast log", panes = { agent("Charge sizing"), agent("Vibration limits"), agent("Dust study") } },
+		{ id = 59, name = "blast log", panes = { agent("Charge sizing", "GPT-6 Astra"), agent("Vibration limits", "Claude Opus 4.6"), agent("Dust study") } },
 		{ id = 60, panes = { note("") } },
 	} },
 	{ id = 34, name = "Lantern", tabs = {
@@ -66,7 +66,7 @@ local OFFLINE_TITLES = { "omp", "omp", "Index rebuild", "Pager duty", "Spec revi
 -- Role -> id lookups for tests (invented, stable).
 census.session = { harbor = 31, dune = 40, fjord = 41 }
 census.tab = {
-	multiNamed = 51, single = 52, namedNote = 53, mixed = 58, laterShared = 59, namedBrowser = 63, reference = 64,
+	multiNamed = 51, single = 52, namedNote = 53, mixed = 58, finishedShared = 59, namedBrowser = 63, reference = 64,
 	pair = 66, shell = 69, finished = 70,
 }
 census.rail = { multiNamed = 801, mixed = 802 }
@@ -135,7 +135,7 @@ function census.raw()
 			table.insert(panes, { pane = pane.id, tab = tab.id, title = pane.spec.title, kind = pane.spec.kind,
 				program = pane.spec.program, cwd = pane.spec.cwd or "", url = pane.spec.url, path = pane.spec.path,
 				focused = pane.id == first.id and tab.id == 52, floating = false, parked = false })
-			if pane.spec.kind == "agent" then table.insert(agents, { pane = pane.id, state = "idle" }) end
+			if pane.spec.kind == "agent" then table.insert(agents, { pane = pane.id, state = "idle", model = pane.spec.model }) end
 		end
 		if rail then
 			table.insert(content, rail)
@@ -172,7 +172,7 @@ function census.rows()
 	local built = build()
 	local rows, serial = {}, 0
 	local overrides = {
-		["Vibration limits"] = { disposition = "later", retained = true },
+		["Vibration limits"] = { disposition = "finished", retained = true },
 		["Bale counting"] = { disposition = "reference", retained = true },
 		["Kettle seam"] = { disposition = "finished", retained = true },
 		["Slab survey"] = { attention = true, reviewRevision = 4 },
@@ -183,7 +183,7 @@ function census.rows()
 			local row = { workId = "work:" .. serial, serial = serial, pane = pane.id, host = LOCAL_HOST, hostKey = "local",
 				tab = pane.tab, session = pane.session, title = pane.spec.title, sessionName = "", hostName = "Workbench",
 				disposition = "active", retained = false, identityKey = "conversation:" .. pane.id, attention = false,
-				nativeState = "idle", orphaned = false, noOpenPane = false, navigable = true }
+				nativeState = "idle", orphaned = false, noOpenPane = false, navigable = true, live = true }
 			for field, value in pairs(overrides[pane.spec.title] or {}) do row[field] = value end
 			table.insert(rows, row)
 		end
@@ -193,7 +193,8 @@ function census.rows()
 		table.insert(rows, { workId = "work:" .. serial, serial = serial, pane = 700 + index, host = REMOTE_HOST,
 			hostKey = REMOTE_ADDRESS, title = title, sessionName = "Rolling", hostName = "Remote Lab", disposition = "active",
 			retained = false, identityKey = nil, attention = false, nativeState = "unknown", orphaned = false,
-			noOpenPane = false, navigable = false, unavailableReason = "Remote Lab offline" })
+			noOpenPane = false, navigable = false, unavailableReason = "Remote Lab offline",
+			stale = true, live = false })
 	end
 	return rows
 end

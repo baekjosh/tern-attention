@@ -3,9 +3,24 @@ local bootstrap = require("../window")
 local nativeCanvas = require("./native_canvas")
 local copy = nativeCanvas.copy
 
+-- What native `tern.kv.get` returns is decoded JSON: every array (empty or not, never an object) carries a
+-- protected metatable, so `table.clone` or `setmetatable` on a stored array raises exactly as it does natively.
+-- A plain deep copy would let a parser that clones stored arrays pass here and fail on a real Tern.
+local function decoded(value)
+	if type(value) ~= "table" then return value end
+	local result, count = {}, 0
+	for key, item in pairs(value) do
+		result[key] = decoded(item)
+		count += 1
+	end
+	if getmetatable(value) == false or (#value > 0 and #value == count) then
+		setmetatable(result, { __metatable = false })
+	end
+	return result
+end
+
 local function rowAction(node, op)
 	op = op or "open"
-	if node.p and node.p.hidden then return nil end
 	local click = node.p and node.p.actions and node.p.actions.click
 	if type(click) == "string" and string.sub(click, 1, #op + 1) == op .. ":" then return click end
 	for _, child in node.c or {} do
@@ -27,6 +42,71 @@ local function keyedAction(node, key)
 end
 
 
+-- A left or right rail draws the two-region stack (a split root: attention sections over Workspace); a bottom rail
+-- keeps the strip with one selected section. These helpers address either shape, so a test names the section it is
+-- looking at and never the shape. `world.viewing` is the section the test last asked to see: the stack shows all of
+-- them at once, where the strip has to select one.
+local function isStack(view) return view.k == "split" end
+
+local function descend(node, ...)
+	for _, key in { ... } do
+		if node == nil then return nil end
+		node = nativeCanvas.childAt(node, key)
+	end
+	return node
+end
+
+-- The keyed `rows` node of one section: the strip's single list, or that section's list inside the stack.
+local function sectionRows(world, pane, section)
+	local view = world.canvases[pane].view
+	if not isStack(view) then return (nativeCanvas.childAt(view, "rows")) end
+	section = section or world.viewing
+	if section == "workspace" then return descend(view, "bottom", "rows") end
+	return descend(view, "top", "stack", section, "rows")
+end
+
+-- What `rowAction` and `keyedAction` search for the section being looked at: the whole strip, or one stack list.
+local function shown(world, pane)
+	local view = world.canvases[pane].view
+	if isStack(view) then return sectionRows(world, pane) end
+	return view
+end
+
+local function coverageOf(view)
+	if isStack(view) then return descend(view, "top", "coverage") end
+	return (nativeCanvas.childAt(view, "coverage"))
+end
+
+-- The node carrying one queue's label and count, and the key of its label child: a strip tab, or a stack section header.
+local function queueHead(world, pane, queue)
+	local view = world.canvases[pane].view
+	if isStack(view) then return descend(view, "top", "stack", queue, "head", "toggle"), "title" end
+	return descend(view, "header", "queues", queue), "label"
+end
+
+local function queueCount(world, pane, queue)
+	return nativeCanvas.childAt((queueHead(world, pane, queue)), "count").p.text
+end
+
+local function queueLabel(world, pane, queue)
+	local head, labelKey = queueHead(world, pane, queue)
+	return nativeCanvas.childAt(head, labelKey).p.text .. " · " .. nativeCanvas.childAt(head, "count").p.text
+end
+
+-- The strip's header parts: queue tabs, tools and the current-location line. The stack has no tabs; its tools and
+-- location sit in the attention region and the Workspace head.
+local function headerPart(world, pane, key)
+	local view = world.canvases[pane].view
+	if isStack(view) then
+		if key == "location" then return descend(view, "bottom", "head", "line", "location") end
+		if key == "tools" then return descend(view, "top", "tools", "buttons") end
+		error("a stack has no header part named " .. key)
+	end
+	return (nativeCanvas.childAt(nativeCanvas.childAt(view, "header"), key))
+end
+
+local SECTION_NAMES = { attention = true, working = true, workspace = true }
+
 -- Only the native boundary is fake; controller, model, view, and layout execute unchanged. The fixture opens rails
 -- on the left unless a test names another default position, so the layout shapes read below stay stable; each edge
 -- has its own placement tests further down.
@@ -41,7 +121,7 @@ local function native(enabled, os, position)
 		root = { pane = 10 }, focused = 10, failOpen = nil, agentState = "waiting_input", agentAlert = false,
 		contentInspectionUnavailable = false, abortInventory = false, savedTriage = nil, failTriageWrite = false,
 		triageWrites = 0, encoded = {}, encodingCount = 0, keys = {}, pluginKeys = {}, binds = {},
-		failKeys = false, failBind = false, rejectBind = false }
+		failKeys = false, failBind = false, rejectBind = false, viewing = "attention" }
 	world.processes, world.identityFiles, world.holdIdentity, world.inspections = {}, {}, false, 0
 	-- The phone queue snapshot (`phone.json`) is kept apart from diagnostics files so neither counts as the other.
 	world.phoneBytes, world.phoneWrites, world.failPhoneWrite, world.linkHandler = nil, 0, false, nil
@@ -58,6 +138,7 @@ local function native(enabled, os, position)
 	world.tabs = { [3] = { session = 2, host = 1, content = 10 } }
 	world.layouts, world.membership, world.parked, world.floating = {}, { [10] = 3 }, {}, {}
 	world.replicaAt, world.replicaDelay, world.layoutWrites, world.closes = {}, 0, 0, {}
+	world.parks = {}
 	-- Window canvas metadata (list and get share one replica) may lag the session's pane inventory.
 	world.metadataAt, world.metadataDelay = {}, 0
 	-- Restart-restored canvas panes: in session inventory only, absent from cx.canvas list and get, and
@@ -73,8 +154,10 @@ local function native(enabled, os, position)
 	-- Native facts the workspace navigator reads, panes without a tab, the native creation and management calls,
 	-- and a record of every call the plugin must never make.
 	world.paneInfo, world.loose, world.hostSwitches, world.actionRuns = {}, {}, {}, {}
+	-- The model each agent pane reports in the native agent list; a pane with no entry reports none.
+	world.models = {}
 	world.newTabs, world.noteCreates, world.fileOpens, world.browserCalls = {}, {}, {}, {}
-	world.sessionCreates, world.renames = {}, {}
+	world.sessionCreates, world.renames, world.orders, world.ignoreOrders = {}, {}, {}, false
 	world.nextTab, world.nextNativePane, world.nextSession = 40, 200, 40
 	local function strip(tree, pane)
 		if not tree then return nil end
@@ -121,7 +204,8 @@ local function native(enabled, os, position)
 		self.currentHost, self.currentSession, self.focused = info.host, info.session, info.content
 		self.handlers.focus({ pane = self.focused }, cx)
 	end
-	function world:emit(kind, event) self.handlers[kind](event, cx) end
+	-- A native event carries the context of the call that caused it: inside an await callback, that call's fresh one.
+	function world:emit(kind, event) self.handlers[kind](event, self.awaitContext or cx) end
 	function world:closePane(pane)
 		local tab = self.membership[pane]
 		if tab then setRoot(tab, strip(root(tab), pane)) end
@@ -134,10 +218,21 @@ local function native(enabled, os, position)
 		runtime = { os = os or "macos" },
 		plugin = { dir = "/native/attention", data = "/native/attention-data" } }
 	function sdk.json.array(value) return setmetatable(value or {}, { __metatable = false }) end
-	-- The native encoder is trusted; capture its input rather than reimplementing JSON.
+	-- The native encoder is trusted; capture its input rather than reimplementing JSON. Like the native encoder, equal
+	-- content encodes to the same text: the token is a canonical (key-sorted) rendering of the value.
+	local function canonical(value, depth)
+		assert(depth < 64, "fake JSON nesting too deep")
+		if type(value) ~= "table" then return type(value):sub(1, 1) .. tostring(value) end
+		local keys = {}
+		for key in value do table.insert(keys, key) end
+		table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+		local parts = {}
+		for _, key in keys do table.insert(parts, tostring(key) .. "=" .. canonical(value[key], depth + 1)) end
+		return "{" .. table.concat(parts, ",") .. "}"
+	end
 	function sdk.json.encode(value)
 		world.encodingCount += 1
-		local token = "native-json:" .. world.encodingCount
+		local token = "native-json:" .. canonical(value, 0)
 		world.encoded[token] = copy(value)
 		return token
 	end
@@ -372,14 +467,14 @@ local function native(enabled, os, position)
 	function sdk.kv.get(key)
 		if key == "triage" and world.failTriageRead then error(world.triageReadMessage or "triage read unavailable") end
 		if key == "preferences" then world.preferenceReads += 1 end
-		return copy(if key == "preferences" then world.prefs else world.savedTriage)
+		return decoded(if key == "preferences" then world.prefs else world.savedTriage)
 	end
 	function sdk.kv.set(key, value)
 		if key == "preferences" then
 			if world.failPreferenceWrite then error("preference disk unavailable") end
 			world.prefs = copy(value)
+			if world.tamperPreferenceWrite then world.prefs.enabled = not world.prefs.enabled end
 			world.preferenceWrites += 1
-			if world.tamperPreferenceWrite then world.prefs.backlogAfterSeconds = 10800 end
 		else
 			if world.failTriageWrite then error("triage disk unavailable") end
 			world.savedTriage = copy(value)
@@ -405,6 +500,21 @@ local function native(enabled, os, position)
 		return timer
 	end
 	function world:advance(ms)
+		-- Native emits `agent_state` when an agent's state changes (old = nil for an agent new since the last look); test
+		-- code changes `agentState` directly, so the fake reports each change before time moves. The first look only records.
+		if self.listAgents and self.handlers.agent_state then
+			local seen, first = {}, self.agentStates == nil
+			self.agentStates = self.agentStates or {}
+			for _, agent in self.listAgents() do
+				seen[agent.pane] = true
+				local old = self.agentStates[agent.pane]
+				if old ~= agent.state then
+					self.agentStates[agent.pane] = agent.state
+					if not first then self:emit("agent_state", { pane = agent.pane, old = old, new = agent.state }) end
+				end
+			end
+			for pane in self.agentStates do if not seen[pane] then self.agentStates[pane] = nil end end
+		end
 		local untilTime = self.now + ms
 		local steps = 0
 		while true do
@@ -472,6 +582,19 @@ local function native(enabled, os, position)
 		end
 		error("Current native picker has no item: " .. label)
 	end
+	-- Expands recorded facts the way a user does on a left/right rail: the row's More button opens the native
+	-- tracking menu and "Inspect recorded facts" is chosen from it. `scope` is a row (or a view whose first row is used).
+	function world:expandRow(pane, scope)
+		local action = rowAction(scope, "menu")
+		assert(action, "the row offers its More menu")
+		local before = #self.pickers
+		self:click(pane, action)
+		assert(#self.pickers == before + 1, "the More button opens exactly one native tracking menu")
+		for index, item in ipairs(self.pickers[#self.pickers].options.items) do
+			if item.op == "inspect" then self:choose(index); return end
+		end
+		error("the tracking menu offers Inspect recorded facts")
+	end
 	function world:helperCount(op)
 		local count = 0
 		for _, request in ipairs(self.sourceProcesses) do
@@ -479,10 +602,64 @@ local function native(enabled, os, position)
 		end
 		return count
 	end
+	-- Presses a rendered control. A stack has no section tabs (every section is on screen), so choosing a section
+	-- there only records which one the test reads next (and closes an open settings panel, as a tab would). Workspace
+	-- also opens any session a stack still shows collapsed, as a user would (this Mac's sessions already start open).
+	-- A stack pager belongs to its own section, not the first one found.
 	function world:control(pane, key)
-		local action = keyedAction(self.canvases[pane].view, key)
+		local view = self.canvases[pane].view
+		if isStack(view) and SECTION_NAMES[key] then
+			self.viewing = key
+			local settings = descend(view, "top", "settings")
+			if settings and settings.p.hidden == false then
+				-- The strip's section tabs also leave the settings panel; the stack's gear closes it.
+				self:click(pane, keyedAction(view, "settings"))
+				self:advance(32)
+			end
+			if key == "workspace" then self:openSessions(pane) end
+			return
+		end
+		local scope = view
+		local action = keyedAction(scope, key)
 		assert(action, "current rendered control unavailable: " .. key)
 		self:click(pane, action)
+	end
+	-- Presses the disclosure chevron of one stack section header (Attention or Working).
+	function world:toggleQueue(pane, queue)
+		local toggle = descend(self.canvases[pane].view, "top", "stack", queue, "head", "toggle")
+		assert(toggle and toggle.p.actions, "the section header offers its toggle: " .. queue)
+		self:click(pane, toggle.p.actions.click)
+	end
+	-- Restores every minimized session of a stack's Workspace list with its box's + strip: minimized boxes sit in a
+	-- host's Minimized group.
+	function world:openSessions(pane)
+		for _ = 1, 16 do
+			local rows = descend(self.canvases[pane].view, "bottom", "rows")
+			local action = nil
+			for _, row in ipairs(if rows then rows.c or {} else {}) do
+				local boxes = if row.p.role == "workspace.minimized-line" then descend(row, "boxes") else nil
+				local edge = if boxes and boxes.c and boxes.c[1] then nativeCanvas.childAt(boxes.c[1], "edge") else nil
+				if edge and edge.p.actions then action = edge.p.actions.click; break end
+			end
+			if not action then return end
+			self:click(pane, action)
+			self:advance(32)
+		end
+		error("the stack kept collapsed sessions after sixteen openings")
+	end
+	-- Minimizes the first open session of a stack's Workspace list with its box's − strip: a real disclosure change.
+	function world:closeSession(pane)
+		local rows = descend(self.canvases[pane].view, "bottom", "rows")
+		for _, row in ipairs(if rows then rows.c or {} else {}) do
+			local ledger = string.sub(row.p.key, 1, 8) == "session_" and (row.p.role == "workspace.ledger" or row.p.role == "workspace.ledger-current")
+			local edge = if ledger then nativeCanvas.childAt(row, "edge") else nil
+			if edge and edge.p.actions then
+				self:click(pane, edge.p.actions.click)
+				self:advance(32)
+				return
+			end
+		end
+		error("no open session row to collapse")
 	end
 	function world:click(pane, action)
 		assert(self.handlers.canvas_action({ owner = "attention", pane = pane, act = action }, cx) == true,
@@ -596,6 +773,7 @@ local function native(enabled, os, position)
 			path = info.path, url = info.url, cwd = info.cwd, program = info.program, focused = world.focused == pane }
 	end
 	function cx.session:panes()
+		world.paneListReads = (world.paneListReads or 0) + 1
 		local panes, seen = {}, {}
 		for pane in world.membership do
 			local value = self:pane(pane)
@@ -630,10 +808,19 @@ local function native(enabled, os, position)
 			zoomed = tab == 3 and world.zoomed }
 	end
 	function cx.agents:list()
-		local agents = if world.membership[10] then { { pane = 10, state = world.agentState, delivery_error = world.deliveryError } } else {}
+		world.agentListReads = (world.agentListReads or 0) + 1
+		local agents = if world.membership[10] then { { pane = 10, state = world.agentState, delivery_error = world.deliveryError,
+			model = world.models[10] } } else {}
 		for pane, state in world.additionalAgents or {} do
-			if world.membership[pane] then table.insert(agents, { pane = pane, state = state }) end
+			if world.membership[pane] then table.insert(agents, { pane = pane, state = state, model = world.models[pane] }) end
 		end
+		return agents
+	end
+	-- The fake's own change detection is not a plugin read.
+	function world.listAgents()
+		local reads = world.agentListReads
+		local agents = cx.agents:list()
+		world.agentListReads = reads
 		return agents
 	end
 	function cx.agents:transcript(pane, opts) return world.transcripts[pane] or {} end
@@ -700,8 +887,8 @@ local function native(enabled, os, position)
 		assert(canvas, "cannot update missing canvas")
 		world.canvases[pane] = nativeCanvas.apply(canvas, change)
 		if world.canvasPaints then
-			local rows = nativeCanvas.childAt(world.canvases[pane].view, "rows")
-			local coverage = nativeCanvas.childAt(world.canvases[pane].view, "coverage")
+			local rows = sectionRows(world, pane, "attention")
+			local coverage = coverageOf(world.canvases[pane].view)
 			table.insert(world.canvasPaints, { pane = pane, at = world.now, role = rows and rows.p.role,
 				notice = if coverage and not coverage.p.hidden then copy((nativeCanvas.childAt(coverage, "notice"))) else nil })
 		end
@@ -771,6 +958,8 @@ local function native(enabled, os, position)
 	end
 	function cx.layout:park(pane)
 		world.layoutWrites += 1
+		table.insert(world.parks, pane)
+		if world.refusePark and world.refusePark[pane] then return false, "native park refused" end
 		local tab = world.membership[pane]
 		setRoot(tab, strip(root(tab), pane))
 		world.parked[pane] = true
@@ -832,6 +1021,26 @@ local function native(enabled, os, position)
 		if not world.sessions[session] then return false, "unknown session" end
 		world.sessions[session].name = name
 		return true
+	end
+	function cx.layout:order_tab(tab, position)
+		table.insert(world.orders, { tab = tab, position = position })
+		if world.ignoreOrders or not world.tabs[tab] then return end
+		-- Native re-denses the session's positions: splice among that session's tabs, then 1..n again.
+		local session = world.tabs[tab].session
+		local ids = {}
+		for id, info in world.tabs do
+			if info.session == session then table.insert(ids, { id = id, position = info.position or id }) end
+		end
+		table.sort(ids, function(a, b)
+			if a.position ~= b.position then return a.position < b.position end
+			return a.id < b.id
+		end)
+		local ordered = {}
+		for _, entry in ipairs(ids) do
+			if entry.id ~= tab then table.insert(ordered, entry.id) end
+		end
+		table.insert(ordered, math.min(math.max(position, 1), #ordered + 1), tab)
+		for index, id in ipairs(ordered) do world.tabs[id].position = index end
 	end
 	function cx.docs:new_note(title, markdown)
 		table.insert(world.noteCreates, { title = title, markdown = markdown })
@@ -905,7 +1114,7 @@ end
 
 local function renderedRowFor(world, rail, pane)
 	local serial = savedItemFor(world, pane).serial
-	return (nativeCanvas.childAt(nativeCanvas.childAt(world.canvases[rail].view, "rows"), "r" .. serial))
+	return (nativeCanvas.childAt(sectionRows(world, rail), "r" .. serial))
 end
 local function visibleText(node)
 	if node.p and node.p.hidden then return "" end
@@ -914,24 +1123,47 @@ local function visibleText(node)
 	return table.concat(parts, " ")
 end
 
--- The sticky header's keyed parts: queue buttons, tools, and the current-location line.
-local function headerPart(world, pane, key)
-	return (nativeCanvas.childAt(nativeCanvas.childAt(world.canvases[pane].view, "header"), key))
-end
-local function queueCount(world, pane, queue)
-	return nativeCanvas.childAt(nativeCanvas.childAt(headerPart(world, pane, "queues"), queue), "count").p.text
+local function tooltipText(node)
+	if node.p and node.p.hidden then return "" end
+	local parts = { if node.p then node.p.title or "" else "" }
+	for _, child in ipairs(node.c or {}) do table.insert(parts, tooltipText(child)) end
+	return table.concat(parts, " ")
 end
 -- Workspace rows are keyed by their navigator key with every non-alphanumeric byte escaped; `part` names the
--- clickable child (open, toggle, menu, details) and a set-aside disclosure is its own `aside` child.
+-- clickable child (open, toggle, menu, details).
 local function wsRow(world, rail, key)
 	local safe = string.gsub(key, "[^%w]", function(char) return string.format("_%02x", string.byte(char)) end)
-	return (nativeCanvas.childAt(nativeCanvas.childAt(world.canvases[rail].view, "rows"), safe))
+	local rows = sectionRows(world, rail, "workspace")
+	local direct = (nativeCanvas.childAt(rows, safe))
+	if direct then return direct end
+	for _, block in ipairs(rows.c or {}) do
+		if block.p and (block.p.role == "workspace.ledger" or block.p.role == "workspace.ledger-current") then
+			local nested = (nativeCanvas.childAt((nativeCanvas.childAt(block, "rows")), safe))
+			if nested then return nested end
+		elseif block.p and block.p.role == "workspace.empty-line" then
+			local named = (nativeCanvas.childAt((nativeCanvas.childAt(block, "names")), safe))
+			if named then return named end
+		elseif block.p and block.p.role == "workspace.minimized-line" then
+			local boxes = nativeCanvas.childAt(block, "boxes")
+			local minimized = if boxes then (nativeCanvas.childAt(boxes, safe)) else nil
+			if minimized then return minimized end
+		end
+	end
+	return nil
 end
 local function wsPart(world, rail, key, part)
 	local row = wsRow(world, rail, key)
 	if not row then return nil end
-	local holder = if part == "aside" then row else nativeCanvas.childAt(row, "main")
-	local item = if holder then nativeCanvas.childAt(holder, part) else nil
+	-- An empty session is its own button on the No tabs line.
+	if row.p and row.p.role == "workspace.empty-name" then return if part == "open" then row.p.actions.click else nil end
+	local ledger = row.p and (row.p.role == "workspace.ledger" or row.p.role == "workspace.ledger-current")
+	-- A session box: its edge strip is the minimize/restore toggle, its name the jump.
+	if ledger and part == "toggle" and nativeCanvas.childAt(row, "edge") then
+		local edge = nativeCanvas.childAt(row, "edge")
+		return if edge.p.actions then edge.p.actions.click else nil
+	end
+	local holder = if ledger then nativeCanvas.childAt(row, "label") else ((nativeCanvas.childAt(row, "main")) or row)
+	local item = if holder then nativeCanvas.childAt(holder, if ledger and part == "open" then "name" else part) else nil
 	return if item and item.p.actions then item.p.actions.click else nil
 end
 
@@ -1036,7 +1268,7 @@ do
 	local saved = world.prefs.instances["local"]["3"]
 	assert(world.prefs.schema == 4 and world.prefs.defaults.position == "bottom"
 		and math.abs(world.prefs.defaults.shares.bottom["local"] - 0.32) < 0.000001
-		and saved.position == "bottom" and math.abs(saved.shares.bottom - 0.32) < 0.000001,
+		and saved.position == "bottom" and saved.shares == nil,
 		"a legacy store keeps its bottom position and height")
 	world:reload()
 	world:advance(2300)
@@ -1385,13 +1617,13 @@ do
 	local pane = world.opens[1].pane
 	world:interruptNextPass()
 	world.focused = pane
-	world:click(pane, rowAction(world.canvases[pane].view))
+	world:click(pane, rowAction(shown(world, pane)))
 	assert(world.focused == 10, "a still-visible valid row must stay actionable during budget recovery")
 	world.agentState = "idle"
 	world.now += 5000
 	world:budget("resumed")
 	world:advance(100)
-	assert(rowAction(world.canvases[pane].view) == nil,
+	assert(rowAction(shown(world, pane)) == nil,
 		"budget recovery must replace the interrupted view with the current attention state")
 	local reads = world.inventoryReads
 	world:advance(1100)
@@ -1411,16 +1643,17 @@ end
 -- than adopting a fresh layout state that overwrites an unobserved manual drag.
 do
 	local world = native(true)
-	world:advance(2100)
+	world:advance(4100)
 	world.root.ratio = 0.39
 	world:budget("paused")
 	world.now += 5000
 	world:budget("resumed")
-	world:advance(1100)
+	world:advance(3100)
 	assert(math.abs(world.root.ratio - 0.39) < 0.000001,
 		"budget recovery must preserve a native manual divider change")
-	assert(math.abs(world.prefs.instances["local"]["3"].shares.left - 0.39) < 0.000001,
-		"manual share must be retained only by its tab")
+	assert(math.abs(world.prefs.defaults.shares.left["local"] - 0.39) < 0.000001
+		and world.prefs.instances["local"]["3"].shares == nil,
+		"a manual share is retained as the host's width, never per tab")
 	assert(world.focusWrites == 0 and world:activeTimers() == 1,
 		"layout recovery must preserve typing focus and one heartbeat")
 end
@@ -1660,95 +1893,44 @@ do
 	world.prefs = { enabled = true, owner = "desktop", shares = { ["local"] = 0.39 }, suppressed = {} }
 	world:advance(3100)
 	local pane = world.opens[1].pane
-	assert(world.prefs.schema == 4 and world.prefs.defaults.position == "bottom" and world.opens[1].options.how == "beside"
-		and world.root.split == "down" and world.root[1].pane == 10 and world.root[2].pane == pane
-		and math.abs(world.root.ratio - 0.75) < 0.01,
-		"legacy preferences migrate and the rail mounts at the bottom, the default position")
+	assert(world.prefs.schema == 4 and world.prefs.defaults.position == "left" and world.opens[1].options.dir == "left"
+		and world.root.split == "right" and world.root[1].pane == pane and world.root[2].pane == 10
+		and math.abs(world.root.ratio - 0.25) < 0.02,
+		"legacy preferences migrate and the rail mounts on the left, the default position")
 	assert(world.prefs.defaults.shares.right["local"] == 0.39 and world.prefs.defaults.shares.bottom["local"] == nil,
 		"a legacy width stays a right-edge size and is never reused as a bottom height")
-	world:control(pane, "settings")
-	world:advance(50)
-	world.utcShift = 14400
-	world:control(pane, "age-3")
-	world:advance(50)
-	local state = world:inspect()
-	assert(state.attentionCount == 0 and state.laterCount == 1 and world.agentState == "waiting_input",
-		"the Settings cutoff must age unresolved attention without answering it")
-	assert(world.focusWrites == 0, "settings must not focus an agent")
-end
-
-do
-	local world = native(true)
-	world.identityFiles[10] = "/sessions/never-aging.jsonl"
-	world:advance(3100)
-	local pane = world.opens[1].pane
-	world.utcShift = 604800
-	world:advance(1100)
-	assert(world:inspect().attentionCount == 1 and world:inspect().laterCount == 0,
-		"an unconfigured age cutoff must retain unresolved P0 indefinitely")
-	world:control(pane, "settings")
-	world:advance(50)
-	world:control(pane, "age-24")
-	world:advance(50)
-	assert(world:inspect().attentionCount == 0 and world:inspect().laterCount == 1,
-		"choosing a timed cutoff must still move old P0 to Backlog")
-	world:control(pane, "age-never")
-	world:advance(50)
-	assert(world.prefs.backlogAfterSeconds == 0 and world:inspect().laterCount == 1,
-		"Never must save without restoring existing Backlog")
-	world:control(pane, "later")
-	world:advance(50)
-	world:click(pane, rowAction(world.canvases[pane].view, "menu")); world:choose(1)
-	world:advance(50)
-	local reloaded = native(true)
-	reloaded.prefs, reloaded.savedTriage = copy(world.prefs), copy(world.savedTriage)
-	reloaded.identityFiles = copy(world.identityFiles)
-	reloaded.utcShift = world.utcShift + math.floor(world.now / 1000) + 604800
-	reloaded:advance(3100)
-	assert(reloaded:inspect().attentionCount == 1 and reloaded:inspect().laterCount == 0
-		and reloaded.prefs.backlogAfterSeconds == 0,
-		"Never must remain effective after saving and reloading restored P0")
-	assert(world.focusWrites == 0 and reloaded.focusWrites == 0, "aging settings never acknowledge or focus an agent")
+	assert(world.focusWrites == 0, "mounting migrated preferences must not focus an agent")
 end
 
 do
 	local world = native(true)
 	world.identityFiles[10] = "/sessions/controller-agent.jsonl"
-	world.prefs.backlogAfterSeconds = 21600
 	world.agentAlert = true
 	world:advance(3100)
 	local pane = world.opens[1].pane
-	world:click(pane, rowAction(world.canvases[pane].view, "menu")); world:choose(1)
+	world:click(pane, rowAction(shown(world, pane), "menu")); world:chooseLabel("Finished for now · current scope")
 	world:advance(100)
-	assert(world:inspect().attentionCount == 0 and world:inspect().laterCount == 1)
-	assert(world.agentAlert and world.focusWrites == 0, "Snooze must not acknowledge or focus native attention")
+	assert(world:inspect().attentionCount == 0 and world.savedTriage.items[1].disposition == "finished")
+	assert(world.agentAlert and world.focusWrites == 0, "Finishing must not acknowledge or focus native attention")
 	world:command("next")
-	assert(world.focusWrites == 0, "Next P0 must exclude Backlog")
-	world:control(pane, "later")
-	world:advance(50)
-	assert(rowAction(world.canvases[pane].view, "route-open"), "Backlog must keep the live item navigable")
-	world:click(pane, rowAction(world.canvases[pane].view, "menu")); world:choose(1)
-	world:advance(100)
-	assert(world:inspect().attentionCount == 1 and world:inspect().laterCount == 0,
-		"Restore must return the unresolved item to P0")
-	world.utcShift = 21600
-	world:advance(1100)
-	assert(world:inspect().attentionCount == 0 and world:inspect().laterCount == 1,
-		"unresolved restored attention must age into Backlog after six hours")
-	local reloaded = native(true)
-	reloaded.prefs, reloaded.savedTriage = copy(world.prefs), copy(world.savedTriage)
-	reloaded.identityFiles = copy(world.identityFiles)
-	reloaded.utcShift, reloaded.agentAlert = world.utcShift + math.floor(world.now / 1000), true
-	reloaded:advance(3100)
-	assert(reloaded:inspect().attentionCount == 0 and reloaded:inspect().laterCount == 1,
-		"reload must retain Backlog without fabricating new attention")
-	reloaded.agentState = "working"
-	reloaded:advance(1100)
-	assert(reloaded:inspect().laterCount == 1, "continuing unread work is not yet a new request")
-	reloaded.agentState = "waiting_input"
-	reloaded:advance(1100)
-	assert(reloaded:inspect().attentionCount == 1 and reloaded:inspect().laterCount == 0,
-		"a genuinely new waiting request must return to P0")
+	assert(world.focusWrites == 0, "Next attention must exclude Finished work")
+end
+
+-- A stored record from the retired Later queue is rewritten as Finished on the first load, not only in memory.
+do
+	local first = native(true)
+	first.identityFiles[10] = "/sessions/controller-agent.jsonl"
+	first:advance(3100)
+	local stored = copy(first.savedTriage)
+	assert(stored and stored.schema == 3 and stored.items[1], "fixture: a saved schema-3 record")
+	stored.items[1].disposition, stored.items[1].laterUtc, stored.items[1].laterEpisode = "later", 1, 0
+	local world = native(true)
+	world.identityFiles[10] = "/sessions/controller-agent.jsonl"
+	world.savedTriage = stored
+	world:advance(3100)
+	local item = world.savedTriage.items[1]
+	assert(world.triageWrites >= 1 and item.disposition == "finished" and item.retained == true
+		and item.laterUtc == nil and item.laterEpisode == nil, "the Later → Finished migration reaches the store")
 end
 
 do
@@ -1769,23 +1951,23 @@ do
 	world:advance(1)
 	assert(#world.opens == 1, "recovered storage must automatically mount the panel after discovery")
 	local pane = world.opens[1].pane
-	local snooze = rowAction(world.canvases[pane].view, "menu")
-	assert(snooze and rowAction(world.canvases[pane].view),
-		"automatic recovery must publish usable Open and Snooze actions before diagnostics")
+	local setAside = rowAction(shown(world, pane), "menu")
+	assert(setAside and rowAction(shown(world, pane)),
+		"automatic recovery must publish usable Open and More actions before diagnostics")
 	world:advance(100)
 	assert(world:inspect().attentionCount == 1 and world:inspect().status == "ready",
 		"recovered storage must restore ready attention")
 	world.failTriageWrite = true
-	world:click(pane, rowAction(world.canvases[pane].view, "menu")); world:choose(1)
+	world:click(pane, rowAction(shown(world, pane), "menu")); world:chooseLabel("Finished for now · current scope")
 	world:advance(100)
 	local unsaved = world:inspect()
-	assert(unsaved.status == "unsaved" and unsaved.count == 1 and unsaved.laterCount == 1
+	assert(unsaved.status == "unsaved" and unsaved.count == 1 and unsaved.attentionCount == 0
 		and world.savedTriage.items[1].disposition == "active",
 		"a failed save keeps the exact count under an unsaved status, never durable success")
 	world.failTriageWrite = false
 	world:advance(1100)
-	assert(world.savedTriage.items[1].disposition == "later" and world:inspect().status == "ready",
-		"a pending Snooze must persist when storage returns")
+	assert(world.savedTriage.items[1].disposition == "finished" and world:inspect().status == "ready",
+		"a pending Finished must persist when storage returns")
 	local writes = world.nativeWrites
 	world:advance(5000)
 	assert(world.nativeWrites == writes, "unchanged idle attention must not write canvas, layout, preferences, or triage")
@@ -1826,7 +2008,7 @@ do
 	world:addTab(4, 11, 1, 7)
 	world.sessions[2].name, world.sessions[7].name = "Session A", "Session B"
 	world.identityFiles[10], world.identityFiles[11] = "/sessions/sticky-a.jsonl", "/sessions/sticky-b.jsonl"
-	world.additionalAgents = { [11] = "waiting_input" }
+	world.additionalAgents = { [11] = "working" }
 	world:advance(3100)
 	local first = world.opens[1].pane
 	world:switch(4); world:advance(3100)
@@ -1834,45 +2016,34 @@ do
 	world:switch(3); world:advance(100)
 	local placementWrites = world.layoutWrites
 
-	local function selectedQueue(pane)
-		local queues = headerPart(world, pane, "queues")
-		for _, queue in ipairs(queues.c) do
-			if string.find(queue.p.role, "-selected", 1, true) then return queue.p.key end
-		end
-		return nil
-	end
-	local function rows(pane)
-		return nativeCanvas.childAt(world.canvases[pane].view, "rows").c
-	end
+	local function rows(pane, section) return sectionRows(world, pane, section).c end
+	local function sectionOpen(pane, section) return not sectionRows(world, pane, section).p.hidden end
 
-	assert(#rows(first) == 2, "shared-panel fixture has two conversations from different native sessions")
-	world:click(first, rowAction(rows(first)[1], "menu"))
-	world:choose(1); world:advance(100)
-	world:control(first, "later"); world:advance(100)
-	local deferredRows, deferredQueue = rows(first), selectedQueue(first)
-	assert(deferredQueue == "later" and #deferredRows == 1 and rowAction(deferredRows[1], "menu"),
-		"shared-panel fixture selects the populated Later body in session A")
-	local deferredKey, firstOpen = deferredRows[1].p.key, rowAction(deferredRows[1], "route-open")
+	assert(#rows(first, "attention") == 1 and #rows(first, "working") == 1,
+		"shared-panel fixture has an Attention and a Working conversation from different native sessions")
+	local workingRows = rows(first, "working")
+	assert(rowAction(workingRows[1], "menu"), "the Working row offers its tracking menu")
+	local workingKey, firstOpen = workingRows[1].p.key, rowAction(workingRows[1], "route-open")
 
 	world:switch(4); world:advance(100)
-	assert(selectedQueue(second) == deferredQueue,
-		"shared logical queue: session B must follow the Later selection made in session A")
-	assert(#rows(second) == 1 and rows(second)[1].p.key == deferredKey and rowAction(rows(second)[1], "menu"),
-		"shared logical body: session B must render the same deferred conversation, not its own session queue")
-	local secondOpen = rowAction(rows(second)[1], "route-open")
+	assert(#rows(second, "working") == 1 and rows(second, "working")[1].p.key == workingKey
+		and rowAction(rows(second, "working")[1], "menu"),
+		"shared logical body: session B must render the same working conversation, not its own session queue")
+	local secondOpen = rowAction(rows(second, "working")[1], "route-open")
 	assert(firstOpen and secondOpen and firstOpen ~= secondOpen,
 		"shared logical content must retain independent per-canvas action tokens")
 
-	world:control(second, "attention"); world:advance(100)
-	local activeRows, activeQueue = rows(second), selectedQueue(second)
-	assert(activeQueue == "attention" and #activeRows == 1 and activeRows[1].p.key ~= deferredKey,
-		"session B changes the shared selection to the other populated queue")
-	local activeKey = activeRows[1].p.key
+	-- Closing a section is the shared disclosure: it belongs to the window, not to the canvas that was clicked.
+	assert(sectionOpen(second, "attention") and sectionOpen(second, "working"), "both queues start open")
+	world:toggleQueue(second, "attention"); world:advance(100)
+	assert(not sectionOpen(second, "attention") and sectionOpen(second, "working") and #rows(second, "working") == 1,
+		"session B closes the Attention section and keeps Working open")
 	world:switch(3); world:advance(100)
-	assert(selectedQueue(first) == activeQueue,
-		"shared logical queue: session A must follow the selection subsequently made in session B")
-	assert(#rows(first) == 1 and rows(first)[1].p.key == activeKey and rowAction(rows(first)[1], "menu"),
-		"shared logical body: session A must catch up to B's selected conversation without retaining its old Later")
+	assert(not sectionOpen(first, "attention") and sectionOpen(first, "working"),
+		"shared logical disclosure: session A must follow the section session B closed")
+	assert(#rows(first, "working") == 1 and rows(first, "working")[1].p.key == workingKey
+		and rowAction(rows(first, "working")[1], "menu"),
+		"shared logical body: session A keeps the working conversation while Attention is closed")
 	assert(world.membership[first] == 3 and world.membership[second] == 4
 		and world.layoutWrites == placementWrites and world.focusWrites == 0,
 		"shared panel selection never moves either physical canvas or focuses an agent")
@@ -1984,22 +2155,22 @@ do
 	assert(#world.opens == 1 and world.focusWrites == 0, "eligibility mounts without a focus hop")
 end
 
+-- The only reset is the palette command, and it resets the tab the Mac is showing: another tab's rail is untouched.
 do
 	local world = native(true)
 	world:addTab(4, 11)
 	world:advance(3100)
 	local first = world.opens[1].pane
-	world:control(first, "settings"); world:advance(100)
 	world:switch(4); world:advance(3100)
 	local second = world.opens[2].pane
-	local untouched, otherWrites = copy(world.layouts[4]), world.layoutWritesByTab[4] or 0
-	world.root.ratio = 0.38
+	local untouched, otherWrites = copy(world.root), world.layoutWritesByTab[3] or 0
+	world.layouts[4].ratio = 0.38
 	world:command("reset-placement"); world:advance(500)
-	assert(world.layouts[4].split == untouched.split and world.layouts[4].ratio == untouched.ratio
-		and (world.layoutWritesByTab[4] or 0) == otherWrites,
-		"a clicked rail's Reset changes only that tab even while another is focused")
-	assert(math.abs(world.prefs.instances["local"]["3"].shares.left - 0.38) < 0.000001
-		and math.abs(world.prefs.instances["local"]["4"].shares.left - 0.25) < 0.000001, "the share belongs to each tab")
+	assert(world.root.split == untouched.split and world.root.ratio == untouched.ratio
+		and (world.layoutWritesByTab[3] or 0) == otherWrites,
+		"Reset placement (this tab) changes only the focused tab even while another tab's rail was opened")
+	assert(math.abs(world.layouts[4].ratio - 0.25) < 0.02 and world.prefs.instances["local"]["3"].shares == nil
+		and world.prefs.instances["local"]["4"].shares == nil, "Reset applies the host's rail width; no tab keeps its own")
 	assert(world.prefs.instances["local"]["3"].position == "left" and world.prefs.instances["local"]["4"].position == "left",
 		"each tab records the edge its rail occupies")
 	local sets = world.canvasSets
@@ -2078,8 +2249,8 @@ do
 		shares = { bottom = { ["local"] = 0.3 }, right = { ["local"] = 0.4 } }, suppressed = { ["local"] = true } }
 	world:addTab(4, 11)
 	world:advance(3100); world:switch(4); world:advance(3100)
-	assert(world.prefs.schema == 4 and world.prefs.owner == "desktop" and world.prefs.backlogAfterSeconds == 43200
-		and #world.opens == 0, "migration preserves owner, age cutoff and conservative host suppression")
+	assert(world.prefs.schema == 4 and world.prefs.owner == "desktop" and world.prefs.backlogAfterSeconds == nil
+		and #world.opens == 0, "migration preserves owner and conservative host suppression and drops the retired age cutoff")
 	world:command("open"); world:advance(500)
 	local pane = world.opens[1] and world.opens[1].pane
 	assert(#world.opens == 1 and world.prefs.instances["local"]["4"].pane == pane
@@ -2120,22 +2291,29 @@ do
 	world:advance(1100)
 	assert(world.canvasSets == totalSets + 2 and (world.canvasSetsByPane[first] or 0) == firstSets + 1,
 		"a queue change repaints the active tab at once and each other tab's rail exactly once")
-	assert(not rowAction(world.canvases[first].view) and not rowAction(world.canvases[second].view),
+	assert(not rowAction(shown(world, first)) and not rowAction(shown(world, second)),
 		"the rail of the tab the Mac is not showing converges to the latest queue without a tab switch")
 	world:switch(3); world:advance(50)
-	assert(world.canvasSets == totalSets + 2 and not rowAction(world.canvases[first].view),
-		"activating a caught-up rail paints nothing more")
+	-- The Workspace's current-place marker moves with focus, but only the rail that becomes active repaints for it: the
+	-- rail of the tab left behind keeps its frame until its own content changes or it is shown again.
+	local secondSets = world.canvasSetsByPane[second] or 0
+	assert(world.canvasSets == totalSets + 3 and (world.canvasSetsByPane[first] or 0) == firstSets + 2
+		and (world.canvasSetsByPane[second] or 0) == secondSets and not rowAction(shown(world, first)),
+		"activating a tab repaints only that tab's rail for the moved current marker")
+	local settled = world.canvasSets
+	world:advance(1100)
+	assert(world.canvasSets == settled, "converged rails stay quiet after the marker moves")
 	assert(world:activeTimers() == 1, "converged rails leave only the heartbeat scheduled")
 	world.layouts[4], world.floating[second], world.floats[4] = { pane = 11 }, true, { { pane = second } }
 	world:switch(4)
 	world.focused = second
 	world:emit("focus", { pane = second })
 	firstSets = world.canvasSetsByPane[first] or 0
-	assert(not rowAction(world.canvases[second].view), "the floating rail begins without an attention target")
+	assert(not rowAction(shown(world, second)), "the floating rail begins without an attention target")
 	world.agentState = "waiting_input"
 	world:advance(1100)
 	assert((world.canvasSetsByPane[first] or 0) == firstSets + 1
-		and rowAction(world.canvases[second].view) and rowAction(world.canvases[first].view),
+		and rowAction(shown(world, second)) and rowAction(shown(world, first)),
 		"focused floating Attention is active and the other tab's rail catches up once")
 end
 
@@ -2168,10 +2346,14 @@ do
 	assert(world.layoutReads - reads <= #rails + 1 and world.layoutReads - reads >= #rails,
 		"settled rails share per-pass read-only layout observations, not duplicate full layout censuses")
 	assert(world.layoutWrites == writes, "observing settled rails never enforces geometry")
+	local prefWrites = world.preferenceWrites
 	world.root.ratio = 0.37
 	world:emit("cwd", { pane = 10 }); world:advance(32)
-	assert(math.abs(world.prefs.instances["local"]["3"].shares.left - 0.37) < 0.000001
-		and world.layoutWrites == writes, "the next pass observes a user divider edit, never a cross-pass cache")
+	assert(world.preferenceWrites == prefWrites, "a divider edit is not written on its first observation")
+	world:emit("cwd", { pane = 10 }); world:advance(32)
+	assert(math.abs(world.prefs.defaults.shares.left["local"] - 0.37) < 0.000001
+		and world.prefs.instances["local"]["3"].shares == nil and world.layoutWrites == writes,
+		"the next passes observe a user divider edit, never a cross-pass cache, and record it once it has settled")
 	local before, writesByTab = {}, copy(world.layoutWritesByTab)
 	for _, rail in ipairs(rails) do
 		local tab = world.membership[rail]
@@ -2189,29 +2371,30 @@ do
 			and saved.position == "left" and saved.moveTo == "right",
 			"marking background rails records the move without changing unseen tabs")
 	end
+	local rightShare = 0.25
 	for _, rail in ipairs(rails) do
 		local tab = world.membership[rail]
 		world:switch(tab); world:advance(2100)
 		local tree = if tab == 3 then world.root else world.layouts[tab]
 		local saved = world.prefs.instances["local"][tostring(tab)]
 		assert(tree.split == "right" and tree[2] and tree[2].pane == rail
-			and saved.position == "right" and saved.moveTo == nil and saved.placement == nil
+			and saved.position == "right" and saved.moveTo == nil and saved.placement == nil and saved.shares == nil
 			and (world.layoutWritesByTab[tab] or 0) > (writesByTab[tab] or 0)
-			and math.abs(tree.ratio - 0.75) < 0.02
-			and math.abs(saved.shares.right - (1 - tree.ratio)) < 0.000001
-			and math.abs(saved.shares.left - before[tab].ratio) < 0.000001,
-			"an eligible visit moves and resizes its rail, then persists fresh geometry rather than cached pre-move observations")
+			and math.abs(tree.ratio - (1 - rightShare)) < 0.02,
+			"an eligible visit moves and resizes its rail to the host's width for that edge, with no per-tab size")
+		tree.ratio = 0.63
+		world:emit("cwd", { pane = world.tabs[tab].content }); world:advance(32)
 		reads, writes = world.layoutReads, world.layoutWrites
 		local inventories = world.inventoryReads
-		tree.ratio = 0.63
 		world:emit("cwd", { pane = world.tabs[tab].content }); world:advance(32)
 		local passes = world.inventoryReads - inventories
 		assert(passes > 0 and world.layoutReads - reads >= #rails * passes
 			and world.layoutReads - reads <= (#rails + 1) * passes,
 			"each observed pass keeps bounded layout reads even when multiple scheduled passes share the interval")
-		assert(math.abs(world.prefs.instances["local"][tostring(tab)].shares.right - 0.37) < 0.000001
+		assert(math.abs(world.prefs.defaults.shares.right["local"] - 0.37) < 0.000001
 			and world.layoutWrites == writes and tree.ratio == 0.63,
-			"after native move/resize, a fresh observation persists a user divider edit without enforcing geometry")
+			"after native move/resize, a settled user divider edit is recorded as the host's width without enforcing geometry")
+		rightShare = 0.37
 	end
 end
 
@@ -2235,17 +2418,31 @@ do
 		tree.ratio = 0.29
 	end
 	world:emit("cwd", { pane = 10 }); world:advance(32)
+	assert(world.preferenceWrites == writes, "a changed divider is written only once it has settled")
+	world:emit("cwd", { pane = 10 }); world:advance(32)
 	assert(world.preferenceWrites - writes == 1,
-		"one pass observing changed shares on every rail commits them in a single preference write")
+		"one pass settling every rail's divider commits the host's width in a single write")
+	assert(math.abs(world.prefs.defaults.shares.left["local"] - 0.29) < 0.000001, "the settled divider width is recorded")
 	for _, rail in ipairs(rails) do
-		local saved = world.prefs.instances["local"][tostring(world.membership[rail])]
-		assert(saved and math.abs(saved.shares.left - 0.29) < 0.000001, "every rail's edited divider share is recorded")
+		assert(world.prefs.instances["local"][tostring(world.membership[rail])].shares == nil, "no rail keeps its own width")
 	end
 	world:reload(); world:advance(3100)
-	for _, rail in ipairs(rails) do
-		local saved = world.prefs.instances["local"][tostring(world.membership[rail])]
-		assert(saved and math.abs(saved.shares.left - 0.29) < 0.000001, "the batched shares persist across reload")
+	assert(math.abs(world.prefs.defaults.shares.left["local"] - 0.29) < 0.000001, "the host's width persists across reload")
+end
+
+-- A focus change repaints only the rail in the active tab: a background rail keeps its frame until it becomes active or
+-- its own content changes. The settle advance lets every rail's first paint land before the snapshot; the walk after it
+-- stays well inside `catchup.REFRESH_MS` (10 s), after which any background rail is re-rendered on purpose
+-- to pick up slow inputs such as the pinned location line.
+do
+	local world, rails = mirroredWorld(3)
+	world:advance(3100)
+	local untouched = rails[4]
+	local sets = world.canvasSetsByPane[untouched] or 0
+	for _, tab in ipairs({ 5, 4, 3 }) do
+		world:switch(tab); world:advance(100)
 	end
+	assert((world.canvasSetsByPane[untouched] or 0) == sets, "a focus change never repaints a background rail")
 end
 local function setSecondRequest(world, waiting)
 	local state = if waiting then "waiting_input" else "working"
@@ -2257,8 +2454,15 @@ do
 	local world, rails = mirroredWorld(4)
 	local sets = copy(world.canvasSetsByPane)
 	world.canvasPaints = {}
+	local reads = world.paneListReads
 	setSecondRequest(world, true)
-	world:advance(1000)
+	world:advance(200)
+	-- One visible change stales every hidden rail; they catch up from that pass's data, not one full pass each.
+	local hidden = 0
+	for _, paint in world.canvasPaints do if paint.pane ~= rails[1] then hidden += 1 end end
+	assert(hidden == #rails - 1 and world.paneListReads - reads < hidden,
+		"hidden rails catch up from the pass's data, not one inventory read per rail")
+	world:advance(800)
 	for index, rail in rails do
 		assert(queueCount(world, rail, "attention") == "2", "every tab's rail reaches the new count without a tab switch")
 		-- The visible rail also pulses for the arrival and retires the pulse; a background rail is painted exactly once.
@@ -2280,13 +2484,32 @@ do
 		"once every rail is current nothing is painted and no catch-up pass stays scheduled")
 end
 
--- Rails that keep lagging share the one background paint per pass: none is starved by the others.
+-- A quiet window rebuilds almost nothing: a rail whose render inputs are unchanged skips the render, so over a minute
+-- the rail in view renders once per 10 s clock bucket (its ages) and each hidden rail about once (60 s bucket), instead
+-- of a render every heartbeat and every hidden-rail refresh. Any input change still renders at once.
+do
+	local world, rails = mirroredWorld(4)
+	world:advance(5000)
+	local before = world:inspect().counters.renders
+	world:advance(60000)
+	local quiet = world:inspect().counters.renders - before
+	assert(quiet <= 7 + 2 * (#rails - 1), "a quiet minute renders per clock bucket, not per pass: " .. tostring(quiet))
+	before = world:inspect().counters.renders
+	setSecondRequest(world, true)
+	world:advance(100)
+	assert(world:inspect().counters.renders > before and queueCount(world, rails[1], "attention") == "2",
+		"a changed input renders and shows in the same pass")
+end
+
+-- Rails that keep lagging share the background paints: none is starved by the others. Each round renames every agent
+-- (a change that never repeats), so every background pick writes and the per-rail write counts compare fairly.
 do
 	local world, rails = mirroredWorld(4)
 	local sets = copy(world.canvasSetsByPane)
-	for round = 1, 20 do
-		setSecondRequest(world, round % 2 == 1)
-		world:advance(100)
+	for round = 1, 60 do
+		world.agentTitle = "Agent " .. round
+		world:emit("title", { pane = 10 })
+		world:advance(32)
 	end
 	local least, most = math.huge, 0
 	for index = 2, #rails do
@@ -2375,12 +2598,12 @@ do
 	world.root = { split = "down", ratio = 0.6, [1] = { pane = 10 }, [2] = { pane = 91 } }
 	world.layouts[4] = { split = "down", ratio = 0.6, [1] = { pane = 11 }, [2] = { pane = 92 } }
 	world.layouts[5] = { split = "down", ratio = 0.6, [1] = { pane = 12 }, [2] = { pane = 93 } }
-	world.prefs = { schema = 4, enabled = true, owner = "desktop", backlogAfterSeconds = 0,
+	world.prefs = { schema = 4, enabled = true, owner = "desktop",
 		defaults = { position = "bottom", shares = { left = {}, bottom = {}, right = {} }, hidden = {} }, uiByWindow = {},
 		instances = { ["local"] = {
-			["3"] = { tab = 3, session = 2, pane = 91, userHidden = false, position = "bottom", shares = { bottom = 0.4 } },
-			["4"] = { tab = 4, session = 2, pane = 92, userHidden = false, position = "bottom", shares = { bottom = 0.4 } },
-			["5"] = { tab = 5, session = 2, pane = 93, userHidden = true, position = "bottom", shares = { bottom = 0.4 } } } } }
+			["3"] = { tab = 3, session = 2, pane = 91, userHidden = false, position = "bottom" },
+			["4"] = { tab = 4, session = 2, pane = 92, userHidden = false, position = "bottom" },
+			["5"] = { tab = 5, session = 2, pane = 93, userHidden = true, position = "bottom" } } } }
 	world.additionalAgents = { [11] = "working", [12] = "working" }
 	world:advance(3100)
 	assert(queueCount(world, 92, "attention") == "1" and world.canvasSetsByPane[93] == nil,
@@ -2426,14 +2649,15 @@ end
 -- Catching a rail up is a paint and nothing else.
 do
 	local world, rails = mirroredWorld(3)
-	world:control(rails[1], "later"); world:advance(40)
+	world:toggleQueue(rails[1], "attention"); world:advance(40)
 	local before = { prefs = world.preferenceWrites, phone = world.phoneWrites, triage = world.triageWrites,
 		layout = world.layoutWrites, focus = world.focusWrites, native = world.nativeWrites - world.canvasSets,
 		settings = world.settingsWrites }
 	world:advance(1000)
 	for index = 2, #rails do
-		assert(nativeCanvas.childAt(headerPart(world, rails[index], "queues"), "later").p.role == "attention.queue-selected",
-			"a background rail follows the visible rail's mode")
+		assert(sectionRows(world, rails[index], "attention").p.hidden == true
+			and sectionRows(world, rails[index], "working").p.hidden == false,
+			"a background rail follows the visible rail's closed section")
 	end
 	assert(world.preferenceWrites == before.prefs and world.phoneWrites == before.phone and world.triageWrites == before.triage
 		and world.layoutWrites == before.layout and world.focusWrites == before.focus
@@ -2643,7 +2867,7 @@ do
 		return { tab = tab, session = 2, pane = pane, userHidden = hidden, position = position,
 			shares = { [position] = share }, placement = placement }
 	end
-	world.prefs = { schema = 3, enabled = true, owner = "desktop", backlogAfterSeconds = 0,
+	world.prefs = { schema = 3, enabled = true, owner = "desktop",
 		defaults = { position = "bottom", shares = { bottom = { ["local"] = 0.3 }, right = {} }, hidden = {} },
 		instances = { ["local"] = { ["3"] = entry(3, 91, "bottom", 0.32, false), ["4"] = entry(4, 92, "right", 0.3, false),
 			["5"] = entry(5, 93, "bottom", 0.3, true),
@@ -2661,8 +2885,8 @@ do
 		assert(saved.position == position and saved.relocate == nil and saved.share == nil and saved.placement == nil,
 			"tab " .. tab .. " keeps its position and drops the unreplayed legacy checkpoint")
 	end
-	assert(migrated.instances["local"]["4"].shares.right == 0.3 and migrated.instances["local"]["6"].shares.bottom == 0.4,
-		"every tab keeps its own size")
+	assert(migrated.instances["local"]["4"].shares == nil and migrated.instances["local"]["6"].shares == nil,
+		"per-tab sizes are dropped; widths live in the host defaults")
 	world:reload(); world:advance(100)
 	assert(world.preferenceWrites == 1 and equalValue(world.prefs, migrated), "migration is idempotent across reload")
 	world.zoomed = false
@@ -2713,26 +2937,27 @@ do
 		entries[tostring(tab)] = { tab = tab, session = 2, pane = rail, userHidden = tab % 7 == 0, share = 0.3,
 			relocate = true, note = "kept" }
 	end
-	world.prefs = { schema = 4, enabled = true, owner = "desktop", backlogAfterSeconds = 0,
+	world.prefs = { schema = 4, enabled = true, owner = "desktop",
 		defaults = { share = { ["local"] = 0.3 }, hidden = {} }, instances = { ["local"] = entries }, uiByWindow = {},
 		futureField = { kept = true } }
 	world:advance(100)
 	local stored = world.prefs
 	assert(world.preferenceWrites == 2, "one write strips the obsolete flag and one adopts every rail")
-	assert(stored.schema == 4 and stored.futureField.kept == true and stored.defaults.position == "bottom"
-		and stored.defaults.share == nil and stored.defaults.shares.left["local"] == 0.3,
-		"the default position is bottom; the old single size was a left size; unknown fields survive")
-	local expected = { bottom = "bottom", right = "right", left = "left", nested = "bottom" }
+	assert(stored.schema == 4 and stored.futureField.kept == true and stored.defaults.position == "left"
+		and stored.defaults.share == nil,
+		"the default position is left; the retired single size map is dropped, not migrated; unknown fields survive")
+	for _, edge in { "bottom", "right", "left" } do
+		local width = stored.defaults.shares[edge]["local"]
+		assert(width ~= nil and math.abs(width - 0.3) < 0.000001,
+			edge .. ": adoption records the physical width its rails were found at, once per host and position")
+	end
+	local expected = { bottom = "bottom", right = "right", left = "left", nested = "left" }
 	for tab = 3, 24 do
 		local saved = stored.instances["local"][tostring(tab)]
 		local kind = kinds[(tab - 3) % 4 + 1]
 		assert(saved.relocate == nil and saved.share == nil and saved.note == "kept" and saved.position == expected[kind],
 			"tab " .. tab .. " (" .. kind .. ") is adopted at its physical edge, the default when it has none")
-		assert((kind == "bottom" or kind == "right" or kind == "left")
-			== (saved.shares[saved.position] ~= nil and math.abs(saved.shares[saved.position] - 0.3) < 0.000001),
-			"tab " .. tab .. " records the size it actually has, and only at its own edge")
-		assert((saved.shares.left ~= nil) == (kind == "left"),
-			"the legacy size becomes a left size only for a rail adopted on the left")
+		assert(saved.shares == nil, "tab " .. tab .. " records no per-tab size")
 	end
 	for tab = 3, 24 do
 		assert(equalValue(if tab == 3 then world.root else world.layouts[tab], before[tab]),
@@ -2746,6 +2971,28 @@ do
 		"the settled store is idempotent: a reload writes and moves nothing")
 end
 
+-- Preferences written while Later existed load without error. The retired age cutoff is dropped; `later` leaves the
+-- stored queue order, and an order that is then not exactly Attention and Working falls back to the default. The
+-- load rewrites the store, and the mounted rail paints the migrated order.
+for _, case in ipairs({
+	{ stored = { "working", "later", "attention" }, expected = { "working", "attention" } },
+	{ stored = { "attention", "later" }, expected = { "attention", "working" } },
+}) do
+	local world = native(true)
+	world.prefs.backlogAfterSeconds = 21600
+	world.prefs.queueOrder = case.stored
+	world:advance(3100)
+	assert(toastCount(world, "error", "") == 0 and world:inspect().preferenceError == nil,
+		"a store carrying the retired Later fields loads without error")
+	assert(world.prefs.backlogAfterSeconds == nil and equalValue(world.prefs.queueOrder, case.expected),
+		"the rewritten store has no age cutoff and the migrated queue order")
+	local sections = {}
+	for _, section in ipairs(descend(world.canvases[world.opens[1].pane].view, "top", "stack").c or {}) do
+		table.insert(sections, section.p.key)
+	end
+	assert(equalValue(sections, case.expected), "the stack paints the migrated queue order")
+end
+
 -- A rail whose earlier creation or placement never finished is adopted where it physically is: the unreadable
 -- earlier checkpoint is dropped, never replayed, and the stored default never drags the rail to another edge.
 for _, interrupted in { "creating", "checkpoint" } do
@@ -2757,7 +3004,7 @@ for _, interrupted in { "creating", "checkpoint" } do
 	local entry = { tab = 3, session = 2, pane = 91, userHidden = false, relocate = true }
 	if interrupted == "creating" then entry.creating = true
 	else entry.placement = { status = "placing", checkpoint = { version = 2, tab = 3 }, generation = 1 } end
-	world.prefs = { schema = 4, enabled = true, owner = "desktop", backlogAfterSeconds = 0,
+	world.prefs = { schema = 4, enabled = true, owner = "desktop",
 		defaults = { position = "left", hidden = {} }, uiByWindow = {}, instances = { ["local"] = { ["3"] = entry } } }
 	local before = copy(world.root)
 	world:advance(3100)
@@ -2780,7 +3027,7 @@ do
 	world.parked[91] = true
 	world.floating[92], world.floats[4] = true, { { pane = 92 } }
 	world.layouts[5] = { split = "down", ratio = 0.5, [1] = { pane = 12 }, [2] = { pane = 93 } }
-	world.prefs = { schema = 4, enabled = true, owner = "desktop", backlogAfterSeconds = 0,
+	world.prefs = { schema = 4, enabled = true, owner = "desktop",
 		defaults = { position = "right", hidden = {} }, uiByWindow = {},
 		instances = { ["local"] = {
 			["3"] = { tab = 3, session = 2, pane = 91, userHidden = false, relocate = true },
@@ -2799,13 +3046,13 @@ do
 		"parked and floating rails stay parked and floating")
 end
 
--- A new rail opens at the default position, which is the bottom unless the preferences say otherwise.
+-- A new rail opens at the default position, which is the left edge unless the preferences say otherwise.
 for _, case in { "default", "bottom", "right", "left" } do
 	local world = native(true, nil, if case == "default" then "bottom" else case)
 	if case == "default" then world.prefs.defaults.position = nil end
 	world:advance(3100)
 	local pane = world.opens[1].pane
-	local position = if case == "default" then "bottom" else case
+	local position = if case == "default" then "left" else case
 	local saved = world.prefs.instances["local"]["3"]
 	if position == "left" then
 		assert(world.opens[1].options.dir == "left" and world.root.split == "right" and world.root[1].pane == pane
@@ -2818,8 +3065,26 @@ for _, case in { "default", "bottom", "right", "left" } do
 			and world.root[2].pane == pane and math.abs(world.root.ratio - 0.75) < 0.02,
 			case .. ": a bottom rail opens as the full-width bottom strip")
 	end
-	assert(saved.position == position and math.abs(saved.shares[position] - 0.25) < 0.02 and world.focusWrites == 0
-		and world.focused == 10, case .. ": the position and size are recorded and focus never moves")
+	assert(saved.position == position and saved.shares == nil and world.focusWrites == 0
+		and world.focused == 10, case .. ": the position is recorded with no per-tab size and focus never moves")
+end
+
+-- A divider drag is written once, when it has settled, as the host's width for that edge; a rail opened later uses it.
+do
+	local world = native(true)
+	world:addTab(4, 11)
+	world:advance(3100)
+	world.root.ratio = 0.33
+	local writes = world.preferenceWrites
+	world:emit("cwd", { pane = 10 }); world:advance(32)
+	assert(world.preferenceWrites == writes, "a divider still moving is not written")
+	world:emit("cwd", { pane = 10 }); world:advance(32)
+	assert(world.preferenceWrites == writes + 1 and math.abs(world.prefs.defaults.shares.left["local"] - 0.33) < 0.000001
+		and world.prefs.instances["local"]["3"].shares == nil, "a settled divider is written once, as the host's width")
+	world:advance(5000)
+	assert(world.preferenceWrites == writes + 1, "later passes write nothing more")
+	world:switch(4); world:advance(3100)
+	assert(math.abs(world.layouts[4].ratio - 0.33) < 0.02, "a rail opened later uses the host's width")
 end
 
 -- Choosing a position moves only this tab's rail, each position remembers its own size, and the choice becomes the
@@ -2830,9 +3095,9 @@ do
 	world:advance(3100)
 	local first = world.opens[1].pane
 	world.root.ratio = 0.6
-	world:advance(1100)
-	assert(math.abs(world.prefs.instances["local"]["3"].shares.bottom - 0.4) < 0.000001,
-		"a divider drag is remembered as the bottom size")
+	world:advance(3100)
+	assert(math.abs(world.prefs.defaults.shares.bottom["local"] - 0.4) < 0.000001,
+		"a settled divider drag is remembered as the host's bottom width")
 	world:switch(4); world:advance(3100)
 	local second = world.opens[2].pane
 	local untouched, writes = copy(world.layouts[4]), world.layoutWritesByTab[4] or 0
@@ -2842,13 +3107,14 @@ do
 	assert(world.root.split == "right" and world.root[1].pane == 10 and world.root[2].pane == first
 		and math.abs(world.root.ratio - 0.75) < 0.02, "Right moves the rail to the right edge at its own default size")
 	local saved = world.prefs.instances["local"]["3"]
-	assert(saved.position == "right" and math.abs(saved.shares.bottom - 0.4) < 0.000001 and world.prefs.defaults.position == "bottom",
-		"the choice is saved for the tab only; the default is untouched; the bottom size is remembered")
+	assert(saved.position == "right" and saved.shares == nil and world.prefs.defaults.position == "bottom"
+		and math.abs(world.prefs.defaults.shares.bottom["local"] - 0.4) < 0.000001,
+		"the choice is saved for the tab only; the default is untouched; the bottom width is remembered")
 	assert(equalValue(world.layouts[4], untouched) and (world.layoutWritesByTab[4] or 0) == writes
 		and world.prefs.instances["local"]["4"].position == "bottom", "only the chosen tab's rail moves")
 	world:command("this-tab-bottom"); world:advance(1500)
 	assert(world.root.split == "down" and world.root[2].pane == first and math.abs(world.root.ratio - 0.6) < 0.02,
-		"Bottom restores the size this tab's bottom rail last had")
+		"Bottom applies the host's bottom width")
 	world:command("this-tab-left"); world:advance(1500)
 	assert(world.root.split == "right" and world.root[1].pane == first and world.root[2].pane == 10
 		and math.abs(world.root.ratio - 0.25) < 0.02 and world.prefs.defaults.position == "bottom",
@@ -2895,8 +3161,9 @@ do
 	local allWrites = world.layoutWrites
 	world:control(rails[3], "settings"); world:advance(100)
 	world:command("all-tabs-bottom"); world:advance(1500)
-	assert(toastCount(world, "info", "Marked 2 tabs · 3 left as they are") == 1,
-		"two settled left rails are marked; the hidden, parked and floating rails are counted as left alone")
+	assert(toastCount(world, "info", "This tab moves now · 1 tab moves on their next visit · left as they are: "
+		.. "1 hidden, 2 parked or floating") == 1,
+		"the selected tab starts now, the unvisited tab waits for its visit, and each kept rail is counted by reason")
 	assert(world.root.split == "down" and world.root[2].pane == rails[3] and world.prefs.defaults.position == "bottom",
 		"the selected tab starts at once and the position becomes the default")
 	local stored = world.prefs.instances["local"]
@@ -2945,7 +3212,8 @@ do
 	world.zoomed = true
 	local writes = world.layoutWrites
 	world:command("all-tabs-bottom"); world:advance(1500)
-	assert(toastCount(world, "info", "Marked 2 tabs · 0 left as they are") == 1, "both rails are marked")
+	assert(toastCount(world, "info", "2 tabs move on their next visit") == 1,
+		"both rails are marked; the zoomed selected tab keeps its marker and is not reported as moving")
 	assert(world.prefs.instances["local"]["3"].moveTo == "bottom" and world.layoutWrites == writes
 		and world.root.split == "right", "a zoomed tab is marked but not moved")
 	world:advance(3000)
@@ -2957,8 +3225,8 @@ do
 	assert(world.layouts[4].split == "right" and world.layouts[4][1].pane == second, "the other tab still waits for its visit")
 end
 
--- A rail on a host that is offline cannot be marked or moved, and "All tabs" says so: it is counted as left as it
--- is, and its stored entry and layout are untouched, while the connected rail is marked normally.
+-- Left for all marks a rail on an offline host as well: its stored entry carries the marker, nothing is moved while
+-- the host is away, and the rail moves on its first visit after the host connects.
 do
 	local world = native(true)
 	world:addTab(4, 11, 5, 7)
@@ -2971,15 +3239,46 @@ do
 		"fixture: a local rail and a remote rail both sit on the left")
 	world.hostStates[5] = "disconnected"
 	world:advance(1100)
-	local stored, tree, writes = copy(world.prefs.instances["host-5"]["4"]), copy(world.layouts[4]), world.layoutWritesByTab[4] or 0
+	local tree, writes = copy(world.layouts[4]), world.layoutWritesByTab[4] or 0
 	world:command("all-tabs-bottom"); world:advance(1500)
-	assert(toastCount(world, "info", "Marked 1 tab · 1 left as they are") == 1,
-		"the connected rail is marked and the rail on the offline host is counted as left as it is")
+	assert(toastCount(world, "info", "This tab moves now · 1 tab moves on their next visit") == 1,
+		"the connected rail moves now and the offline host's rail is queued for its next visit")
 	assert(world.root.split == "down" and world.root[2].pane == here, "the connected rail moves")
-	assert(equalValue(world.prefs.instances["host-5"]["4"], stored) and world.prefs.instances["host-5"]["4"].moveTo == nil
-		and world.prefs.instances["host-5"]["4"].position == "left", "the offline host's stored entry is untouched")
-	assert(equalValue(world.layouts[4], tree) and (world.layoutWritesByTab[4] or 0) == writes and world.canvases[remote],
-		"the offline host's rail is not moved")
+	local offline = world.prefs.instances["host-5"]["4"]
+	assert(offline.moveTo == "bottom" and offline.position == "left" and equalValue(world.layouts[4], tree)
+		and (world.layoutWritesByTab[4] or 0) == writes and world.canvases[remote],
+		"the offline host's rail is marked and not moved while the host is away")
+	world.hostStates[5] = nil
+	world:advance(1100)
+	world:switch(4); world:advance(3100)
+	assert(world.layouts[4].split == "down" and world.layouts[4][2].pane == remote
+		and world.prefs.instances["host-5"]["4"].moveTo == nil and world.prefs.instances["host-5"]["4"].position == "bottom",
+		"the rail moves on its first visit after the host connects")
+end
+
+-- The selected tab on an offline host is not an eligible visit: its mark stays while the host is away, and the rail
+-- moves on the next pass after the host connects.
+do
+	local world = native(true)
+	world:addTab(4, 11, 5, 7)
+	world:advance(3100)
+	world:switch(4); world:advance(3100)
+	local remote = world.opens[2].pane
+	assert(world.prefs.instances["host-5"]["4"] and world.layouts[4].split == "right",
+		"fixture: the selected tab is on the remote host with its rail on the left")
+	world.hostStates[5] = "disconnected"
+	world:advance(1100)
+	local tree, writes = copy(world.layouts[4]), world.layoutWritesByTab[4] or 0
+	world:command("all-tabs-bottom"); world:advance(3000)
+	local offline = world.prefs.instances["host-5"]["4"]
+	assert(offline.moveTo == "bottom" and offline.position == "left" and equalValue(world.layouts[4], tree)
+		and (world.layoutWritesByTab[4] or 0) == writes and toastCount(world, "info", "This tab moves now") == 0,
+		"the selected tab on an offline host keeps its mark and does not move")
+	world.hostStates[5] = nil
+	world:advance(3100)
+	assert(world.layouts[4].split == "down" and world.layouts[4][2].pane == remote
+		and world.prefs.instances["host-5"]["4"].moveTo == nil and world.prefs.instances["host-5"]["4"].position == "bottom",
+		"the rail moves once the host connects")
 end
 
 -- Hiding, parking or floating a marked rail, or moving it by hand, drops the marker without moving anything; a
@@ -3046,9 +3345,9 @@ end
 
 do
 	local world = native(true)
-	world.prefs = { schema = 4, enabled = true, owner = "desktop", backlogAfterSeconds = 0, uiByWindow = {},
+	world.prefs = { schema = 4, enabled = true, owner = "desktop", uiByWindow = {},
 		defaults = { position = "bottom", shares = { left = {}, bottom = {}, right = {} }, hidden = {} },
-		instances = { ["local"] = { ["3"] = { tab = 3, session = 2, userHidden = false, position = "left", shares = {},
+		instances = { ["local"] = { ["3"] = { tab = 3, session = 2, userHidden = false, position = "left",
 			moveTo = "banana" } } } }
 	local original = copy(world.prefs)
 	world:advance(3100)
@@ -3064,10 +3363,10 @@ do
 	world:addTab(4, 11); world:addTab(5, 12)
 	world:advance(3100)
 	local first = world.opens[1].pane
-	world.prefs.instances["local"]["5"] = { tab = 5, session = 2, userHidden = false, position = "left", shares = {} }
+	world.prefs.instances["local"]["5"] = { tab = 5, session = 2, userHidden = false, position = "left" }
 	world:advance(1100)
 	world:command("all-tabs-right"); world:advance(1500)
-	assert(toastCount(world, "info", "Marked 1 tab · 0 left as they are") == 1, "only the mounted rail is marked")
+	assert(toastCount(world, "info", "This tab moves now") == 1, "only the mounted rail moves now")
 	assert(world.root.split == "right" and world.root[2].pane == first and world.prefs.defaults.position == "right")
 	assert(world.prefs.instances["local"]["5"].position == "right" and world.prefs.instances["local"]["5"].moveTo == nil,
 		"an instance with nothing mounted takes the new position without a marker")
@@ -3095,7 +3394,7 @@ do
 	world:advance(1100)
 	local tree, writes = copy(world.root), world.layoutWrites
 	world:command("all-tabs-bottom"); world:advance(3000)
-	assert(toastCount(world, "info", "Marked 1 tab · 0 left as they are") == 1, "the crowded tab is marked")
+	assert(toastCount(world, "info", "This tab moves now") == 1, "the crowded tab moves now and then settles")
 	local saved = world.prefs.instances["local"]["3"]
 	assert(saved.moveTo == nil and saved.placement == nil and world:inspect().instances[1].phase == "ready",
 		"a degraded placement settles and leaves no marker")
@@ -3170,20 +3469,22 @@ end
 do
 	local world = native(true)
 	world.prefs.uiByWindow = {
-		desktop = { section = "settings", collapsed = { ["host:1:local"] = true, [5] = true, bad = "yes" },
+		desktop = { section = "settings",
+			collapsed = { ["host:1:local"] = true, ["session:local#2"] = false, [5] = true, bad = "yes" },
 			setAsideOpen = { ["aside:tab:local#3"] = true } },
-		other = { section = "later", collapsed = {}, setAsideOpen = {} },
+		other = { section = "working", collapsed = {} },
 	}
 	world:advance(3100)
 	local pane = world.opens[1].pane
-	world:control(pane, "settings"); world:advance(50)
-	world:control(pane, "age-3"); world:advance(50)
+	world:toggleQueue(pane, "working"); world:advance(50)
 	local saved = world.prefs.uiByWindow
-	assert(world.prefs.schema == 4 and world.prefs.backlogAfterSeconds == 10800, "the unrelated preference saved")
+	assert(world.prefs.schema == 4 and world.preferenceWrites >= 1, "the unrelated preference saved")
 	assert(saved.desktop.section == "attention" and saved.desktop.collapsed["host:1:local"] == true
 		and saved.desktop.collapsed[5] == nil and saved.desktop.collapsed.bad == nil
-		and saved.desktop.setAsideOpen["aside:tab:local#3"] == true and saved.other.section == "later",
-		"transient sections and foreign keys are dropped while valid state and other windows survive")
+		and saved.desktop.setAsideOpen == nil and saved.other.section == "working",
+		"transient sections, foreign keys and the retired Set aside state are dropped while valid state and other windows survive")
+	assert(saved.desktop.collapsed["session:local#2"] == false,
+		"an explicitly opened group survives as false where a collapsed entry is tri-state")
 end
 
 -- A left rail wraps nested content that also has a floating pane, preserving every divider and the float.
@@ -3260,7 +3561,7 @@ for _, interruptedReply in { false, true } do
 end
 
 local function beacon(world, pane)
-	local group = nativeCanvas.childAt(world.canvases[pane].view, "rows")
+	local group = sectionRows(world, pane, "attention")
 	for _, row in ipairs(group.c) do
 		assert(row.p.role ~= "attention.row-arrival" and row.p.role ~= "attention.row-arrival-again",
 			"individual rows never own the collective cue")
@@ -3288,21 +3589,21 @@ local function acceptedCues(world)
 	return cues
 end
 
-for _, completion in ipairs({ "visible", "early", "snoozed" }) do
+for _, completion in ipairs({ "visible", "early", "finished" }) do
 	local world = native(true)
 	world.agentState, world.agentAlert = "idle", true
 	world:advance(3100)
 	local pane = world.opens[1].pane
-	local previousOpen = rowAction(world.canvases[pane].view)
+	local previousOpen = rowAction(shown(world, pane))
 	assert(previousOpen and not beacon(world, pane), "pre-existing unseen attention seeds a quiet baseline")
-	if completion == "snoozed" then
-		world:click(pane, rowAction(world.canvases[pane].view, "menu")); world:choose(1); world:advance(100)
-		assert(not rowAction(world.canvases[pane].view), "the existing unseen request moves to Backlog")
+	if completion == "finished" then
+		world:click(pane, rowAction(shown(world, pane), "menu")); world:chooseLabel("Finished for now · current scope"); world:advance(100)
+		assert(not rowAction(shown(world, pane)), "the existing unseen request leaves Attention as Finished")
 	end
 	local earlierRevision = world.savedTriage.items[1].reviewRevision
 	world.agentState = "working"
 	world:emit("agent_state", { pane = 10, old = "idle", new = "working" }); world:advance(32)
-	assert(not rowAction(world.canvases[pane].view) and world:inspect().attentionCount == 0
+	assert(not rowAction(shown(world, pane)) and world:inspect().attentionCount == 0
 		and world.savedTriage.items[1].reviewRevision == earlierRevision and not beacon(world, pane),
 		"continuous native alert cannot keep an earlier unread review in Attention during a fresh turn")
 	if completion ~= "early" then world.agentState = "idle" end
@@ -3311,19 +3612,19 @@ for _, completion in ipairs({ "visible", "early", "snoozed" }) do
 	assert(completionRevision ~= nil and completionRevision ~= earlierRevision,
 		"literal completion records a new unread revision even before runtime inventory settles")
 	if completion == "early" then
-		assert(not rowAction(world.canvases[pane].view) and world:inspect().attentionCount == 0 and not beacon(world, pane),
+		assert(not rowAction(shown(world, pane)) and world:inspect().attentionCount == 0 and not beacon(world, pane),
 			"a completion with lagging working inventory is recorded but not presented or cued")
 		world:advance(5100)
 		assert(world.savedTriage.items[1].reviewRevision == completionRevision
-			and not rowAction(world.canvases[pane].view) and not beacon(world, pane),
+			and not rowAction(shown(world, pane)) and not beacon(world, pane),
 			"the recorded completion survives more than five seconds without leaking into the working queue")
 		world.agentState = "idle"
 		world:emit("agent_state", { pane = 10, old = "working", new = "idle" }); world:advance(32)
 	end
-	local completionOpen = rowAction(world.canvases[pane].view)
-	if completion == "snoozed" then
-		assert(world.agentAlert and completionOpen == nil and world:inspect().laterCount == 1 and not beacon(world, pane),
-			"ordinary completion cannot interrupt explicit Later or replay a cue")
+	local completionOpen = rowAction(shown(world, pane))
+	if completion == "finished" then
+		assert(world.agentAlert and completionOpen == nil and world:inspect().attentionCount == 0 and not beacon(world, pane),
+			"ordinary completion cannot interrupt explicit Finished or replay a cue")
 	else
 		assert(world.agentAlert and completionOpen and completionOpen ~= previousOpen
 			and world:inspect().attentionCount == 1 and beacon(world, pane)
@@ -3336,12 +3637,12 @@ for _, completion in ipairs({ "visible", "early", "snoozed" }) do
 		"duplicate completion delivery neither creates a revision nor requeues a cue after cooldown")
 	world.agentState = "working"
 	world:emit("agent_state", { pane = 10, old = "idle", new = "working" }); world:advance(32)
-	assert(not rowAction(world.canvases[pane].view) and not beacon(world, pane),
+	assert(not rowAction(shown(world, pane)) and not beacon(world, pane),
 		"starting another turn under continuous alert removes passive review without replaying completion")
 	world.agentState = "idle"
 	world:emit("agent_finished", { pane = 10, result = "done" }); world:advance(32)
-	assert(world.agentAlert and (if completion == "snoozed" then not beacon(world, pane) else beacon(world, pane)),
-		"later output remains deferred; an active later turn can cue without resetting native alert")
+	assert(world.agentAlert and (if completion == "finished" then not beacon(world, pane) else beacon(world, pane)),
+		"later output stays out of Attention for Finished work; an active turn can cue without resetting native alert")
 	assert(world.focusWrites == 0, "completion-to-cue delivery never navigates or acknowledges the request")
 end
 
@@ -3350,7 +3651,7 @@ for _, failure in ipairs({ "canvas", "maintenance" }) do
 	world.agentState = "working"
 	world:advance(3100)
 	local pane = world.opens[1].pane
-	assert(not beacon(world, pane) and not rowAction(world.canvases[pane].view),
+	assert(not beacon(world, pane) and not rowAction(shown(world, pane)),
 		"initial empty P0 is quiet")
 	world.canvasPaints = {}
 	if failure == "canvas" then world.failNextCanvasSet = true
@@ -3358,13 +3659,13 @@ for _, failure in ipairs({ "canvas", "maintenance" }) do
 	world.agentState = "waiting_input"
 	world:emit("agent_state", { pane = 10, old = "working", new = "waiting_input" })
 	world:advance(32)
-	assert(#world.canvasPaints == 0 and not rowAction(world.canvases[pane].view) and not beacon(world, pane),
+	assert(#world.canvasPaints == 0 and not rowAction(shown(world, pane)) and not beacon(world, pane),
 		"rejected arrival pass has not painted the request or started a cue")
 	local rejectedAt = world.now
 	while #world.canvasPaints == 0 and world.now < rejectedAt + 3000 do world:advance(1) end
 	assert(#world.canvasPaints > 0, "the request must reach a healthy paint within the three-second retry bound")
 	local deliveredAt, first = world.canvasPaints[1].at, beacon(world, pane)
-	assert(deliveredAt < rejectedAt + 3000 and rowAction(world.canvases[pane].view),
+	assert(deliveredAt < rejectedAt + 3000 and rowAction(shown(world, pane)),
 		"the first healthy pass recovers the request before its cue reservation expires")
 	assert(first and world.canvasPaints[1].role == first and #acceptedCues(world) == 1,
 		"a transient " .. failure .. " failure must retain exactly one eligible cue until paint accepts it")
@@ -3375,7 +3676,7 @@ for _, failure in ipairs({ "canvas", "maintenance" }) do
 	assert(beacon(world, pane) == first, "the recovered cue lasts until its accepted-paint deadline")
 	world:advance(1)
 	assert(not beacon(world, pane)
-		and nativeCanvas.childAt(world.canvases[pane].view, "rows").p.role == "attention.rows-occupied",
+		and sectionRows(world, pane, "attention").p.role == "attention.rows-occupied",
 		"the recovered cue retires at 900ms while occupied P0 retains its permanent tint")
 	world:advance(deliveredAt + 2999 - 32 - world.now)
 	world.agentAlert = true
@@ -3413,8 +3714,8 @@ for _, interruption in ipairs({ "section", "tab", "reload", "expiry" }) do
 	world:emit("title", { pane = 10 }); world:advance(32)
 	assert(not beacon(world, pane), "a rejected canvas update leaves no accepted cue")
 	if interruption == "section" then
-		world:control(pane, "later"); world:advance(32)
-		world:control(pane, "attention"); world:advance(1100)
+		world:toggleQueue(pane, "attention"); world:advance(32)
+		world:toggleQueue(pane, "attention"); world:advance(1100)
 	elseif interruption == "tab" then
 		world:switch(4); world:advance(1100)
 		assert(not beacon(world, world.opens[2].pane), "a pending cue cannot migrate to another tab")
@@ -3431,7 +3732,7 @@ for _, interruption in ipairs({ "section", "tab", "reload", "expiry" }) do
 	if interruption == "expiry" then
 		assert(#world.canvasPaints > 0
 			and world.canvasPaints[1].at >= world.failCanvasUntil
-			and nativeCanvas.childAt(world.canvases[pane].view, "rows").p.role == "attention.rows-occupied",
+			and sectionRows(world, pane, "attention").p.role == "attention.rows-occupied",
 			"the first healthy paint after the three-second reservation bound is quiet but remains tinted")
 	end
 	world:advance(3100)
@@ -3453,64 +3754,58 @@ do
 		world:advance(ms)
 		assert(#world.toasts == before, "arrival processing never emits native alerts")
 	end
-	local function queueLabel(queue)
-		local queues = headerPart(world, pane, "queues")
-		local item = nativeCanvas.childAt(queues, queue)
-		return nativeCanvas.childAt(item, "label").p.text .. " · " .. nativeCanvas.childAt(item, "count").p.text
-	end
-	assert(#nativeCanvas.childAt(world.canvases[pane].view, "rows").c == 1 and not beacon(world, pane),
+	assert(#sectionRows(world, pane, "attention").c == 1 and not beacon(world, pane),
 		"the initial occupied list is quiet")
-	local open = rowAction(world.canvases[pane].view)
+	local open = rowAction(shown(world, pane))
 	world.agentAlert = true
 	world:emit("title", { pane = 10 }); advanceQuietly(100)
 	local first = beacon(world, pane)
-	assert(first and #nativeCanvas.childAt(world.canvases[pane].view, "rows").c == 1,
+	assert(first and #sectionRows(world, pane, "attention").c == 1,
 		"one occupied row receives the list band")
-	assert(rowAction(world.canvases[pane].view) ~= open, "new review evidence receives a distinct Open token")
-	open = rowAction(world.canvases[pane].view)
+	assert(rowAction(shown(world, pane)) ~= open, "new review evidence receives a distinct Open token")
+	open = rowAction(shown(world, pane))
 	world.additionalAgents[11] = "waiting_input"
 	world:emit("agent_state", { pane = 11, old = "working", new = "waiting_input" }); advanceQuietly(100)
-	local rows = nativeCanvas.childAt(world.canvases[pane].view, "rows").c
-	local snoozeSecond = rowAction(rows[2], "menu")
-	assert(#rows == 2 and beacon(world, pane) == first and queueLabel("attention") == "Attention · 2",
+	local rows = sectionRows(world, pane, "attention").c
+	local secondMenu = rowAction(rows[2], "menu")
+	assert(#rows == 2 and beacon(world, pane) == first and queueLabel(world, pane, "attention") == "Attention · 2",
 		"a second arrival joins the existing band and immediately updates the count")
 	assert(rowAction(rows[1]) == open, "group updates preserve existing row action targets")
 	world.additionalAgents[12] = "waiting_input"
 	world:emit("agent_state", { pane = 12, old = "working", new = "waiting_input" }); advanceQuietly(100)
-	assert(#nativeCanvas.childAt(world.canvases[pane].view, "rows").c == 3
-		and beacon(world, pane) == first and queueLabel("attention") == "Attention · 3",
+	assert(#sectionRows(world, pane, "attention").c == 3
+		and beacon(world, pane) == first and queueLabel(world, pane, "attention") == "Attention · 3",
 		"three occupied rows share one unchanged band")
 	world.agentState, world.agentAlert = "working", false
 	world:emit("agent_state", { pane = 10, old = "waiting_input", new = "working" }); advanceQuietly(100)
-	local remaining = nativeCanvas.childAt(world.canvases[pane].view, "rows").c
-	assert(#remaining == 2 and rowAction(remaining[1], "menu") == snoozeSecond
-		and queueLabel("attention") == "Attention · 2" and beacon(world, pane) == first,
+	local remaining = sectionRows(world, pane, "attention").c
+	assert(#remaining == 2 and rowAction(remaining[1], "menu") == secondMenu
+		and queueLabel(world, pane, "attention") == "Attention · 2" and beacon(world, pane) == first,
 		"resumed work leaves Attention while other requests retain their bindings and shared cue deadline")
 	advanceQuietly(300)
 	world.agentState = "waiting_input"
 	world:emit("agent_state", { pane = 10, old = "working", new = "waiting_input" }); advanceQuietly(100)
-	assert(beacon(world, pane) == first and queueLabel("attention") == "Attention · 3",
+	assert(beacon(world, pane) == first and queueLabel(world, pane, "attention") == "Attention · 3",
 		"a late burst neither restarts nor intensifies the active cue; now=" .. tostring(world.now)
 			.. " cue=" .. tostring(beacon(world, pane)) .. " first=" .. tostring(first)
-			.. " queue=" .. queueLabel("attention") .. " native=" .. tostring(savedItemFor(world, 10).nativeState)
+			.. " queue=" .. queueLabel(world, pane, "attention") .. " native=" .. tostring(savedItemFor(world, 10).nativeState)
 			.. " waiting=" .. tostring(savedItemFor(world, 10).waiting))
 	advanceQuietly(200)
 	world:emit("title", { pane = 10 }); advanceQuietly(100)
 	assert(not beacon(world, pane),
 		"the original 900ms deadline wins even when the last arrival is much younger")
-	world:click(pane, snoozeSecond); world:choose(1); advanceQuietly(100)
-	assert(queueLabel("attention") == "Attention · 2" and queueLabel("later") == "Later · 1")
 	world.additionalAgents[11] = "working"
 	world:emit("agent_state", { pane = 11, old = "waiting_input", new = "working" }); advanceQuietly(100)
+	assert(queueLabel(world, pane, "attention") == "Attention · 2" and queueCount(world, pane, "working") == "1")
 	world.additionalAgents[11] = "waiting_input"
 	world:emit("agent_state", { pane = 11, old = "working", new = "waiting_input" }); advanceQuietly(100)
-	assert(not beacon(world, pane) and queueLabel("attention") == "Attention · 3" and queueLabel("later") == "Later · 0"
-		and #nativeCanvas.childAt(world.canvases[pane].view, "rows").c == 3,
+	assert(not beacon(world, pane) and queueLabel(world, pane, "attention") == "Attention · 3" and queueCount(world, pane, "working") == "0"
+		and #sectionRows(world, pane, "attention").c == 3,
 		"a fresh native episode within the three-second rate cap updates rows and counts without a new cue")
 	advanceQuietly(1300)
 	world.agentAlert = true
 	world:emit("title", { pane = 10 }); advanceQuietly(100)
-	assert(not beacon(world, pane) and queueLabel("attention") == "Attention · 3",
+	assert(not beacon(world, pane) and queueLabel(world, pane, "attention") == "Attention · 3",
 		"a new native revision near the end of the full three-second window is still consumed quietly")
 	advanceQuietly(400)
 	assert(not beacon(world, pane), "rate-limited arrivals never enqueue a trailing catch-up pulse")
@@ -3545,9 +3840,8 @@ do
 	world:advance(200)
 	world.additionalAgents[11] = "waiting_input"
 	world:emit("agent_state", { pane = 11, old = "working", new = "waiting_input" }); world:advance(32)
-	local queues = headerPart(world, pane, "queues")
-	assert(#nativeCanvas.childAt(world.canvases[pane].view, "rows").c == 2
-		and nativeCanvas.childAt(nativeCanvas.childAt(queues, "attention"), "count").p.text == "2" and beacon(world, pane) == first,
+	assert(#sectionRows(world, pane, "attention").c == 2
+		and queueCount(world, pane, "attention") == "2" and beacon(world, pane) == first,
 		"the pending retirement timer never delays ordinary arrival rows or counts")
 	assert(world:activeTimers() == 2 and not retirement.cancelled and retirement.due == started + 900,
 		"an active-cue update neither restarts its timer nor adds animation-frame timers")
@@ -3582,7 +3876,7 @@ do
 	world:advance(3100)
 	local pane = world.opens[1].pane
 	assert(not beacon(world, pane), "initial successful projection is a quiet baseline")
-	local open, snooze = rowAction(world.canvases[pane].view), rowAction(world.canvases[pane].view, "menu")
+	local open = rowAction(shown(world, pane))
 	world:emit("agent_state", { pane = 10, old = "waiting_input", new = "waiting_input" })
 	world:advance(100)
 	assert(not beacon(world, pane), "repeated pending requests are not arrivals")
@@ -3594,7 +3888,7 @@ do
 	world:advance(100)
 	local first = beacon(world, pane)
 	assert(first, "a genuinely new attention revision cues the queue")
-	assert(rowAction(world.canvases[pane].view) ~= open and rowAction(world.canvases[pane].view, "menu") ~= nil,
+	assert(rowAction(shown(world, pane)) ~= open and rowAction(shown(world, pane), "menu") ~= nil,
 		"new review evidence has a new Open token and a current revision-bound menu")
 	world.agentAlert = false
 	world:emit("title", { pane = 10 }); world:advance(100)
@@ -3603,15 +3897,6 @@ do
 	assert(beacon(world, pane) == first, "event bursts preserve one finite pulse")
 	world:advance(1800)
 	assert(not beacon(world, pane), "heartbeat retires the finite cue without replay")
-	snooze = rowAction(world.canvases[pane].view, "menu")
-	world:click(pane, snooze); world:choose(1); world:advance(100)
-	world:control(pane, "later"); world:advance(100)
-	local restore = rowAction(world.canvases[pane].view, "menu")
-	assert(restore, "the same pending request is available in Backlog")
-	world:click(pane, restore); world:choose(1); world:advance(100)
-	world:control(pane, "attention"); world:advance(100)
-	assert(not beacon(world, pane), "manual Restore is not new attention")
-	world:click(pane, rowAction(world.canvases[pane].view, "menu")); world:choose(1); world:advance(100)
 	world:advance(1000)
 	world.agentState, world.agentAlert = "working", false
 	world:emit("agent_state", { pane = 10, old = "waiting_input", new = "working" }); world:advance(100)
@@ -3623,16 +3908,47 @@ do
 	assert(world.focusWrites == 0, "queue arrivals never navigate")
 end
 
-for _, section in ipairs({ "later", "settings" }) do
+-- A folded queue section opens itself when a conversation arrives in it: the arrival is seen (and Attention's cue
+-- plays) without a click. Folding it again sticks until the next arrival.
+do
 	local world = native(true)
 	world:advance(3100)
 	local pane = world.opens[1].pane
-	world:control(pane, section); world:advance(100)
+	local function open(queue)
+		local toggle = descend(world.canvases[pane].view, "top", "stack", queue, "head", "toggle")
+		return string.find(toggle.p.title, "^Hide ") ~= nil
+	end
+	world:toggleQueue(pane, "attention"); world:advance(100)
+	world:toggleQueue(pane, "working"); world:advance(100)
+	assert(not open("attention") and not open("working"), "both sections start folded")
+	world.agentAlert = true
+	world:emit("title", { pane = 10 }); world:advance(100)
+	assert(open("attention"), "an arrival opens folded Attention")
+	assert(beacon(world, pane), "the arrival's cue plays in the section it opened")
+	assert(not open("working"), "an Attention arrival leaves Working as the user left it")
+	world:toggleQueue(pane, "attention"); world:advance(3100)
+	assert(not open("attention"), "folding again sticks while nothing new arrives")
+	world.agentAlert = false
+	world.agentState = "working"
+	world:emit("agent_state", { pane = 10, old = "waiting_input", new = "working" }); world:advance(6100)
+	assert(open("working") and queueCount(world, pane, "working") == "1", "a conversation that starts working opens folded Working")
+end
+
+-- Attention is out of sight while the settings panel replaces the stack; the same control hides it and brings it back.
+for _, hiding in ipairs({ "settings" }) do
+	local world = native(true)
+	world:advance(3100)
+	local pane = world.opens[1].pane
+	local function toggle()
+		if hiding == "settings" then world:control(pane, "settings") else world:toggleQueue(pane, "attention") end
+		world:advance(100)
+	end
+	toggle()
 	world.agentAlert = true
 	world:emit("title", { pane = 10 }); world:advance(100)
 	assert(not beacon(world, pane), "hidden P0 arrivals are consumed, not displayed")
-	world:control(pane, "attention"); world:advance(100)
-	assert(not beacon(world, pane), "section selection does not replay an arrival")
+	toggle()
+	assert(not beacon(world, pane), "showing Attention again does not replay an arrival")
 	world:advance(3100)
 	assert(not beacon(world, pane), "a hidden arrival is not queued until the rate window expires")
 	world.agentAlert = false
@@ -3640,8 +3956,8 @@ for _, section in ipairs({ "later", "settings" }) do
 	world.agentAlert = true
 	world:emit("title", { pane = 10 }); world:advance(100)
 	assert(beacon(world, pane), "fresh visible attention can cue after a consumed hidden arrival")
-	world:control(pane, section); world:advance(100)
-	world:control(pane, "attention"); world:advance(100)
+	toggle()
+	toggle()
 	assert(not beacon(world, pane), "leaving the queue retires an active cue instead of pausing it")
 end
 
@@ -3698,14 +4014,13 @@ do
 	local world = native(true)
 	world:addTab(4, 11)
 	world:addTab(5, 12, 8, 9)
-	world.additionalAgents = { [11] = "idle" }
+	world.additionalAgents = { [11] = "working" }
 	world:advance(3100)
 	local rail = world.opens[1].pane
-	world:control(rail, "workspace"); world:advance(100)
-	world:click(rail, rowAction(renderedRowFor(world, rail, 11), "menu")); world:choose(1); world:advance(100)
+	world:control(rail, "attention"); world:advance(100)
 	world:control(rail, "attention"); world:advance(100)
 	local function counts()
-		return { queueCount(world, rail, "attention"), queueCount(world, rail, "later"), tostring(world:inspect().allCount) }
+		return { queueCount(world, rail, "attention"), queueCount(world, rail, "working"), tostring(world:inspect().allCount) }
 	end
 	local before = counts()
 	assert(before[1] == "1" and before[2] == "1" and before[3] == "2")
@@ -3713,7 +4028,7 @@ do
 	world:advance(9000)
 	local offline = counts()
 	assert(offline[1] == before[1] and offline[2] == before[2] and offline[3] == before[3],
-		"an offline laptop cannot change counts of tracked local Attention, Later or All work")
+		"an offline laptop cannot change counts of tracked local Attention, Working or All work")
 	assert(world:inspect().status == "partial" and world:inspect().count == nil,
 		"tracked queue counts do not falsely establish complete remote coverage")
 	world.focused = rail
@@ -3752,7 +4067,7 @@ for _, origin in { "next", "open" } do
 	world.focused = rail
 	world:command("next"); world:advance(100)
 	assert(world.focused == 10, "global round visits A before attempting B")
-	local targetRow = nativeCanvas.childAt(world.canvases[rail].view, "rows").c[2]
+	local targetRow = sectionRows(world, rail).c[2]
 	local targetKey, targetAction = targetRow.p.key, rowAction(targetRow)
 	if origin == "next" then world:command("next") else world:click(rail, targetAction) end
 	assert(world.focused == 11 and world:inspect().navigationPending,
@@ -3762,7 +4077,7 @@ for _, origin in { "next", "open" } do
 	local notifications = #world.toasts
 	world:switch(3); world:advance(1100)
 	local failed = world:inspect()
-	local movedRow = nativeCanvas.childAt(world.canvases[rail].view, "rows").c[2]
+	local movedRow = sectionRows(world, rail).c[2]
 	local explained = false
 	for index = notifications + 1, #world.toasts do
 		if world.toasts[index].kind == "error" then explained = true end
@@ -3789,7 +4104,7 @@ do
 	local world = native(true)
 	world:advance(3100)
 	local rail = world.opens[1].pane
-	local action = rowAction(world.canvases[rail].view, "next")
+	local action = keyedAction(world.canvases[rail].view, "next")
 	world.failInventory = true
 	world:click(rail, action)
 	assert(world.focusWrites == 0 and #world.sessionSwitches == 0 and #world.toasts > 0,
@@ -3799,7 +4114,7 @@ do
 		"an unavailable inventory paints the paused line instead of stale evidence")
 	world.failInventory = false
 	world:advance(1100)
-	assert(headerPart(world, rail, "queues") ~= nil, "recovered inventory repaints the toolbar in place of the paused line")
+	assert(headerPart(world, rail, "tools") ~= nil, "recovered inventory repaints the toolbar in place of the paused line")
 end
 
 do
@@ -3834,24 +4149,24 @@ do
 	assert(world.layoutWrites == arrivalLayoutWrites and world.focusWrites == 0,
 		"new completion updates Attention without any layout or focus write")
 	local rail = world.opens[1].pane
-	world:click(rail, rowAction(renderedRowFor(world, rail, 12), "menu")); world:choose(1); world:advance(100)
-	assert(world:inspect().attentionCount == 2 and world:inspect().laterCount == 1)
+	world:click(rail, rowAction(renderedRowFor(world, rail, 12), "menu")); world:chooseLabel("Finished for now · current scope"); world:advance(100)
+	assert(world:inspect().attentionCount == 2 and savedItemFor(world, 12).disposition == "finished")
 	local writes = world.layoutWrites
 	world.agentAlert = false
 	world:reload(); world:advance(1100)
 	local saved = world:inspect()
-	assert(saved.attentionCount == 2 and saved.laterCount == 1 and #world.savedTriage.items == 3,
-		"reload and false native alert retain two P0 records and independent Chrome Backlog")
+	assert(saved.attentionCount == 2 and savedItemFor(world, 12).disposition == "finished" and #world.savedTriage.items == 3,
+		"reload and false native alert retain two P0 records and the independent Chrome Finished record")
 	assert(world.layoutWrites == writes and world.focusWrites == 0,
 		"durable queue restoration never writes layout or focus")
-	assert(queueCount(world, rail, "attention") == "2" and queueCount(world, rail, "later") == "1",
+	assert(queueCount(world, rail, "attention") == "2" and queueCount(world, rail, "working") == "0",
 		"toolbar uses the durable presentation after reload")
 	world.focused = rail
 	world:command("next"); world:advance(100)
 	assert(world.focused == 10 and world:inspect().attentionCount == 1,
 		"Next follows durable oldest-first order and acknowledges only its selected record")
 	world:command("next"); world:advance(100)
-	assert(world.focused == 11 and world:inspect().attentionCount == 0 and world:inspect().laterCount == 1)
+	assert(world.focused == 11 and world:inspect().attentionCount == 0)
 end
 
 do
@@ -3861,7 +4176,7 @@ do
 	world:advance(3100)
 	local rail = world.opens[1].pane
 	world.holdIdentity = true
-	world:click(rail, rowAction(world.canvases[rail].view))
+	world:click(rail, rowAction(shown(world, rail)))
 	assert(world.focusWrites == 0, "known identity navigation waits for fresh process evidence")
 	local request = #world.processes
 	world.agentState = "working"
@@ -3876,7 +4191,7 @@ do
 	assert(world.focusWrites == 1 and world:inspect().attentionCount == 1,
 		"revalidated navigation still uses its captured older review revision")
 	world.holdIdentity = false
-	world:click(rail, rowAction(world.canvases[rail].view)); world:advance(100)
+	world:click(rail, rowAction(shown(world, rail))); world:advance(100)
 	assert(world:inspect().attentionCount == 0, "opening the freshly rendered revision acknowledges it")
 end
 
@@ -3885,7 +4200,7 @@ do
 	world.identityFiles[10] = "/sessions/input.jsonl"
 	world:advance(3100)
 	local rail = world.opens[1].pane
-	world:click(rail, rowAction(world.canvases[rail].view)); world:advance(100)
+	world:click(rail, rowAction(shown(world, rail))); world:advance(100)
 	assert(world:inspect().attentionCount == 1 and world.agentState == "waiting_input",
 		"explicit Open cannot resolve a live input condition")
 	local writes = world.focusWrites
@@ -3906,14 +4221,13 @@ do
 	world.agentAlert, world.focused = false, 10
 	world:emit("focus", { pane = 10 }); world:advance(100)
 	assert(world:inspect().attentionCount == 1, "generic focus and native alert disappearance never acknowledge")
-	world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(1); world:advance(100)
+	world:click(rail, rowAction(shown(world, rail), "menu")); world:chooseLabel("Finished for now · current scope"); world:advance(100)
 	world:control(rail, "workspace"); world:advance(100)
-	world:click(rail, wsPart(world, rail, "session:local#2", "open")); world:advance(100)
-	assert(#world.sessionSwitches == 1 and world:inspect().laterCount == 1,
-		"a generic quiet-session switch never acknowledges its Backlog")
-	world:control(rail, "later"); world:advance(100)
-	world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(1); world:advance(100)
-	assert(world:inspect().attentionCount == 1, "unreviewed Backlog can be restored after a generic switch")
+	world:click(rail, wsPart(world, rail, "tab:local#3", "menu")); world:chooseLabel("New tab here"); world:advance(100)
+	assert(#world.sessionSwitches == 1 and world:inspect().attentionCount == 0 and savedItemFor(world, 10).disposition == "finished",
+		"a generic quiet-session switch never acknowledges or reactivates its Finished record")
+	world:click(rail, wsPart(world, rail, "tab:local#3", "menu")); world:chooseLabel("Bring back now"); world:advance(100)
+	assert(world:inspect().attentionCount == 1, "unreviewed Finished work can be brought back after a generic switch")
 end
 
 do
@@ -3924,8 +4238,8 @@ do
 		{ window = "desktop", host = "local", pane = 10, firstSeenUtc = 1699999999, bucket = "backlog" },
 	} }
 	world:advance(3100)
-	assert(world.savedTriage.schema == 3 and world:inspect().attentionCount == 0 and world:inspect().laterCount == 1,
-		"positive same-scope native attention safely joins and preserves legacy Backlog")
+	assert(world.savedTriage.schema == 3 and world:inspect().attentionCount == 0 and savedItemFor(world, 10).disposition == "finished"
+		and savedItemFor(world, 10).retained, "positive same-scope native attention joins legacy Backlog as retained Finished")
 	local writes, processes = world.triageWrites, #world.processes
 	world:advance(5000)
 	assert(world.triageWrites == writes and #world.processes == processes,
@@ -3944,7 +4258,11 @@ do
 	world:emit("agent_finished", { pane = 10, result = "failed" })
 	world.failTriageRead = false
 	world:advance(1100)
-	assert(world:inspect().attentionCount == 1 and world:inspect().laterCount == 1,
+	local finished = 0
+	for _, item in ipairs(world.savedTriage.items) do
+		if item.disposition == "finished" and item.retained then finished += 1 end
+	end
+	assert(world:inspect().attentionCount == 1 and finished == 1,
 		"load recovery preserves saved unavailable records and queued observations")
 end
 
@@ -3955,7 +4273,7 @@ for _, failure in { "json", "shape", "stdout", "stderr", "timeout", "exit", "con
 	world:advance(3100)
 	local rail = world.opens[1].pane
 	world.holdIdentity, world.failIdentitySpawn = true, failure == "spawn"
-	world:click(rail, rowAction(world.canvases[rail].view))
+	world:click(rail, rowAction(shown(world, rail)))
 	local request = #world.processes
 	if failure ~= "spawn" then
 		local result = { status = 0, stdout = "invalid-json", stderr = "", timed_out = false }
@@ -4045,7 +4363,7 @@ for _, failure in { "exit", "spawn" } do
 		local rail = world.opens[1].pane
 		local launches = world.inspections
 		world.holdIdentity, world.failIdentitySpawn = true, failure == "spawn"
-		world:click(rail, rowAction(world.canvases[rail].view))
+		world:click(rail, rowAction(shown(world, rail)))
 		assert(world.inspections == launches + 1, "Open requests one fresh identity proof: " .. label)
 		if failure == "exit" then
 			world:completeIdentity(#world.processes, { status = 1, stdout = "", stderr = "inspect failed", timed_out = false })
@@ -4087,7 +4405,7 @@ for _, failure in { "exit", "spawn" } do
 				world:advance(100)
 			end
 			world.failIdentitySpawn = false
-			world:click(rail, rowAction(world.canvases[rail].view))
+			world:click(rail, rowAction(shown(world, rail)))
 			assert(world.inspections == launches + 4, "an explicit Open retries identity exactly once: " .. label)
 		end
 	end
@@ -4104,7 +4422,7 @@ do
 	assert(table.concat(world.cliProbes, "|") == "/Applications/Tern.app/Contents/MacOS/tern|/usr/bin/tern|/opt/tern/bin/tern",
 		"resolution probes the bundle, then absolute PATH entries, skipping empty and relative entries")
 	local before = #world.processes
-	world:click(rail, rowAction(world.canvases[rail].view))
+	world:click(rail, rowAction(shown(world, rail)))
 	world:advance(100)
 	assert(#world.processes == before + 1 and world.processes[#world.processes].argv[1] == "/opt/tern/bin/tern"
 		and #world.cliProbes == 3, "a later inspection reuses the resolved PATH CLI without probing again")
@@ -4151,7 +4469,7 @@ for _, change in { "owner", "epoch", "membership", "conversation" } do
 	world:advance(3100)
 	local rail = world.opens[1].pane
 	world.holdIdentity = true
-	world:click(rail, rowAction(world.canvases[rail].view))
+	world:click(rail, rowAction(shown(world, rail)))
 	local request = #world.processes
 	if change == "owner" then world.prefs.owner = "other-window"
 	elseif change == "epoch" then world:command("disable"); world:command("enable")
@@ -4181,7 +4499,7 @@ do
 		"ambiguous remapping retains one unavailable record without guessing a destination")
 	world:command("next"); world:advance(100)
 	assert(world.focusWrites == 0, "Next excludes ambiguous restored identity")
-	local remove = rowAction(world.canvases[rail].view, "menu")
+	local remove = rowAction(shown(world, rail), "menu")
 	assert(remove, "unavailable identity exposes its revision-bound tracking menu")
 	local writes = world.layoutWrites
 	world:click(rail, remove); world:chooseLabel("Remove unavailable tracking · no verified route"); world:advance(100)
@@ -4196,18 +4514,18 @@ do
 	world:advance(3100)
 	local rail = world.opens[1].pane
 	world:emit("agent_finished", { pane = 10, result = "failed" }); world:advance(100)
-	local oldAction = rowAction(world.canvases[rail].view)
+	local oldAction = rowAction(shown(world, rail))
 	assert(oldAction, "first failure is published")
 	world.failNextCanvasSet = true
 	world:emit("agent_state", { pane = 10, old = "idle", new = "working" })
 	world:emit("agent_finished", { pane = 10, result = "failed" })
 	world:advance(32)
-	assert(rowAction(world.canvases[rail].view) == oldAction,
+	assert(rowAction(shown(world, rail)) == oldAction,
 		"rejected canvas update leaves the original Open token visible")
 	world:click(rail, oldAction); world:advance(100)
 	assert(world.focusWrites == 1 and world:inspect().attentionCount == 1,
 		"the last accepted canvas binding remains actionable but cannot acknowledge an unpainted newer failure")
-	local newAction = rowAction(world.canvases[rail].view)
+	local newAction = rowAction(shown(world, rail))
 	assert(newAction and newAction ~= oldAction, "successful retry publishes the newer revision's distinct token")
 	world:click(rail, newAction); world:advance(100)
 	assert(world:inspect().attentionCount == 0, "the newly published Open acknowledges the newer failure")
@@ -4220,7 +4538,7 @@ for _, identityChange in { false, true } do
 	world:advance(3100)
 	local rail = world.opens[1].pane
 	world.holdIdentity = true
-	world:click(rail, rowAction(world.canvases[rail].view))
+	world:click(rail, rowAction(shown(world, rail)))
 	local firstRequest = #world.processes
 	world:completeIdentity(firstRequest)
 	assert(world.focusWrites == 1 and world:inspect().navigationPending,
@@ -4328,7 +4646,7 @@ do
 	world:advance(3100)
 	local rail = world.opens[1].pane
 	world.holdIdentity = true
-	world:click(rail, rowAction(world.canvases[rail].view))
+	world:click(rail, rowAction(shown(world, rail)))
 	local request = #world.processes
 	-- The captured document still names the original conversation; the move invalidates it.
 	world.membership[10], world.agentAlert = 4, false
@@ -4363,19 +4681,19 @@ do
 		local revision = world.savedTriage.items[1].reviewRevision
 		world.transcripts[10], world.agentState = transcript, "working"
 		world:emit("agent_state", { pane = 10, old = "idle", new = "working" }); world:advance(32)
-		assert(world:inspect().attentionCount == 0 and not rowAction(world.canvases[rail].view)
+		assert(world:inspect().attentionCount == 0 and not rowAction(shown(world, rail))
 			and world.savedTriage.items[1].reviewRevision == revision and world.savedTriage.items[1].reviewSuperseded == true,
 			"native resumption supersedes presentation without transcript-based acknowledgment or loss of the unread revision")
 		world.agentState = "idle"
 		world:emit("agent_state", { pane = 10, old = "working", new = "idle" }); world:advance(100)
-		assert(world:inspect().attentionCount == 0 and not rowAction(world.canvases[rail].view)
+		assert(world:inspect().attentionCount == 0 and not rowAction(shown(world, rail))
 			and world.savedTriage.items[1].reviewRevision == revision,
 			"idle alone cannot resurrect a superseded review")
 	end
 
 	local racing = reviewWorld()
 	local rail = racing.opens[1].pane
-	local older = rowAction(racing.canvases[rail].view)
+	local older = rowAction(shown(racing, rail))
 	local olderRevision = racing.savedTriage.items[1].reviewRevision
 	racing.transcripts[10] = { { role = "user", text = "my reply", tools = {} } }
 	racing.agentState = "working"
@@ -4383,11 +4701,11 @@ do
 	racing:emit("agent_finished", { pane = 10, result = "done" }); racing:advance(32)
 	local newerRevision = racing.savedTriage.items[1].reviewRevision
 	assert(newerRevision ~= nil and newerRevision ~= olderRevision and racing:inspect().attentionCount == 0
-		and not rowAction(racing.canvases[rail].view),
+		and not rowAction(shown(racing, rail)),
 		"a newer completion is retained but not presented while native inventory still reports working")
 	racing.agentState = "idle"
 	racing:emit("agent_state", { pane = 10, old = "working", new = "idle" }); racing:advance(100)
-	local newer = rowAction(racing.canvases[rail].view)
+	local newer = rowAction(shown(racing, rail))
 	assert(racing:inspect().attentionCount == 1 and newer ~= nil and newer ~= older
 		and racing.savedTriage.items[1].reviewRevision == newerRevision,
 		"settled runtime publishes the retained newer completion despite a synthetic role=user transcript")
@@ -4520,7 +4838,7 @@ do
 	world:advance(3100)
 	local rail = world.opens[1].pane
 	world.holdIdentity = true
-	world:click(rail, rowAction(world.canvases[rail].view))
+	world:click(rail, rowAction(shown(world, rail)))
 	local function failHeld()
 		world:completeIdentity(#world.processes, { status = 1, stdout = "", stderr = "inspect failed", timed_out = false })
 		return world.now
@@ -4581,29 +4899,6 @@ end
 
 do
 	local world = native(true)
-	world:advance(3100)
-	local rail = world.opens[1].pane
-	world.focused = rail
-	assert(world:inspect().attentionCount == 1, "the waiting agent is the next P0 target")
-	world:command("snooze-next")
-	world:advance(100)
-	assert(world:inspect().attentionCount == 0 and world:inspect().laterCount == 1,
-		"the snooze command snoozes exactly the next P0 target")
-	assert(world.focusWrites == 0 and world.savedTriage.items[1].disposition == "later",
-		"snoozing never focuses or acknowledges and persists durably")
-	world:command("snooze-next")
-	world:advance(100)
-	local empty = 0
-	for _, toast in world.toasts do
-		if toast.message == "No reachable attention to defer" then empty += 1 end
-	end
-	assert(empty == 1 and world:inspect().laterCount == 1,
-		"snoozing with no P0 explains itself once without touching the queue")
-end
-
-
-do
-	local world = native(true)
 	world:addTab(4, 11)
 	world:addTab(5, 12)
 	world:advance(3100)
@@ -4641,7 +4936,7 @@ do
 	local review = world:inspect()
 	assert(world.focused == 10 and world.focusWrites == writes + 1,
 		"Previous returns to the pane holding the pending review")
-	assert(review.attentionCount == 1 and review.laterCount == 0 and review.navigationPending == false,
+	assert(review.attentionCount == 1 and review.navigationPending == false,
 		"the restore is location-only: the review stays pending in its bucket with no round consumed")
 	assert(world.triageWrites == triage, "Previous persists no triage change")
 	world:command("next"); world:advance(100)
@@ -4768,7 +5063,7 @@ end
 do
 	local world = native(true)
 	local path = "/sessions/factual.jsonl"
-	world.agentState, world.identityFiles[10] = "idle", path
+	world.agentState, world.agentAlert, world.identityFiles[10] = "idle", true, path
 	world.sourceRecords[path] = nativeCanvas.sourceFact("source-1")
 	world:advance(3100)
 	assert(world:helperCount("source") == 1, "one owner acquires the exact native-proven local source")
@@ -4783,8 +5078,8 @@ do
 	assert(world:helperCount("source") == reads, "another physical canvas does not create another source acquisition")
 	world:switch(3); world:advance(100)
 	local rail = world.opens[1].pane
-	world:control(rail, "workspace"); world:advance(100)
-	world:click(rail, rowAction(world.canvases[rail].view, "details")); world:advance(100)
+	world:control(rail, "attention"); world:advance(100)
+	world:expandRow(rail, shown(world, rail)); world:advance(100)
 	assert(world.focusWrites == 0 and world:inspect().logical.expandedWorkId ~= nil,
 		"global disclosure inspects factual evidence without navigation or acknowledgment")
 	world.sourceRecords[path].revision = "source-2"
@@ -4840,8 +5135,8 @@ do
 	world.sourceRecords[path] = nativeCanvas.sourceFact("retained-body")
 	world:advance(3100)
 	local rail = world.opens[1].pane
-	world:click(rail, rowAction(renderedRowFor(world, rail, 10), "menu")); world:choose(1); world:advance(100)
-	assert(world.savedTriage.items[1].disposition == "later", "fixture: the conversation is deferred before its pane closes")
+	world:click(rail, rowAction(renderedRowFor(world, rail, 10), "menu")); world:chooseLabel("Finished for now · current scope"); world:advance(100)
+	assert(world.savedTriage.items[1].disposition == "finished", "fixture: the conversation is finished before its pane closes")
 	world:closePane(10); world:advance(1100)
 	local keys = world:inspect().sourceKeys
 	assert(keys.locatorEpochs == 0 and keys.dirty == 0, "the retained record's dead pane still drops its flags")
@@ -4874,33 +5169,14 @@ for _, change in ipairs({ "selection", "close", "owner" }) do
 	world.identityFiles[10] = "/sessions/stale-menu.jsonl"
 	world:advance(3100)
 	local rail = world.opens[1].pane
-	world:click(rail, rowAction(world.canvases[rail].view, "menu"))
-	if change == "selection" then world:control(rail, "workspace"); world:advance(100)
+	world:click(rail, rowAction(shown(world, rail), "menu"))
+	if change == "selection" then world:closeSession(rail); world:advance(100)
 	elseif change == "close" then world:closePane(10); world:advance(100)
 	else world.prefs.owner = "other" end
 	local writes = world.triageWrites
-	world:choose(1); world:advance(100)
+	world:chooseLabel("Keep as reference"); world:advance(100)
 	assert(world.triageWrites == writes, "stale " .. change .. " picker must not mutate another logical selection or conversation")
 end
-
-do
-	local world = native(true)
-	world.identityFiles[10] = "/sessions/dated.jsonl"
-	world:advance(3100)
-	local rail = world.opens[1].pane
-	world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(2)
-	world:answer("2027-01-15 America/Los_Angeles"); world:advance(100)
-	assert(string.find(world.pickers[#world.pickers].options.placeholder, "America/Los_Angeles", 1, true)
-		and world:inspect().laterCount == 0, "civil resolution shows the exact zone before applying Later")
-	world:choose(1); world:advance(100)
-	assert(world.savedTriage.items[1].untilUtc == 1800000000
-		and world.savedTriage.items[1].availableOn == "2027-01-15"
-		and world.savedTriage.items[1].zone == "America/Los_Angeles",
-		"confirmed date persists both resolved UTC availability and civil intent")
-	world:closePane(10); world:advance(100)
-	assert(world.savedTriage.items[1].retained, "explicit dated Later survives its last pane without launching anything")
-end
-
 
 do
 	local world = native(true)
@@ -4913,22 +5189,20 @@ do
 	end
 	world:advance(3100)
 	local first = world.opens[1].pane
-	world:control(first, "workspace"); world:advance(100)
-	world:control(first, "page-next"); world:advance(100)
-	world:click(first, rowAction(world.canvases[first].view, "details")); world:advance(100)
+	world:control(first, "attention"); world:advance(100)
+	world:expandRow(first, shown(world, first)); world:advance(100)
 	local selected = world:inspect().logical.expandedWorkId
-	local rowsA = nativeCanvas.childAt(world.canvases[first].view, "rows").c
+	local rowsA = sectionRows(world, first).c
 	world:switch(21); world:advance(3100)
 	local second = world.opens[2].pane
-	local rowsB = nativeCanvas.childAt(world.canvases[second].view, "rows").c
-	assert(world:inspect().logical.pages.workspace == 2 and world:inspect().logical.expandedWorkId == selected
+	local rowsB = sectionRows(world, second).c
+	assert(world:inspect().logical.expandedWorkId == selected
 		and #rowsA == #rowsB and rowsA[1].p.key == rowsB[1].p.key,
-		"page and expanded stable work are one global value across native sessions")
+		"expanded stable work is one global value across native sessions")
 	local opens = #world.opens
 	world:closePane(second); world:advance(100); world:command("open"); world:advance(3100)
-	assert(#world.opens == opens + 1 and world:inspect().logical.pages.workspace == 2
-		and world:inspect().logical.expandedWorkId == selected,
-		"physical canvas replacement recreates only renderer/cache and preserves shared page/detail")
+	assert(#world.opens == opens + 1 and world:inspect().logical.expandedWorkId == selected,
+		"physical canvas replacement recreates only renderer/cache and preserves the shared detail")
 end
 
 do
@@ -4936,103 +5210,12 @@ do
 	world.identityFiles[10] = "/sessions/explicit-intent.jsonl"
 	world:advance(3100)
 	local rail = world.opens[1].pane
-	world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(3); world:choose(4); world:advance(100)
-	local record = world.savedTriage.items[1]
-	local serial = record.serial
-	assert(record.priority == 2, "priority picker persists explicit P2 independently of native input")
-	world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(4); world:advance(100)
+	world:click(rail, rowAction(shown(world, rail), "menu")); world:choose(1); world:choose(4); world:advance(100)
+	assert(world.savedTriage.items[1].priority == 2, "priority picker persists explicit P2 independently of native input")
+	world:click(rail, rowAction(shown(world, rail), "menu")); world:chooseLabel("Keep as reference"); world:advance(100)
 	assert(world.savedTriage.items[1].disposition == "reference" and world.savedTriage.items[1].retained
 		and world:inspect().attentionCount == 0, "reference is explicit retention, not question resolution or execution")
-	world:control(rail, "workspace"); world:advance(100)
-	world:click(rail, rowAction(world.canvases[rail].view, "menu"))
-	world:chooseLabel("Resume tracking · does not run agent"); world:advance(100)
-	assert(world.savedTriage.items[1].disposition == "active" and world.agentState == "waiting_input",
-		"Resume tracking restores tracking without running or answering the native agent")
-	world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(5); world:advance(100)
-	assert(world.savedTriage.items[1].disposition == "finished" and world.savedTriage.items[1].priority == 2,
-		"finish-current-scope preserves explicit priority and does not infer technical success")
-	world:addTab(4, 11)
-	world.identityFiles[11], world.additionalAgents = "/sessions/other-live.jsonl", { [11] = "idle" }
-	world:closePane(10); world:switch(4); world:advance(3100)
-	local currentRail = world.opens[#world.opens].pane
-	local retainedRow = wsRow(world, currentRail, "retained:work:" .. serial)
-	assert(retainedRow and rowAction(retainedRow, "open") == nil, "retained closed work offers no fabricated pane route")
-	world:click(currentRail, rowAction(retainedRow, "menu"))
-	world:chooseLabel("Remove retained row · no open pane"); world:advance(100)
-	assert(#world.savedTriage.items == 1 and world.savedTriage.items[1].serial ~= serial
-		and world.membership[11] and world.focusWrites == 0,
-		"retained removal deletes only local unbound tracking and leaves the other native conversation untouched")
 end
-
-do
-	-- A DST gap and a fold are refused with the helper's specific message; nothing is stored or shifted.
-	for _, refusal in ipairs({
-		{ status = "invalid", problem = "nonexistent", date = "2026-03-08 02:30 America/New_York",
-			error = "2026-03-08 02:30 America/New_York does not exist: clocks skip forward at that time. Choose another time." },
-		{ status = "ambiguous", problem = "repeated", date = "2026-11-01 01:30 America/New_York",
-			error = "2026-11-01 01:30 America/New_York happens twice: clocks fall back at that time. Choose another time." },
-	}) do
-		local world = native(true)
-		world:advance(3100)
-		local rail = world.opens[1].pane
-		world.dateResponse = { status = refusal.status, problem = refusal.problem, zone = "America/New_York", error = refusal.error }
-		local pickers = #world.pickers
-		world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(2)
-		world:answer(refusal.date); world:advance(100)
-		assert(toastCount(world, "error", refusal.error) == 1, "the specific refusal reaches the user: " .. refusal.problem)
-		assert(#world.pickers == pickers + 1 and world:inspect().laterCount == 0 and world.savedTriage.items[1].untilUtc == nil,
-			"no confirmation is offered and no instant is stored for " .. refusal.problem)
-	end
-end
-
-do
-	-- A past date is accepted, the helper is told the current instant, and the conversation returns on the next refresh.
-	local world = native(true)
-	world.identityFiles[10] = "/sessions/past-date.jsonl"
-	world:advance(3100)
-	local rail = world.opens[1].pane
-	local confirmation = "Bring back 2023-11-14 00:00 America/Los_Angeles = 2023-11-14T08:00:00Z UTC. That time has already passed: "
-		.. "the conversation returns to Attention on the next refresh."
-	world.dateResponse = { status = "ready", resolvedUTC = 1699948800, civilTime = "00:00", past = true,
-		display = "2023-11-14 00:00 America/Los_Angeles", zone = "America/Los_Angeles", confirmation = confirmation }
-	world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(2)
-	world:answer("2023-11-14 America/Los_Angeles"); world:advance(100)
-	local request
-	for _, process in ipairs(world.sourceProcesses) do
-		if process.input.op == "date" then request = process.input end
-	end
-	assert(request and type(request.nowUtc) == "number" and request.nowUtc >= 1700000000 and request.nowUtc < 1700000100
-		and request.zone == "America/Los_Angeles" and request.civilDate == "2023-11-14",
-		"the helper receives the civil fields, the explicit zone, and the current UTC instant")
-	assert(world.pickers[#world.pickers].options.placeholder == confirmation, "the confirmation is the helper's complete statement")
-	world:choose(1); world:advance(1100)
-	assert(world:inspect().attentionCount == 1 and world:inspect().laterCount == 0 and world.savedTriage.items[1].disposition == "active",
-		"a past date is accepted and the conversation is back in Attention after the next refresh")
-	assert(world.focusWrites == 0, "returning from a past date never focuses or acknowledges")
-end
-
-do
-	-- A legacy record carrying only a UTC instant stays Later and is not rewritten by reload or refresh.
-	local world = native(true)
-	world.identityFiles[10] = "/sessions/legacy-utc.jsonl"
-	world:advance(3100)
-	local rail = world.opens[1].pane
-	world.dateResponse = { status = "ready", resolvedUTC = 1800000000, civilTime = "09:00",
-		display = "2027-01-15 09:00 America/Los_Angeles", zone = "America/Los_Angeles" }
-	world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(2)
-	world:answer("2027-01-15 09:00 America/Los_Angeles"); world:advance(100)
-	world:choose(1); world:advance(100)
-	local item = world.savedTriage.items[1]
-	item.availableOn, item.availableTime, item.zone = nil, nil, nil
-	local saved = copy(world.savedTriage)
-	world:reload(); world:advance(1100)
-	local after = world.savedTriage.items[1]
-	assert(world:inspect().laterCount == 1 and after.untilUtc == 1800000000 and after.availableOn == nil
-		and after.availableTime == nil and after.zone == nil,
-		"a UTC-only Later record stays valid and keeps its exact instant without invented civil fields")
-	assert(saved.items[1].untilUtc == after.untilUtc, "reload does not migrate or rewrite the stored instant")
-end
-
 
 do
 	local world = native(true)
@@ -5040,8 +5223,8 @@ do
 	world.sourceRecords["/sessions/silent-old.jsonl"] = nativeCanvas.sourceFact("old-source")
 	world:advance(3100)
 	local rail = world.opens[1].pane
-	world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(3); world:choose(4); world:advance(100)
-	world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(4); world:advance(100)
+	world:click(rail, rowAction(shown(world, rail), "menu")); world:choose(1); world:choose(4); world:advance(100)
+	world:click(rail, rowAction(shown(world, rail), "menu")); world:chooseLabel("Keep as reference"); world:advance(100)
 	local oldSerial = world.savedTriage.items[1].serial
 	local fresh = nativeCanvas.sourceFact("replacement-source")
 	fresh.sessionId = "replacement-header"
@@ -5119,7 +5302,7 @@ do
 	world.identityFiles[10] = path
 	world.sourceRecords[path] = { status = "partial", sessionId = "header-uuid", schemaVersion = 3,
 		writerVersions = {}, revision = "same-observation", selection = "unknown", complete = false, reusable = false,
-		coverage = { recordsComplete = false, historyScope = "unavailable", selectionSupport = "unknown" },
+		coverage = { recordsComplete = false, historyScope = "unavailable", fields = { clock = "unknown", questions = "unknown" } },
 		questionCoverage = { status = "unknown", knownTotal = 0, included = 0, omitted = 0 } }
 	world:advance(3100)
 	assert(world.savedTriage.items[1].source == nil, "an incomplete replay does not fabricate history")
@@ -5143,7 +5326,7 @@ do
 		writerVersions = { "18.14.0" }, revision = "cutoff-observation", selection = "unknown",
 		complete = false, reusable = false,
 		questionCoverage = { status = "unknown", knownTotal = 0, included = 0, omitted = 0 },
-		coverage = { recordsComplete = false, historyScope = "unavailable", selectionSupport = "unknown" } }
+		coverage = { recordsComplete = false, historyScope = "unavailable", fields = { clock = "unknown", questions = "unknown" } } }
 	world:advance(3100)
 	assert(world:inspect().attentionCount == 0 and world.savedTriage.items[1].source == nil,
 		"metadata-only cutoff cannot invent current history or attention")
@@ -5161,13 +5344,13 @@ do
 	world.sourceRecords[path] = { status = "partial", sessionId = "header-A", schemaVersion = 3,
 		writerVersions = {}, revision = "metadata-A", selection = "unknown", complete = false, reusable = false,
 		questionCoverage = { status = "unknown", knownTotal = 0, included = 0, omitted = 0 },
-		coverage = { recordsComplete = false, historyScope = "unavailable", selectionSupport = "unknown" } }
+		coverage = { recordsComplete = false, historyScope = "unavailable", fields = { clock = "unknown", questions = "unknown" } } }
 	world:advance(3100)
 	local rail = world.opens[1].pane
 	assert(world.savedTriage.items[1].sourceSessionId == "header-A" and world.savedTriage.items[1].source == nil,
 		"positive header identity is available for navigation even when no source history is applicable")
 	world.holdIdentity = true
-	world:click(rail, rowAction(world.canvases[rail].view))
+	world:click(rail, rowAction(shown(world, rail)))
 	local request = #world.processes
 	world.sourceRecords[path].sessionId, world.sourceRecords[path].revision = "header-B", "metadata-B"
 	world:emit("title", { pane = 10 }); world:advance(100)
@@ -5193,7 +5376,7 @@ do
 	world:emit("agent_finished", { pane = 10, result = "failed" }); world:advance(100)
 	local rail = world.opens[1].pane
 	local bodies, headers, captured = world:helperCount("source"), world:helperCount("header"), world.savedTriage.items[1].source.capturedAtUtc
-	world:click(rail, rowAction(world.canvases[rail].view)); world:advance(100)
+	world:click(rail, rowAction(shown(world, rail))); world:advance(100)
 	assert(world.focusWrites == 1 and world:inspect().attentionCount == 0
 		and world:helperCount("source") == bodies and world:helperCount("header") >= headers + 2
 		and world.savedTriage.items[1].source.capturedAtUtc == captured
@@ -5210,12 +5393,12 @@ for _, action in ipairs({ "open", "priority" }) do
 	world:emit("agent_finished", { pane = 10, result = "failed" }); world:advance(100)
 	local rail = world.opens[1].pane
 	if action == "priority" then
-		world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(3)
+		world:click(rail, rowAction(shown(world, rail), "menu")); world:choose(1)
 	end
 	local replacement = nativeCanvas.sourceFact("same-stat-observation")
 	replacement.sessionId = "rewritten-header"
 	world.sourceRecords[path] = replacement
-	if action == "open" then world:click(rail, rowAction(world.canvases[rail].view))
+	if action == "open" then world:click(rail, rowAction(shown(world, rail)))
 	else world:choose(4) end
 	world:advance(300)
 	local found = false
@@ -5234,12 +5417,12 @@ do
 	world.identityFiles[10], world.sourceRecords[path], world.holdSources = path, nativeCanvas.sourceFact("first-body"), true
 	world:advance(3100)
 	local rail, serial = world.opens[1].pane, world.savedTriage.items[1].serial
-	world:click(rail, rowAction(world.canvases[rail].view, "menu"))
+	world:click(rail, rowAction(shown(world, rail), "menu"))
 	world:completeSource(#world.sourceProcesses); world:advance(100)
 	world.holdSources = false
-	world:choose(1); world:advance(100)
+	world:chooseLabel("Finished for now · current scope"); world:advance(100)
 	assert(world.savedTriage.items[1].serial == serial and world.savedTriage.items[1].sourceSessionId == "header-uuid"
-		and world.savedTriage.items[1].disposition == "later" and world.agentState == "waiting_input",
+		and world.savedTriage.items[1].disposition == "finished" and world.agentState == "waiting_input",
 		"initial unknown header strengthens only the same captured work/binding/review, then fresh proof permits the explicit action")
 end
 
@@ -5270,7 +5453,7 @@ do
 	world.holdSources = true
 	world:reload(); world:advance(100)
 	local heldBody = #world.sourceProcesses
-	local open = rowAction(world.canvases[rail].view)
+	local open = rowAction(shown(world, rail))
 	assert(open, "an exact live local pane offers a header-verification attempt while current-owner history is unavailable")
 	world:click(rail, open); world:advance(100)
 	local heldHeader = #world.sourceProcesses
@@ -5280,7 +5463,7 @@ do
 	world.sourceRecords[path] = { status = "partial", sessionId = "header-uuid", schemaVersion = 3,
 		writerVersions = {}, revision = "header-only-current", selection = "unknown", complete = false, reusable = false,
 		questionCoverage = { status = "unknown", knownTotal = 0, included = 0, omitted = 0 },
-		coverage = { recordsComplete = false, historyScope = "unavailable", selectionSupport = "unknown" } }
+		coverage = { recordsComplete = false, historyScope = "unavailable", fields = { clock = "unknown", questions = "unknown" } } }
 	world.holdSources = false
 	world:completeSource(heldBody); world:completeSource(heldHeader); world:advance(300)
 	assert(world.focusWrites == 1 and not world:inspect().navigationPending
@@ -5293,12 +5476,12 @@ end
 for _, choice in ipairs({ "Keep as reference", "Finished for now · current scope" }) do
 	local world = native(true)
 	local path = "/sessions/explicit-resume-only.jsonl"
-	world.agentState, world.identityFiles[10] = "idle", path
+	world.agentState, world.agentAlert, world.identityFiles[10] = "idle", true, path
 	world.sourceRecords[path] = nativeCanvas.sourceFact("before-choice")
 	world:advance(3100)
 	local rail = world.opens[1].pane
-	world:control(rail, "workspace"); world:advance(100)
-	world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:chooseLabel(choice); world:advance(100)
+	world:control(rail, "attention"); world:advance(100)
+	world:click(rail, rowAction(shown(world, rail), "menu")); world:chooseLabel(choice); world:advance(100)
 	local disposition = world.savedTriage.items[1].disposition
 	world:advance(1100)
 	local update = nativeCanvas.sourceFact("new-factual-input")
@@ -5310,7 +5493,8 @@ for _, choice in ipairs({ "Keep as reference", "Finished for now · current scop
 		and world.savedTriage.items[1].source.lastHuman.id == "new-human-input"
 		and world:inspect().attentionCount == 0,
 		"new recorded text and native execution remain factual without automatically reactivating explicit tracking choices")
-	world:click(rail, rowAction(world.canvases[rail].view, "menu"))
+	world:control(rail, "working"); world:advance(100)
+	world:click(rail, rowAction(shown(world, rail), "menu"))
 	world:chooseLabel("Resume tracking · does not run agent"); world:advance(100)
 	assert(world.savedTriage.items[1].disposition == "active" and world.agentState == "working" and world.focusWrites == 0,
 		"only explicit Resume changes the tracking disposition, without executing or navigating the agent")
@@ -5327,7 +5511,7 @@ do
 	world:emit("agent_finished", { pane = 10, result = "failed" }); world:advance(100)
 	local rail, captured = world.opens[1].pane, world.savedTriage.items[1].source.capturedAtUtc
 	world.holdHeaders = true
-	world:click(rail, rowAction(world.canvases[rail].view)); world:advance(100)
+	world:click(rail, rowAction(shown(world, rail))); world:advance(100)
 	local heldHeader, warnings = #world.sourceProcesses, #world.warnings
 	assert(world.sourceProcesses[heldHeader].input.op == "header" and world:inspect().navigationPending and world.focusWrites == 0)
 	world.additionalAgents[11] = "working"
@@ -5354,13 +5538,13 @@ do
 	local revision, serial = savedItemFor(world, 10).reviewRevision, savedItemFor(world, 10).serial
 	world.additionalAgents[11] = "waiting_input"
 	world:emit("agent_state", { pane = 11, old = "working", new = "waiting_input" }); world:advance(100)
-	local rows = nativeCanvas.childAt(world.canvases[rail].view, "rows").c
+	local rows = sectionRows(world, rail).c
 	assert(#rows == 2 and rows[1].p.key == renderedRowFor(world, rail, 11).p.key
 		and rows[2].p.key == "r" .. serial,
 		"at equal priority a current native input blocker precedes an older passive completion")
 	world.agentState = "working"
 	world:emit("agent_state", { pane = 10, old = "idle", new = "working" }); world:advance(100)
-	rows = nativeCanvas.childAt(world.canvases[rail].view, "rows").c
+	rows = sectionRows(world, rail).c
 	local state = world:inspect()
 	assert(state.attentionCount == 1 and #rows == 1 and rows[1].p.key == renderedRowFor(world, rail, 11).p.key
 		and savedItemFor(world, 10).reviewRevision == revision and savedItemFor(world, 10).reviewSuperseded == true,
@@ -5373,16 +5557,17 @@ do
 	world:command("next"); world:advance(100)
 	assert(world.focusWrites == 1, "Next never falls through to either ordinary working conversation")
 	world:switch(3); world:advance(100)
-	world:control(rail, "workspace"); world:advance(100)
-	rows = nativeCanvas.childAt(world.canvases[rail].view, "rows").c
+	world:control(rail, "working"); world:advance(100)
+	rows = sectionRows(world, rail).c
 	assert(renderedRowFor(world, rail, 10) and renderedRowFor(world, rail, 12),
-		"Workspace preserves both working conversations rather than dropping their recorded facts")
+		"Working preserves both working conversations rather than dropping their recorded facts")
 	local allOrder = {}
 	for index, row in ipairs(rows) do allOrder[index] = row.p.key end
 	local workingRow = renderedRowFor(world, rail, 10)
-	local open, disclosure, overflow = rowAction(workingRow, "route-open"), rowAction(workingRow, "details"), rowAction(workingRow, "menu")
-	assert(open and disclosure and overflow, "working rows retain native Open, disclosure and unchanged menu operations")
-	world:click(rail, disclosure); world:advance(100)
+	local open, overflow = rowAction(workingRow, "route-open"), rowAction(workingRow, "menu")
+	assert(open and overflow and not rowAction(workingRow, "details"),
+		"working rows retain native Open and the menu; recorded facts open from the menu, not an inline chevron")
+	world:expandRow(rail, workingRow); world:advance(100)
 	local expanded = world:inspect().logical.expandedWorkId
 	assert(expanded ~= nil and world.focusWrites == 1 and savedItemFor(world, 10).reviewRevision == revision,
 		"disclosure inspects a superseded unread review without navigation or acknowledgment")
@@ -5393,9 +5578,9 @@ do
 	world:choose(nil)
 	world:switch(4); world:advance(3100)
 	local second = world.opens[2].pane
-	local shared = nativeCanvas.childAt(world.canvases[second].view, "rows").c
-	assert(world:inspect().logical.section == "workspace" and world:inspect().logical.expandedWorkId == expanded
-		and #shared == #allOrder, "physical canvases share one logical selection and disclosure")
+	local shared = sectionRows(world, second).c
+	assert(world:inspect().logical.expandedWorkId == expanded and #shared == #allOrder,
+		"physical canvases share one logical selection and disclosure")
 	for index, row in ipairs(shared) do
 		assert(row.p.key == allOrder[index], "All work retains native order across physical canvases")
 	end
@@ -5406,10 +5591,10 @@ do
 		and savedItemFor(world, 10).reviewSuperseded == true,
 		"restored supersession survives idle and reload without clearing or reviving the earlier unread revision")
 	world:control(second, "attention"); world:advance(100)
-	assert(#nativeCanvas.childAt(world.canvases[second].view, "rows").c == 1,
+	assert(#sectionRows(world, second).c == 1,
 		"restored row membership agrees with persisted supersession")
 	world:emit("agent_finished", { pane = 10, result = "done" }); world:advance(100)
-	assert(world:inspect().attentionCount == 2 and #nativeCanvas.childAt(world.canvases[second].view, "rows").c == 2
+	assert(world:inspect().attentionCount == 2 and #sectionRows(world, second).c == 2
 		and savedItemFor(world, 10).reviewRevision ~= revision,
 		"a genuine new settled completion returns to the same Attention projection after restoration")
 end
@@ -5425,23 +5610,24 @@ for _, blocker in ipairs({ "delivery", "startup" }) do
 	if blocker == "delivery" then world.deliveryError = "native prompt delivery failed"
 	else world.startupError = "native agent startup failed" end
 	world:emit("agent_state", { pane = 10, old = "idle", new = "working" }); world:advance(100)
-	assert(world:inspect().attentionCount == 1 and #nativeCanvas.childAt(world.canvases[rail].view, "rows").c == 1
+	assert(world:inspect().attentionCount == 1 and #sectionRows(world, rail).c == 1
 		and savedItemFor(world, 10).reviewRevision == revision and savedItemFor(world, 10).reviewSuperseded == true,
 		"current native " .. blocker .. " blocker remains actionable while the older passive review is superseded")
 	local summary = string.lower(visibleText(renderedRowFor(world, rail, 10)))
-	assert(string.find(summary, if blocker == "delivery" then "deliver" else "startup", 1, true)
+	assert(string.find(summary, if blocker == "delivery" then "prompt not delivered" else "agent didn't start", 1, true)
 		and not string.find(summary, "working", 1, true),
-		"the compact current-state label names the " .. blocker .. " blocker rather than Working")
-	world:click(rail, rowAction(world.canvases[rail].view, "details")); world:advance(100)
+		"the row's need names the " .. blocker .. " blocker rather than Working")
+	world:expandRow(rail, shown(world, rail)); world:advance(100)
 	assert(world.focusWrites == 0 and savedItemFor(world, 10).reviewRevision == revision,
 		"inspecting a live " .. blocker .. " blocker does not navigate or acknowledge")
-	world:click(rail, rowAction(world.canvases[rail].view)); world:advance(100)
+	world:click(rail, rowAction(shown(world, rail))); world:advance(100)
 	assert(world.focused == 10 and world:inspect().attentionCount == 1
 		and savedItemFor(world, 10).reviewRevision == nil,
 		"exact Open acknowledges captured review but cannot resolve a native " .. blocker .. " condition")
 	world.deliveryError, world.startupError = nil, nil
-	world:emit("title", { pane = 10 }); world:advance(100)
-	assert(world:inspect().attentionCount == 0 and not rowAction(world.canvases[rail].view),
+	-- A delivery error clearing has no native event; the next heartbeat after the 5 s agent census refresh picks it up.
+	world:emit("title", { pane = 10 }); world:advance(6100)
+	assert(world:inspect().attentionCount == 0 and not rowAction(shown(world, rail)),
 		"resolved " .. blocker .. " leaves ordinary working absent from Attention")
 end
 
@@ -5458,15 +5644,16 @@ do
 	local revision = savedItemFor(world, 10).reviewRevision
 	world.agentState = "working"
 	world:emit("agent_state", { pane = 10, old = "idle", new = "working" }); world:advance(100)
-	assert(world:inspect().attentionCount == 0 and not rowAction(world.canvases[rail].view)
+	assert(world:inspect().attentionCount == 0 and not rowAction(shown(world, rail))
 		and savedItemFor(world, 10).source.questions[1].status == "open"
 		and savedItemFor(world, 10).reviewRevision == revision,
 		"a historical unresolved question remains recorded but cannot override current native Working")
-	world:control(rail, "workspace"); world:advance(100)
+	world:control(rail, "working"); world:advance(100)
 	local row = renderedRowFor(world, rail, 10)
-	assert(string.find(visibleText(row), "Working", 1, true),
-		"Workspace presents the effective current state instead of the historical question")
-	world:click(rail, rowAction(row, "details")); world:advance(100)
+	assert(string.find(visibleText(row) .. " " .. tooltipText(row), "Working", 1, true)
+		and not string.find(visibleText(row), "Which target should I use?", 1, true),
+		"the Working row presents the effective current state instead of the historical question")
+	world:expandRow(rail, row); world:advance(100)
 	assert(savedItemFor(world, 10).source.questions[1].status == "open"
 		and savedItemFor(world, 10).reviewRevision == revision and world.focusWrites == 0,
 		"disclosure preserves unresolved source facts and the unread revision without answering or navigating")
@@ -5477,20 +5664,21 @@ for _, initialAlert in ipairs({ false, true }) do
 	world.agentState, world.agentAlert = "working", initialAlert
 	world:advance(3100)
 	local rail = world.opens[1].pane
-	assert(world:inspect().attentionCount == 0 and not rowAction(world.canvases[rail].view)
+	assert(world:inspect().attentionCount == 0 and not rowAction(shown(world, rail))
 		and queueCount(world, rail, "attention") == "0" and not beacon(world, rail),
 		"an initial ordinary working snapshot is not Attention, even with native alert already set")
 	world.agentAlert = true
 	world:emit("title", { pane = 10 }); world:advance(100)
-	assert(world:inspect().attentionCount == 0 and not rowAction(world.canvases[rail].view)
+	assert(world:inspect().attentionCount == 0 and not rowAction(shown(world, rail))
 		and queueCount(world, rail, "attention") == "0" and not beacon(world, rail),
 		"a native alert cannot independently promote ordinary working into rows, counts or arrival cues")
 	world.focused = rail
 	world:command("next"); world:advance(100)
 	assert(world.focusWrites == 0, "Next excludes ordinary working regardless of initial or newly observed native alert")
-	world:control(rail, "workspace"); world:advance(100)
-	assert(string.find(visibleText(renderedRowFor(world, rail, 10)), "Working", 1, true),
-		"the excluded working conversation remains inspectable in Workspace")
+	world:control(rail, "working"); world:advance(100)
+	local workspaceRow = renderedRowFor(world, rail, 10)
+	assert(string.find(visibleText(workspaceRow) .. " " .. tooltipText(workspaceRow), "Working", 1, true),
+		"the excluded working conversation remains inspectable in Working")
 end
 
 local function holdCancelledNavigationHeader(world, rail)
@@ -5631,25 +5819,6 @@ do
 	for _ in pairs(covered) do count += 1 end
 	assert(count == 6 and replays == 6 and world.focusWrites == 1,
 		"priority preserves every dirty target exactly once without replay loops or extra helper slots")
-end
-
-for _, time in ipairs({ "09:00", "17:00" }) do
-	local world = native(true)
-	world.identityFiles[10] = "/sessions/exact-civil-time.jsonl"
-	world:advance(3100)
-	local rail = world.opens[1].pane
-	local untilUtc = if time == "09:00" then 1800000000 else 1800028800
-	world.dateResponse = { status = "ready", resolvedUTC = untilUtc, civilTime = time,
-		display = "2027-01-15 " .. time .. " America/Los_Angeles", zone = "America/Los_Angeles" }
-	world:click(rail, rowAction(world.canvases[rail].view, "menu")); world:choose(2)
-	world:answer("2027-01-15 " .. time .. " America/Los_Angeles"); world:advance(100)
-	world:choose(1); world:advance(100)
-	assert(savedItemFor(world, 10).availableTime == time and savedItemFor(world, 10).untilUtc == untilUtc,
-		"confirmed Later preserves the helper-resolved exact civil time " .. time)
-	world:reload(); world:advance(1100)
-	assert(savedItemFor(world, 10).availableTime == time and savedItemFor(world, 10).availableOn == "2027-01-15"
-		and savedItemFor(world, 10).zone == "America/Los_Angeles" and savedItemFor(world, 10).untilUtc == untilUtc,
-		"reload retains distinct civil-time intent independently of the resolved UTC instant")
 end
 
 local function navigationWorld(targets)
@@ -5929,24 +6098,19 @@ do
 end
 
 -- Interactive navigation must not inherit the residual lifetime of unrelated ordinary work.
-for _, ordinary in ipairs({ "source", "date" }) do
+do
 	local world, rail = navigationWorld(2)
 	world.focused = 11
 	world.holdSources, world.holdHeaders = true, true
-	if ordinary == "source" then
-		world:emit("title", { pane = 11 }); world:advance(100)
-	else
-		world:click(rail, rowAction(renderedRowFor(world, rail, 10), "menu")); world:choose(2)
-		world:answer("2027-01-15 09:00 America/Los_Angeles"); world:advance(100)
-	end
+	world:emit("title", { pane = 11 }); world:advance(100)
 	local held = #world.sourceProcesses
-	assert((world.sourceProcesses[held].input.op or "source") == ordinary)
+	assert((world.sourceProcesses[held].input.op or "source") == "source")
 	local captured = savedItemFor(world, 10).reviewRevision
 	world:click(rail, rowAction(renderedRowFor(world, rail, 10))); world:advance(100)
 	local header = #world.sourceProcesses
 	assert(header > held and world.sourceProcesses[header].input.op == "header"
 		and not world.sourceProcesses[held].completed and world.focusWrites == 0,
-		"fresh pre-focus proof starts while unrelated " .. ordinary .. " still owns its lane")
+		"fresh pre-focus proof starts while unrelated source work still owns its lane")
 	world:completeSource(header); world:advance(100)
 	assert(world.focused == 10 and world.focusWrites == 1 and savedItemFor(world, 10).reviewRevision == captured)
 	local confirmation = #world.sourceProcesses
@@ -6052,13 +6216,11 @@ for _, action in ipairs({ "open", "toolbar-next", "next" }) do
 		local held = if boundary == "identity" then #world.processes else #world.sourceProcesses
 		assert(world:inspect().navigationPending and world.focusWrites == 0,
 			action .. " must reach its held " .. boundary .. " proof before the unrelated completion")
-		local selectionRevision = world:inspect().logical.revision
 		world.additionalAgents[11] = "idle"
 		world:emit("agent_finished", { pane = 11, result = "done" }); world:advance(100)
 		local unrelated = savedItemFor(world, 11).reviewRevision
-		assert(unrelated ~= nil and world:inspect().attentionCount == 2
-			and world:inspect().logical.revision > selectionRevision,
-			"the unrelated B completion must add real Attention and normalize selection while stable A is accepted")
+		assert(unrelated ~= nil and world:inspect().attentionCount == 2,
+			"the unrelated B completion must add real Attention while stable A is accepted")
 		if boundary == "identity" then
 			world.holdIdentity = false
 			world:completeIdentity(held); world:advance(100)
@@ -6082,29 +6244,21 @@ for _, action in ipairs({ "open", "toolbar-next", "next" }) do
 	end
 end
 
-for _, selection in ipairs({ "section", "settings", "page", "disclosure" }) do
+for _, selection in ipairs({ "queue", "settings", "disclosure" }) do
 	for _, boundary in ipairs({ "identity", "header" }) do
-		local world, rail = navigationWorld(if selection == "page" then 42 else 2)
-		if selection == "page" then
-			-- Page controls exist only where more than 40 rows are listed: every conversation settles into Attention.
-			for pane = 11, 51 do world:emit("agent_finished", { pane = pane, result = "failed" }) end
-			world:advance(100)
-		end
+		local world, rail = navigationWorld(2)
 		local captured = savedItemFor(world, 10).reviewRevision
 		world.holdIdentity, world.holdHeaders = boundary == "identity", true
 		world:click(rail, rowAction(renderedRowFor(world, rail, 10))); world:advance(100)
 		local held = if boundary == "identity" then #world.processes else #world.sourceProcesses
-		if selection == "section" then
-			world:control(rail, "workspace"); world:advance(100)
-			world:control(rail, "attention"); world:advance(100)
+		if selection == "queue" then
+			world:toggleQueue(rail, "attention"); world:advance(100)
+			world:toggleQueue(rail, "attention"); world:advance(100)
 		elseif selection == "settings" then
 			world:control(rail, "settings"); world:advance(100)
 			world:control(rail, "settings"); world:advance(100)
-		elseif selection == "page" then
-			world:control(rail, "page-next"); world:advance(100)
-			world:control(rail, "page-prev"); world:advance(100)
 		else
-			world:click(rail, rowAction(renderedRowFor(world, rail, 10), "details")); world:advance(100)
+			world:expandRow(rail, renderedRowFor(world, rail, 10)); world:advance(100)
 			world:click(rail, rowAction(renderedRowFor(world, rail, 10), "details")); world:advance(100)
 		end
 		world.holdIdentity, world.holdHeaders = false, false
@@ -6152,13 +6306,13 @@ for _, stage in ipairs({ "identity", "header", "queued-header" }) do
 	local pendingRow = renderedRowFor(world, rail, 10)
 	assert(hasVisibleRole(pendingRow, "attention.navigation-pending") and not rowAction(pendingRow),
 		"accepted " .. stage .. " row visibly awaits proof without an enabled second Open")
-	assert(rowAction(pendingRow, "details") and rowAction(pendingRow, "menu"),
-		"pending navigation leaves the accepted row's disclosure and menu available")
+	assert(rowAction(pendingRow, "menu") and not rowAction(pendingRow, "details"),
+		"pending navigation leaves the accepted row's menu available and collapsed rows have no inline disclosure")
 	assert(rowAction(renderedRowFor(world, rail, 11))
 		and not hasVisibleRole(renderedRowFor(world, rail, 11), "attention.navigation-pending"),
 		"pending paint never disables another row's Open or marks unrelated work as opening")
-	world:control(rail, "workspace"); world:advance(100)
-	-- The section change deliberately cancelled that attempt; retry from a current token.
+	world:closeSession(rail); world:advance(100)
+	-- Collapsing a Workspace session deliberately cancelled that attempt; retry from a current token.
 	world.holdIdentity, world.holdHeaders = false, false
 	if stage == "identity" then world:completeIdentity(heldIdentity)
 	else world:completeSource(heldHeader) end
@@ -6200,12 +6354,13 @@ for _, stage in ipairs({ "identity", "header", "queued-header" }) do
 		"post-focus acknowledgment requires its own fresh header, not the pre-focus result")
 	world.holdHeaders, world.holdSources = false, false
 	world:completeSource(#world.sourceProcesses); world:advance(300)
-	world:control(rail, "workspace"); world:advance(100)
+	world:control(rail, "attention"); world:advance(100)
 	assert(world.focusWrites == 1 and not world:inspect().navigationPending
 		and savedItemFor(world, 10).reviewRevision == nil
-		and not hasVisibleRole(renderedRowFor(world, rail, 10), "attention.navigation-pending")
-		and rowAction(renderedRowFor(world, rail, 10), "route-open"),
+		and not hasVisibleRole(world.canvases[rail].view, "attention.navigation-pending"),
 		"successful " .. stage .. " coalesced Open clears only its transient pending state")
+	world:control(rail, "workspace"); world:advance(100)
+	assert(wsPart(world, rail, "tab:local#3", "open"), "the tab is openable again after " .. stage .. " Open")
 end
 
 for _, failure in ipairs({ "identity", "header" }) do
@@ -6243,7 +6398,7 @@ for _, failure in ipairs({ "identity", "header" }) do
 			and savedItemFor(world, 10).reviewRevision == captured and world.focusWrites == 0,
 			"the held backoff retry cannot restore Open or replay navigation before fresh identity arrives")
 		world:completeIdentity(#world.processes); world:advance(100)
-		local recoveredCoverage = nativeCanvas.childAt(world.canvases[rail].view, "coverage")
+		local recoveredCoverage = coverageOf(world.canvases[rail].view)
 		assert(rowAction(renderedRowFor(world, rail, 10))
 			and (recoveredCoverage.p.hidden or not nativeCanvas.childAt(recoveredCoverage, "notice"))
 			and not world:inspect().navigationPending
@@ -6291,25 +6446,20 @@ for _, stage in ipairs({ "running-header", "queued-header" }) do
 		"cross-target supersession acknowledges B only after its exact fresh destination header")
 end
 
-for _, consumer in ipairs({ "menu", "date" }) do
+do
 	local world, rail = navigationWorld(3)
-	if consumer == "date" then
-		world.dateResponse = { status = "ready", resolvedUTC = 1800000000, civilTime = "09:00",
-			display = "2027-01-15 09:00 America/Los_Angeles", zone = "America/Los_Angeles" }
-	end
 	world:emit("agent_finished", { pane = 11, result = "failed" }); world:emit("agent_finished", { pane = 12, result = "failed" })
 	world:advance(100)
 	world.holdSources, world.holdHeaders = true, true
 	world:emit("title", { pane = 12 }); world:advance(100)
 	local heldBody = #world.sourceProcesses
 	assert(world.sourceProcesses[heldBody].input.op == nil and not world.sourceProcesses[heldBody].completed,
-		"independent " .. consumer .. " work queues behind a real held source body")
+		"independent menu work queues behind a real held source body")
 	world:click(rail, rowAction(renderedRowFor(world, rail, 12), "menu"))
-	if consumer == "menu" then world:choose(1)
-	else world:choose(2); world:answer("2027-01-15 09:00 America/Los_Angeles") end
+	world:chooseLabel("Finished for now · current scope")
 	world:advance(100)
 	assert(savedItemFor(world, 12).disposition == "active",
-		"the independent " .. consumer .. " mutation cannot finish before its queued helper proof")
+		"the independent menu mutation cannot finish before its queued helper proof")
 	world:click(rail, rowAction(renderedRowFor(world, rail, 10))); world:advance(100)
 	world:click(rail, rowAction(renderedRowFor(world, rail, 11))); world:advance(100)
 	assert(not world.sourceProcesses[heldBody].completed,
@@ -6323,54 +6473,9 @@ for _, consumer in ipairs({ "menu", "date" }) do
 		index += 1
 	end
 	assert(world.focused == 11 and world.focusWrites == 1 and not world:inspect().navigationPending,
-		"independent " .. consumer .. " work and the newest B navigation both finish after pruning A")
-	if consumer == "date" then
-		local choices = world.pickers[#world.pickers].options.items
-		assert(#choices == 1 and choices[1].resolved and choices[1].resolved.resolvedUTC == 1800000000
-			and choices[1].resolved.civilTime == "09:00",
-			"the independent queued date job must still deliver its resolved civil-time confirmation")
-		world:choose(1); world:advance(100)
-		world.holdSources, world.holdHeaders = false, false
-		world:completeSource(#world.sourceProcesses); world:advance(100)
-		assert(savedItemFor(world, 12).availableTime == "09:00" and savedItemFor(world, 12).untilUtc == 1800000000,
-			"surviving date work remains usable through its own fresh header and stores the confirmed time")
-	end
-	assert(savedItemFor(world, 12).disposition == "later" and savedItemFor(world, 10).reviewRevision ~= nil,
-		"pruning only navigation consumers preserves the independent " .. consumer .. " mutation and A's unread review")
-end
-
-for _, changeSelection in ipairs({ false, true }) do
-	local world = native(true)
-	world.agentState = "idle"
-	world:addTab(4, 11); world:addTab(5, 12)
-	world.additionalAgents = { [11] = "working", [12] = "idle" }
-	local path = "/sessions/pending-date-origin.jsonl"
-	world.identityFiles[12], world.sourceRecords[path] = path, nativeCanvas.sourceFact("pending-date-origin")
-	world.dateResponse = { status = "ready", resolvedUTC = 1800000000, civilTime = "09:00",
-		display = "2027-01-15 09:00:00 America/Los_Angeles", zone = "America/Los_Angeles" }
-	world:advance(3100)
-	local rail = world.opens[1].pane
-	world:control(rail, "workspace"); world:advance(100)
-	world:click(rail, rowAction(renderedRowFor(world, rail, 12), "menu")); world:choose(2)
-	world:answer("2027-01-15 09:00 America/Los_Angeles"); world:advance(100)
-	local revision = world:inspect().logical.revision
-	assert(world.pickers[#world.pickers].options.items[1].resolved,
-		"the date origin is captured before an unrelated conversation adds Attention")
-	world.additionalAgents[11] = "idle"
-	world:emit("agent_finished", { pane = 11, result = "done" }); world:advance(100)
-	local unrelated = savedItemFor(world, 11).reviewRevision
-	assert(unrelated ~= nil and world:inspect().logical.revision > revision,
-		"the unrelated completion changes derived anchors without changing the date target")
-	if changeSelection then
-		world:control(rail, "attention"); world:advance(100)
-		world:control(rail, "workspace"); world:advance(100)
-	end
-	world:choose(1); world:advance(100)
-	local item = savedItemFor(world, 12)
-	assert(item.disposition == (if changeSelection then "active" else "later")
-		and item.untilUtc == (if changeSelection then nil else 1800000000)
-		and savedItemFor(world, 11).reviewRevision == unrelated and world.focusWrites == 0,
-		"date confirmation survives derived list changes, but explicit away-and-back cancels without mutation")
+		"independent menu work and the newest B navigation both finish after pruning A")
+	assert(savedItemFor(world, 12).disposition == "finished" and savedItemFor(world, 10).reviewRevision ~= nil,
+		"pruning only navigation consumers preserves the independent menu mutation and A's unread review")
 end
 
 for _, targets in ipairs({ 2, 6 }) do
@@ -6448,8 +6553,8 @@ end
 -- ─── Workspace navigator ─────────────────────────────────────────────────────────────────────────────────
 -- Fixture: two conversations with an unread review (tab 3 in session Work, tab 4 in session Research) and a
 -- named note tab.
-local function workspaceWorld()
-	local world = native(true)
+local function workspaceWorld(position)
+	local world = native(true, nil, position)
 	world.agentState = "idle"
 	world.identityFiles[10], world.identityFiles[11] = "/sessions/ws-a.jsonl", "/sessions/ws-b.jsonl"
 	world:addTab(4, 11, 1, 7)
@@ -6472,19 +6577,16 @@ local function pickerIndex(world, id)
 end
 
 -- D4: navigation never changes review state or the Next attention round; review actions still do.
-for _, via in ipairs({ "attention-open", "workspace-note", "workspace-conversation", "later", "search", "previous", "reveal" }) do
+for _, via in ipairs({ "attention-open", "workspace-note", "workspace-conversation", "search", "previous", "reveal" }) do
 	local world, rail = workspaceWorld()
 	local revisionA, revisionB = savedItemFor(world, 10).reviewRevision, savedItemFor(world, 11).reviewRevision
 	assert(revisionA ~= nil and revisionB ~= nil and world:inspect().attentionCount == 2,
 		"both conversations carry an unread review before navigating")
-	local start = if via == "workspace-conversation" or via == "later" or via == "search" then 12 else 10
+	local start = if via == "workspace-conversation" or via == "search" then 12 else 10
 	if start == 12 then
 		-- The rail on screen is the one in the selected tab.
 		world:switch(5); world:advance(3100)
 		rail = world.opens[#world.opens].pane
-	end
-	if via == "later" then
-		world:click(rail, rowAction(renderedRowFor(world, rail, 10), "menu")); world:choose(1); world:advance(100)
 	end
 	local writes, focusBefore = world.triageWrites, world.focusWrites
 	local target = 10
@@ -6493,28 +6595,25 @@ for _, via in ipairs({ "attention-open", "workspace-note", "workspace-conversati
 	elseif via == "workspace-note" then
 		target = 12
 		world:control(rail, "workspace"); world:advance(100)
-		world:click(rail, wsPart(world, rail, "pane:local#12", "open")); world:advance(100)
+		world:click(rail, wsPart(world, rail, "tab:local#5", "open")); world:advance(100)
 	elseif via == "workspace-conversation" then
 		world:control(rail, "workspace"); world:advance(100)
-		world:click(rail, rowAction(renderedRowFor(world, rail, 10), "route-open")); world:advance(100)
-	elseif via == "later" then
-		world:control(rail, "later"); world:advance(100)
-		world:click(rail, rowAction(renderedRowFor(world, rail, 10), "route-open")); world:advance(100)
+		world:click(rail, wsPart(world, rail, "tab:local#3", "open")); world:advance(100)
 	elseif via == "search" then
 		world:control(rail, "search")
 		world:choose(pickerIndex(world, "pane:local#10")); world:advance(100)
 	elseif via == "previous" then
 		world:control(rail, "workspace"); world:advance(100)
-		world:click(rail, wsPart(world, rail, "pane:local#12", "open")); world:advance(100)
+		world:click(rail, wsPart(world, rail, "tab:local#5", "open")); world:advance(100)
 		assert(world.focused == 12, "the detour reached the note")
 		world:advance(3100)
 		world:control(world.opens[#world.opens].pane, "previous"); world:advance(100)
 	else
 		world:control(rail, "workspace"); world:advance(100)
 		world:click(rail, wsPart(world, rail, "session:local#2", "toggle")); world:advance(100)
-		assert(not wsRow(world, rail, "r" .. savedItemFor(world, 10).serial), "the collapsed session hides its conversation")
-		world:control(rail, "location"); world:advance(100)
-		assert(wsRow(world, rail, "r" .. savedItemFor(world, 10).serial), "Reveal current opens the collapsed session")
+		assert(not wsRow(world, rail, "tab:local#3"), "the collapsed session hides its tab")
+		world:command("reveal"); world:advance(100)
+		assert(wsRow(world, rail, "tab:local#3"), "Reveal current opens the collapsed session around the current pane's tab")
 		target = 10
 	end
 	local acknowledged = via == "attention-open"
@@ -6527,14 +6626,14 @@ for _, via in ipairs({ "attention-open", "workspace-note", "workspace-conversati
 			"Attention Open acknowledges exactly the displayed review")
 	else
 		assert(savedItemFor(world, 10).reviewRevision == revisionA and world.triageWrites == writes
-			and world:inspect().attentionCount == (if via == "later" then 1 else 2),
+			and world:inspect().attentionCount == 2,
 			via .. " is navigation only: no acknowledgment and no tracking write")
 	end
 	world.focused = rail
 	world:command("next"); world:advance(100)
-	assert(world.focused == (if acknowledged or via == "later" then 11 else 10),
+	assert(world.focused == (if acknowledged then 11 else 10),
 		via .. " leaves the Next attention round where it was")
-	if not acknowledged and via ~= "later" then
+	if not acknowledged then
 		assert(savedItemFor(world, 10).reviewRevision == nil,
 			"Next attention still acknowledges the review it opens")
 	end
@@ -6562,6 +6661,27 @@ local function hasLabel(labels, needle)
 	return false
 end
 
+-- A reference conversation with no open pane is in no queue. Search still lists it, choosing it refuses plainly,
+-- and nothing moves focus.
+do
+	local world, rail = workspaceWorld()
+	local serial = savedItemFor(world, 10).serial
+	world:click(rail, rowAction(renderedRowFor(world, rail, 10), "menu")); world:chooseLabel("Keep as reference"); world:advance(100)
+	world:closePane(10); world:advance(100)
+	world:switch(4); world:advance(3100)
+	rail = world.opens[#world.opens].pane
+	assert(not nativeCanvas.childAt(sectionRows(world, rail, "attention"), "r" .. serial)
+		and not nativeCanvas.childAt(sectionRows(world, rail, "working"), "r" .. serial),
+		"the reference conversation without an open pane is in no queue")
+	local focusBefore, switches = world.focusWrites, #world.sessionSwitches
+	world:control(rail, "search")
+	world:choose(pickerIndex(world, "retained:work:" .. serial)); world:advance(100)
+	assert(toastCount(world, "info", "No open pane") == 1
+		and world.focusWrites == focusBefore and #world.sessionSwitches == switches,
+		"choosing the saved conversation refuses plainly and navigates nowhere")
+end
+
+
 local function chooseContaining(world, needle)
 	for index, label in ipairs(menuLabels(world)) do
 		if string.find(label, needle, 1, true) then world:choose(index); return end
@@ -6576,9 +6696,9 @@ for _, placement in ipairs({ "parked", "floating", "unattached" }) do
 	if placement == "parked" then world.parked[12] = true
 	elseif placement == "floating" then world.floating[12], world.floats[5] = true, { { pane = 12, over = 11, corner = "top_right" } }
 	else world.membership[12], world.tabs[5], world.loose[12] = nil, nil, true end
-	world:advance(100)
+	world:advance(3100)
 	world:control(rail, "workspace"); world:advance(100)
-	local action = wsPart(world, rail, "pane:local#12", "open")
+	local action = wsPart(world, rail, if placement == "floating" then "tab:local#5" else "pane:local#12", "open")
 	assert(action, "the " .. placement .. " pane is listed with its own open control")
 	local focusBefore, layoutBefore = world.focusWrites, world.layoutWrites
 	world:click(rail, action); world:advance(100)
@@ -6595,20 +6715,23 @@ for _, placement in ipairs({ "parked", "floating", "unattached" }) do
 	assert(world.settingsWrites == 0, "no native setting is written")
 end
 
--- Tab rows focus their content (never an owned canvas), session rows switch session (empty ones too), and host
--- rows switch host; a disconnected host is refused with nothing else done.
+-- Tab rows focus their content (never an owned canvas), a session label discloses its tabs, and a host band
+-- discloses its sessions; a session with no visible tab is listed by name on the No tabs line, which opens a tab there.
 do
 	local world, rail = workspaceWorld()
 	world.sessions[9] = { host = 1, name = "Empty" }
 	table.insert(world.sessionOrder, 9)
-	world:advance(100)
+	world:advance(3100)
 	world:control(rail, "workspace"); world:advance(100)
 	assert(wsRow(world, rail, "pane:local#" .. rail) == nil, "the navigator never lists its own canvas")
-	local emptyOpen = wsPart(world, rail, "session:local#9", "open")
-	assert(emptyOpen, "an empty session stays listed and selectable")
-	world:click(rail, emptyOpen); world:advance(100)
-	assert(world.currentSession == 9 and world.sessionSwitches[#world.sessionSwitches] == 9 and world.focusWrites == 0,
-		"a session row switches the native session")
+	assert(wsRow(world, rail, "session:local#9") and not wsPart(world, rail, "session:local#9", "toggle"),
+		"a session with no visible tab is listed, with nothing to disclose")
+	local sessionToggle = wsPart(world, rail, "session:local#7", "toggle")
+	assert(sessionToggle, "a session with tabs stays listed with its disclosure")
+	local tabsBefore = #world.newTabs
+	world:click(rail, wsPart(world, rail, "session:local#9", "open")); world:advance(100)
+	assert(world.currentSession == 9 and #world.newTabs == tabsBefore + 1,
+		"opening an empty session switches to it and opens its first tab")
 	world:switch(5); world:advance(3100)
 	local noteRail = world.opens[#world.opens].pane
 	world.focused = noteRail
@@ -6617,38 +6740,220 @@ do
 		"a tab row focuses its content pane even when its focused pane is the owned canvas")
 end
 
-for _, state in ipairs({ "connected", "disconnected" }) do
+do
 	local world, rail = workspaceWorld()
 	world:addTab(6, 13, 8, 21)
 	world.sessions[21].name, world.hostNames = "Laptop work", { [8] = "Laptop" }
-	world:advance(100)
+	world:advance(3100)
 	world:control(rail, "workspace"); world:advance(100)
-	if state == "disconnected" then world.hostStates[8] = "disconnected"; world:advance(1100) end
-	local action = wsPart(world, rail, "host:6:host-8", "open")
-	assert(action, "a host row is listed once two hosts have content")
+	local hostRow = wsRow(world, rail, "host:6:host-8")
+	assert(hostRow and hostRow.p.tag == "button" and hostRow.p.actions and hostRow.p.actions.click,
+		"a host row is listed once two hosts have content, and its whole row is the disclosure")
+	world:click(rail, wsPart(world, rail, "tab:host-8#6", "open")); world:advance(100)
+	assert(#world.hostSwitches == 1 and world.hostSwitches[1] == 8 and world.currentHost == 8,
+		"a tab row on another host switches to that host")
+end
+-- A tab row on an offline host is refused like its host row: native focus does not change.
+do
+	local world, rail = workspaceWorld()
+	world:addTab(6, 13, 8, 21)
+	world.sessions[21].name, world.hostNames = "Laptop work", { [8] = "Laptop" }
+	world:advance(3100)
+	world:control(rail, "workspace"); world:advance(100)
+	world.hostStates[8] = "disconnected"; world:advance(1100)
+	local action = wsPart(world, rail, "tab:host-8#6", "open")
+	assert(action, "an offline host's tab row is listed with its open control")
+	local focused = world.focused
 	world:click(rail, action); world:advance(100)
-	if state == "connected" then
-		assert(#world.hostSwitches == 1 and world.hostSwitches[1] == 8 and world.currentHost == 8, "a host row switches host")
-	else
-		assert(#world.hostSwitches == 0 and world.focusWrites == 0 and toastCount(world, "info", "Host is offline") == 1,
-			"a disconnected host is refused and nothing else is done")
-	end
+	assert(world.focusWrites == 0 and world.focused == focused and #world.hostSwitches == 0
+		and toastCount(world, "info", "Host is offline · nothing changed") == 1,
+		"a tab row on an offline host is refused and focus does not change")
 end
 
 -- A control that no longer matches the native world is "Target changed", never a position or title fallback.
 do
 	local world, rail = workspaceWorld()
 	world:control(rail, "workspace"); world:advance(100)
-	local note = wsPart(world, rail, "pane:local#12", "open")
-	local conversation = rowAction(renderedRowFor(world, rail, 10), "route-open")
+	local note = wsPart(world, rail, "tab:local#5", "open")
+	local conversation = wsPart(world, rail, "tab:local#3", "open")
 	world.membership[12] = 4
 	world:click(rail, note)
 	assert(toastCount(world, "info", "Target changed") == 1 and world.focusWrites == 0 and world.focused == 10,
 		"a pane that moved tabs since the row was drawn is not activated")
+	-- The rail's own tab loses its last content pane: the rail closes inside that close event, never left alone in the tab.
 	world:closePane(10)
-	world:click(rail, conversation)
-	assert(toastCount(world, "info", "Target changed") == 2 and world.focusWrites == 0,
-		"a conversation route whose pane closed is not activated")
+	assert(world.canvases[rail] == nil and world.focusWrites == 0, "a tab whose only content pane closed takes its rail with it")
+end
+
+-- A tab created while the window watches gets its rail inside its own events (native order: the shell's pane_created,
+-- tab_created, then focus), with no restore grace and no timer.
+do
+	local world = native(true)
+	world:advance(3100)
+	local before = #world.opens
+	world:addTab(4, 11)
+	world:emit("pane_created", { pane = 11 })
+	world:emit("tab_created", { tab = 4 })
+	world:switch(4)
+	local opened = world.opens[before + 1]
+	assert(opened and world.membership[opened.pane] == 4, "the new tab's rail opens inside its creation events")
+end
+
+-- Closing the last tab of the current session goes back to where you were before (the empty session stays listed);
+-- the window never sits in a session Attention cannot show itself in.
+do
+	local world = native(true)
+	world:advance(3100)
+	world:addTab(4, 11, 1, 21)
+	world:switch(4); world:advance(3100)
+	local tabRail = world.opens[#world.opens].pane
+	assert(world.membership[tabRail] == 4 and world.currentSession == 21, "fixture: the other session's tab has its rail")
+	world.tabs[4].content = nil
+	world:closePane(11)
+	assert(world.canvases[tabRail] == nil, "the emptied tab's rail closed with its last content pane")
+	world.tabs[4], world.focused = nil, nil
+	world:emit("tab_closed", { tab = 4 })
+	assert(world.focused == 10 and world.currentSession == 2,
+		"closing the session's last tab returns to the pane focused before it, in its own session")
+end
+
+-- The agent census is Tern's costliest read: a quiet heartbeat reuses it, an agent event re-reads it at once, and the
+-- refresh age bounds how stale the fields without an event (model, delivery error) can be.
+do
+	local world = native(true)
+	world:advance(8000)
+	local reads = world.agentListReads
+	world.agentState = "working"
+	world:advance(100)
+	assert(world.agentListReads > reads and world:inspect().attentionCount == 0,
+		"an agent state change is read in the pass its event schedules")
+	reads = world.agentListReads
+	world:advance(4000)
+	assert(world.agentListReads == reads, "quiet heartbeats reuse the agent census")
+	world:advance(2000)
+	assert(world.agentListReads == reads + 1, "the census refreshes once its age passes the refresh bound")
+end
+
+-- Closing a tab that leaves its session with other tabs moves nothing.
+do
+	local world = native(true)
+	world:advance(3100)
+	world:addTab(4, 11)
+	world:switch(4); world:advance(3100)
+	local writes = world.focusWrites
+	world:closePane(11)
+	world.tabs[4] = nil
+	world:emit("tab_closed", { tab = 4 })
+	assert(world.focusWrites == writes, "a session that still has tabs is left to native focus")
+end
+
+-- The rail's place line carries the focused conversation's model in its tooltip, and names none without a model.
+do
+	local world, rail = workspaceWorld()
+	local function placeTooltip()
+		local found = nil
+		local function visit(node)
+			if node.p and node.p.hidden then return end
+			if node.p and node.p.role == "attention.location" and node.p.tag == "button" then found = node.p.title end
+			for _, child in ipairs(node.c or {}) do visit(child) end
+		end
+		visit(world.canvases[rail].view)
+		return found
+	end
+	world.models = { [10] = "GPT-6 Astra" }
+	world:emit("agent_state", { pane = 10, old = "idle", new = "idle" }); world:advance(3100)
+	world:control(rail, "workspace"); world:advance(100)
+	assert(placeTooltip() and string.find(placeTooltip(), "GPT-6 Astra", 1, true),
+		"the place line's tooltip names the focused conversation's model")
+	world.models = {}
+	world:emit("agent_state", { pane = 10, old = "idle", new = "idle" }); world:advance(3100)
+	assert(placeTooltip() and not string.find(placeTooltip(), "GPT-6 Astra", 1, true),
+		"a place with no model names none in the place line's tooltip")
+end
+
+-- An agent's model is display only: flipping it re-renders the sub-line and moves no target signature, row key, or
+-- control binding, so a control drawn before the flip still activates instead of refusing with "Target changed".
+do
+	local world, rail = workspaceWorld()
+	local function modelLine(row)
+		local found = nil
+		local function visit(node)
+			if node.p and node.p.hidden then return end
+			if node.p and node.p.role == "attention.model-line" and node.p.text ~= "" then found = node.p.text end
+			for _, child in ipairs(node.c or {}) do visit(child) end
+		end
+		visit(row)
+		return found
+	end
+	local function conversationRow(pane)
+		return (nativeCanvas.childAt(sectionRows(world, rail, "attention"), "r" .. savedItemFor(world, pane).serial))
+	end
+	local function rowKeys()
+		local keys = {}
+		for _, row in ipairs(sectionRows(world, rail, "workspace").c) do table.insert(keys, row.p.key) end
+		return table.concat(keys, ",")
+	end
+	local function setModels(models)
+		world.models = models
+		world:emit("agent_state", { pane = 10, old = "idle", new = "idle" }); world:advance(3100)
+	end
+	setModels({ [10] = "GPT-6 Astra", [11] = "Claude Opus 4.6" })
+	world:control(rail, "workspace"); world:advance(100)
+	assert(modelLine(conversationRow(10)) == "GPT-6 Astra" and modelLine(conversationRow(11)) == "Claude Opus 4.6",
+		"two different models: each Attention row names its own on the sub-line")
+	local conversation = rowAction(conversationRow(10))
+	local note = wsPart(world, rail, "tab:local#5", "open")
+	local tab = wsPart(world, rail, "tab:local#3", "open")
+	local session = wsPart(world, rail, "session:local#7", "toggle")
+	local keys = rowKeys()
+	assert(conversation and note and tab and session)
+	local focusBefore = world.focusWrites
+	for _, step in ipairs({
+		{ models = { [10] = "GPT-6 Terra", [11] = "Claude Opus 4.6" }, first = "GPT-6 Terra", second = "Claude Opus 4.6" },
+		{ models = { [10] = "Claude Opus 4.6", [11] = "Claude Opus 4.6" }, first = "Claude Opus 4.6", second = "Claude Opus 4.6" },
+		{ models = {}, first = false, second = false },
+		{ models = { [10] = "GPT-6 Astra", [11] = "Claude Opus 4.6" }, first = "GPT-6 Astra", second = "Claude Opus 4.6" },
+	}) do
+		setModels(step.models)
+		local firstRow, secondRow = conversationRow(10), conversationRow(11)
+		assert((modelLine(firstRow) or false) == step.first and (modelLine(secondRow) or false) == step.second,
+			"the sub-line follows the model: a known model shows even when every row shares it, and an absent model draws none")
+		assert(rowAction(firstRow) == conversation and wsPart(world, rail, "tab:local#5", "open") == note
+			and wsPart(world, rail, "tab:local#3", "open") == tab
+			and wsPart(world, rail, "session:local#7", "toggle") == session and rowKeys() == keys,
+			"a model change redraws no control binding and no row key")
+		assert(toastCount(world, "info", "Target changed") == 0, "a model change never refuses a target")
+	end
+	world:click(rail, note); world:advance(100)
+	assert(world.focused == 12 and world.focusWrites == focusBefore + 1 and toastCount(world, "info", "Target changed") == 0,
+		"a control drawn before the model flipped still activates its exact target")
+end
+
+-- A model that changes with no other event still reaches the rail: the paint gate must see the displayed model, not only
+-- the identity signature, or the sub-line keeps a model the agent no longer reports.
+do
+	local world, rail = workspaceWorld()
+	local function modelLine(row)
+		local found = nil
+		local function visit(node)
+			if node.p and node.p.hidden then return end
+			if node.p and node.p.role == "attention.model-line" and node.p.text ~= "" then found = node.p.text end
+			for _, child in ipairs(node.c or {}) do visit(child) end
+		end
+		visit(row)
+		return found
+	end
+	local function conversationRow()
+		return (nativeCanvas.childAt(sectionRows(world, rail, "attention"), "r" .. savedItemFor(world, 10).serial))
+	end
+	world.models = { [10] = "GPT-6 Astra" }
+	world:emit("agent_state", { pane = 10, old = "idle", new = "idle" }); world:advance(3100)
+	world:control(rail, "workspace"); world:advance(100)
+	assert(modelLine(conversationRow()) == "GPT-6 Astra", "fixture: the first model paints")
+	world.models = { [10] = "Claude Opus 4.6" }
+	world:advance(3100)
+	assert(modelLine(conversationRow()) == "Claude Opus 4.6",
+		"a model change with no other event repaints the sub-line")
 end
 
 -- Search offers the complete inventory, cancel is inert, and an answer acts only in its own epoch and owner.
@@ -6684,7 +6989,7 @@ for _, change in ipairs({ "owner", "epoch", "reload", "selection", "moved", "err
 	if change == "owner" then world.prefs.owner = "other"
 	elseif change == "epoch" then world:command("disable"); world:command("enable")
 	elseif change == "reload" then world:reload()
-	elseif change == "selection" then world:control(rail, "later")
+	elseif change == "selection" then world:toggleQueue(rail, "attention")
 	elseif change == "moved" then world.membership[12] = 4 end
 	local focusBefore, toastsBefore = world.focusWrites, #world.toasts
 	world:choose(index, if change == "error" then "picker unavailable" else nil)
@@ -6694,35 +6999,62 @@ for _, change in ipairs({ "owner", "epoch", "reload", "selection", "moved", "err
 	assert(change == "reload" or #world.toasts > toastsBefore, "a refused search answer says so after " .. change)
 end
 
--- Reveal current opens a deferred conversation's Set aside group and persists that disclosure.
+-- Reveal current opens the collapsed session around a pane inside a tab and lands on that tab's row; the panes of a
+-- tab have no rows of their own.
 do
 	local world, rail = workspaceWorld()
 	world.membership[13], world.paneHosts[13] = 4, 1
 	world.layouts[4] = { split = "right", ratio = 0.5, [1] = { pane = 11 }, [2] = { pane = 13 } }
 	world.paneInfo[13] = { kind = "terminal", title = "Shell" }
 	world:advance(100)
-	world:click(rail, rowAction(renderedRowFor(world, rail, 11), "menu")); world:choose(1); world:advance(100)
 	world:control(rail, "workspace"); world:advance(100)
-	local serial = savedItemFor(world, 11).serial
-	assert(wsRow(world, rail, "tab:local#4") and wsPart(world, rail, "aside:tab:local#4", "aside")
-		and not wsRow(world, rail, "r" .. serial), "the deferred conversation is collapsed under Set aside")
+	assert(wsRow(world, rail, "tab:local#4") and not wsRow(world, rail, "pane:local#13")
+		and not wsRow(world, rail, "r" .. savedItemFor(world, 11).serial), "a tab with two panes is one row")
+	world:click(rail, wsPart(world, rail, "session:local#7", "toggle")); world:advance(100)
+	assert(not wsRow(world, rail, "tab:local#4"), "the collapsed session hides its tabs")
 	world:switch(4); world:advance(3100)
 	local tabRail = world.opens[#world.opens].pane
-	world:control(tabRail, "location"); world:advance(100)
-	assert(wsRow(world, tabRail, "r" .. serial), "Reveal current opens the Set aside group around the current pane")
-	assert(world.prefs.uiByWindow.desktop.setAsideOpen["tab:local#4"] == true and world.focusWrites == 0
-		and savedItemFor(world, 11).disposition == "later", "the disclosure persists and nothing else changes")
+	local focusBefore = world.focusWrites
+	world:command("reveal"); world:advance(100)
+	assert(wsRow(world, tabRail, "tab:local#4") and world.prefs.uiByWindow.desktop.collapsed["session:local#7"] == false
+		and world.focusWrites == focusBefore,
+		"Reveal current opens the session around the current pane's tab row and persists that disclosure")
+end
+
+-- A linked parked conversation's row is keyed by its conversation, not its pane: Reveal current still finds it and
+-- opens the collapsed Parked section around it.
+do
+	local world, rail = workspaceWorld()
+	world.parked[11] = true
+	world:advance(3100)
+	world:control(rail, "workspace"); world:advance(100)
+	local row = "r" .. savedItemFor(world, 11).serial
+	assert(wsRow(world, rail, row), "fixture: the parked conversation is listed under Parked")
+	world:click(rail, wsPart(world, rail, "section:parked:local", "toggle")); world:advance(100)
+	assert(not wsRow(world, rail, row), "fixture: the collapsed Parked section hides it")
+	world.focused = 11
+	world:emit("focus", { pane = 11 }); world:advance(100)
+	local focusBefore = world.focusWrites
+	world:command("reveal"); world:advance(100)
+	assert(wsRow(world, rail, row) and world.prefs.uiByWindow.desktop.collapsed["section:parked:local"] == false
+		and world.focusWrites == focusBefore and toastCount(world, nil, "not listed") == 0,
+		"Reveal current opens the Parked section around a linked parked pane without moving focus")
 end
 
 -- The location line is Workspace-only. The rail is not a destination: with the rail itself focused, the line and
 -- Reveal current keep naming the last active content pane, until that pane disappears.
 do
 	local world, rail = workspaceWorld()
-	assert(visibleText(headerPart(world, rail, "location")) == "", "Attention shows no current-location line")
-	world:control(rail, "later"); world:advance(100)
-	assert(visibleText(headerPart(world, rail, "location")) == "", "Later shows no current-location line")
-	world:control(rail, "working"); world:advance(100)
-	assert(visibleText(headerPart(world, rail, "location")) == "", "Currently working shows no current-location line")
+	local function holdsKey(node, key)
+		if node.p and node.p.key == key then return true end
+		for _, child in ipairs(node.c or {}) do
+			if holdsKey(child, key) then return true end
+		end
+		return false
+	end
+	assert(not holdsKey(descend(world.canvases[rail].view, "top"), "location"),
+		"the Attention and Working sections show no current-location line")
+	assert(holdsKey(descend(world.canvases[rail].view, "bottom"), "location"), "the Workspace region owns the line")
 	world:control(rail, "workspace"); world:advance(100)
 	local content = visibleText(headerPart(world, rail, "location"))
 	assert(not string.find(content, "No current location", 1, true) and string.find(content, "Agent", 1, true),
@@ -6733,9 +7065,9 @@ do
 	assert(world.focused == rail and visibleText(headerPart(world, rail, "location")) == content
 		and headerPart(world, rail, "location").p.tag == "button", "rail focus keeps naming the last content location")
 	world:click(rail, wsPart(world, rail, "session:local#2", "toggle")); world:advance(100)
-	assert(not wsRow(world, rail, "r" .. savedItemFor(world, 10).serial), "the collapsed session hides its conversation")
-	world:control(rail, "location"); world:advance(100)
-	assert(wsRow(world, rail, "r" .. savedItemFor(world, 10).serial) and world.focused == rail,
+	assert(not wsRow(world, rail, "tab:local#3"), "the collapsed session hides its tab")
+	world:command("reveal"); world:advance(100)
+	assert(wsRow(world, rail, "tab:local#3") and world.focused == rail,
 		"Reveal current from the focused rail reveals the last content destination without moving focus")
 	-- A second tab with two content panes keeps its rail when one of them closes.
 	world:addTab(6, 14, 1, 2)
@@ -6747,18 +7079,19 @@ do
 	local second = world.opens[#world.opens].pane
 	world.focused = 15
 	world:emit("focus", { pane = 15 }); world:advance(100)
-	assert(string.find(visibleText(headerPart(world, second, "location")), "Shell B", 1, true), "the focused content pane is the location")
+	assert(string.find(tooltipText(headerPart(world, second, "location")), "Shell B", 1, true), "the focused content pane is the location")
 	world.focused = second
 	world:emit("focus", { pane = second }); world:advance(100)
-	assert(string.find(visibleText(headerPart(world, second, "location")), "Shell B", 1, true), "the rail focus keeps Shell B")
+	assert(string.find(tooltipText(headerPart(world, second, "location")), "Shell B", 1, true), "the rail focus keeps Shell B")
 	world:closePane(15); world:advance(100)
-	assert(world.canvases[second] and string.find(visibleText(headerPart(world, second, "location")), "No current location", 1, true),
+	assert(world.canvases[second] and headerPart(world, second, "location") == nil,
 		"the tracked content pane is forgotten when it disappears")
 end
 
--- D3: the control window returns to where it left off; nothing transient is saved or replayed.
+-- D3: the control window returns to where it left off; nothing transient is saved or replayed. The strip saves its
+-- selected section; the stack has no section to select and saves only its disclosures (next test).
 do
-	local world, rail = workspaceWorld()
+	local world, rail = workspaceWorld("bottom")
 	assert(world:inspect().logical.section == "attention" and world.prefs.uiByWindow.desktop == nil,
 		"first-ever activation starts in Attention")
 	world:control(rail, "workspace"); world:advance(100)
@@ -6766,17 +7099,122 @@ do
 	local saved = world.prefs.uiByWindow.desktop
 	assert(saved.section == "workspace" and saved.collapsed["session:local#7"] == true, "section and collapse are saved")
 	for key in saved do
-		assert(key == "section" or key == "collapsed" or key == "setAsideOpen", "only navigator state is persisted: " .. key)
+		assert(key == "section" or key == "collapsed", "only navigator state is persisted: " .. key)
 	end
 	world:control(rail, "search")
 	local pickers, focusBefore = #world.pickers, world.focusWrites
 	world:reload(); world:advance(3100)
 	assert(world:inspect().logical.section == "workspace" and #world.pickers == pickers and world.focusWrites == focusBefore,
 		"the saved mode returns without replaying any action or reopening the picker")
-	assert(wsRow(world, rail, "session:local#7") and not wsPart(world, rail, "pane:local#11", "open")
-		and not wsRow(world, rail, "r" .. savedItemFor(world, 11).serial), "the collapsed session stays collapsed")
+	assert(wsRow(world, rail, "session:local#7") and not wsRow(world, rail, "tab:local#4"),
+		"the collapsed session stays collapsed")
 	world:control(rail, "attention"); world:advance(2100)
 	assert(world:inspect().logical.section == "attention", "restoring happens once and never overrides a later choice")
+end
+
+-- This Mac's sessions start open on a stack rail. An explicit choice is stored and survives a reload: closing a session
+-- stores `true`, and reopening it over the open default stores `false`, which must not collapse back after a reload.
+do
+	local world, rail = workspaceWorld()
+	assert(world.prefs.uiByWindow.desktop == nil, "first-ever activation has saved nothing")
+	assert(wsRow(world, rail, "tab:local#3") and wsRow(world, rail, "tab:local#4"),
+		"this Mac's sessions start open on a stack rail")
+	world:click(rail, wsPart(world, rail, "session:local#2", "toggle")); world:advance(100)
+	assert(world.prefs.uiByWindow.desktop.collapsed["session:local#2"] == true
+		and world.prefs.uiByWindow.desktop.collapsed["session:local#7"] == nil,
+		"closing one session stores its explicit choice and leaves the other at its default")
+	assert(not wsRow(world, rail, "tab:local#3"), "the closed session lists no tabs")
+	world:click(rail, wsPart(world, rail, "session:local#2", "toggle")); world:advance(100)
+	assert(world.prefs.uiByWindow.desktop.collapsed["session:local#2"] == false,
+		"reopening a session over the open default is stored as explicit false")
+	world:reload(); world:advance(3100)
+	local restored = world.prefs.uiByWindow.desktop
+	assert(restored.collapsed["session:local#2"] == false and wsRow(world, rail, "tab:local#3"),
+		"the explicit open survives the reload cycle with no click after it")
+end
+
+-- A tab with no open pane has no Workspace row; Search can still name it, and choosing it is refused by name with
+-- nothing changed.
+do
+	local world, rail = workspaceWorld()
+	world.tabs[6] = { session = 7, host = 1, name = "Empty tab" }
+	world:advance(3100)
+	world:control(rail, "workspace"); world:advance(100)
+	assert(not wsRow(world, rail, "tab:local#6"), "an empty tab has no Workspace row")
+	world:control(rail, "search")
+	local index = pickerIndex(world, "tab:local#6")
+	local focusBefore, switches = world.focusWrites, #world.sessionSwitches
+	world:choose(index); world:advance(100)
+	assert(toastCount(world, "info", "Tab has no open pane · nothing changed") == 1
+		and world.focusWrites == focusBefore and #world.sessionSwitches == switches,
+		"a tab with no open pane is refused and nothing changes")
+end
+
+-- The Workspace header's Minimize folds the tree into its header (the top region takes nearly all of the rail), and
+-- Show restores the share the rail had. Layout only: nothing is focused or saved.
+do
+	local world, rail = workspaceWorld()
+	world:advance(100)
+	local function topShare() return world.canvases[rail].view.p.sizes[1] end
+	local function minimizeControl() return keyedAction(descend(world.canvases[rail].view, "bottom", "head"), "minimize") end
+	local before, focusBefore, prefsBefore = topShare(), world.focusWrites, world.preferenceWrites
+	world:click(rail, minimizeControl()); world:advance(100)
+	assert(math.abs(topShare() - 0.9) < 0.001, "minimize gives the attention region nine tenths of the rail")
+	assert(descend(world.canvases[rail].view, "bottom", "rows").p.hidden == true, "minimized Workspace rows are hidden")
+	world:click(rail, minimizeControl()); world:advance(100)
+	assert(math.abs(topShare() - before) < 0.001, "Show restores the share the rail had before minimizing")
+	assert(descend(world.canvases[rail].view, "bottom", "rows").p.hidden == false, "shown Workspace rows return")
+	assert(world.focusWrites == focusBefore and world.preferenceWrites == prefsBefore,
+		"minimizing is layout only: nothing is focused or saved")
+end
+
+-- The gear names the queue Settings returns to, and the Settings heading's Back closes Settings on that same queue.
+do
+	local world, rail = workspaceWorld()
+	world:advance(100)
+	local function titled(node, key)
+		if node.p and node.p.key == key and node.p.title then return node.p.title end
+		for _, child in node.c or {} do
+			local found = titled(child, key)
+			if found then return found end
+		end
+		return nil
+	end
+	world:control(rail, "settings"); world:advance(100)
+	local view = world.canvases[rail].view
+	assert(world:inspect().logical.settings == true and titled(view, "settings") == "Back to Attention",
+		"the gear names the queue it returns to while Settings is open")
+	world:click(rail, keyedAction(view, "back")); world:advance(100)
+	assert(world:inspect().logical.settings == false and world:inspect().logical.section == "attention",
+		"the Settings Back control closes Settings and keeps the queue it came from")
+	assert(world.settingsWrites == 0, "closing Settings writes no native setting")
+end
+
+-- A click that reaches its canvas before the timer pass repaints acts on the control that canvas still shows, and
+-- never reports a refusal. A control the newer paint no longer shows does nothing.
+do
+	local world, rail = workspaceWorld()
+	world:advance(100)
+	local errors, gear = toastCount(world, "error", ""), keyedAction(world.canvases[rail].view, "settings")
+	world:toggleQueue(rail, "working")
+	world:click(rail, gear)
+	world:advance(100)
+	assert(world:inspect().logical.settings == true and toastCount(world, "error", "") == errors,
+		"a gear click that lands before the queue toggle paints still opens Settings without a refusal")
+end
+
+do
+	local world, rail = workspaceWorld("bottom")
+	world:advance(100)
+	local view = world.canvases[rail].view
+	local open, working = rowAction(shown(world, rail)), keyedAction(view, "working")
+	assert(open and working, "fixture: an Attention row and the Working tab are on screen")
+	local focuses, errors = world.focusWrites, toastCount(world, "error", "")
+	world:click(rail, working)
+	world:click(rail, open)
+	world:advance(100)
+	assert(world:inspect().logical.section == "working" and world.focusWrites == focuses and toastCount(world, "error", "") == errors,
+		"a row the newer paint no longer shows does nothing, while the Working tab still takes effect")
 end
 
 -- New… works with no rail at all (an empty session), names its destination before committing, and confirms each
@@ -6858,8 +7296,12 @@ for _, honest in ipairs({ true, false }) do
 	world.ignoreRename = not honest
 	world:control(rail, "workspace"); world:advance(100)
 	world:click(rail, wsPart(world, rail, "tab:local#5", "menu"))
-	local labels = menuLabels(world)
-	assert(#labels == 2 and labels[1] == "Rename tab…" and labels[2] == "New tab here", "a tab offers rename and a new tab")
+	local labels = {}
+	for _, label in ipairs(menuLabels(world)) do
+		if not string.find(label, "^Move ") then table.insert(labels, label) end
+	end
+	assert(#labels == 4 and labels[1] == "Rename tab…" and labels[2] == "New tab here"
+		and labels[3] == "Park (keep program alive)" and labels[4] == "Close", "a tab with panes offers rename, a new tab, park and close")
 	world:choose(1); world:answer("Docs"); world:advance(100)
 	assert(world.renames[1].tab == 5 and world.renames[1].name == "Docs", "the tab is renamed by its explicit id")
 	if honest then
@@ -6868,30 +7310,216 @@ for _, honest in ipairs({ true, false }) do
 	else
 		assert(toastCount(world, "error", "Tab was not renamed") == 1, "an ignored rename is reported")
 	end
-	world:click(rail, wsPart(world, rail, "session:local#7", "menu"))
-	assert(menuLabels(world)[1] == "Rename session…", "a session offers rename")
-	world:choose(1); world:answer("Studies"); world:advance(100)
-	assert(world.renames[2].session == 7 and world.renames[2].name == "Studies", "the session is renamed by its explicit id")
-	if honest then assert(world.sessions[7].name == "Studies")
-	else assert(toastCount(world, "error", "Session was not renamed") == 1) end
 end
 
 do
 	local world, rail = workspaceWorld()
 	world:control(rail, "workspace"); world:advance(100)
-	world:click(rail, wsPart(world, rail, "session:local#7", "menu"))
+	world:click(rail, wsPart(world, rail, "tab:local#5", "menu"))
 	world:chooseLabel("New tab here"); world:advance(100)
 	assert(world.sessionSwitches[#world.sessionSwitches] == 7 and #world.newTabs == 1
 		and world.tabs[world.nextTab - 1].session == 7, "a new tab is created in the row's own session")
 	assert(#world.closes == 0 and toastCount(world, "error", "") == 0, "creating a tab closes nothing")
 	for _, run in ipairs(world.actionRuns) do assert(not string.find(run, "close", 1, true), "no close action is ever run") end
-	for _, kind in ipairs({ "tab:local#5", "session:local#7" }) do
-		world:click(rail, wsPart(world, rail, kind, "menu"))
-		for _, label in ipairs(menuLabels(world)) do
-			assert(not string.find(string.lower(label), "close", 1, true), "the plugin never offers close")
-		end
-		world:choose(nil)
+end
+
+-- Tab rows that own panes offer Park and Close for every one of those panes, counted in the label when more than
+-- one; a tab with no panes and a session row offer neither. Close is one deliberate menu choice with no second prompt.
+local function tabPaneIds(world, tab)
+	local ids = {}
+	for pane, membership in world.membership do
+		if membership == tab and not world.parked[pane] then table.insert(ids, pane) end
 	end
+	table.sort(ids)
+	return ids
+end
+local function nonMoveLabels(world)
+	local labels = {}
+	for _, label in ipairs(menuLabels(world)) do
+		if not string.find(label, "^Move ") then table.insert(labels, label) end
+	end
+	return labels
+end
+
+for _, op in ipairs({ "park", "close" }) do
+	local world, rail = workspaceWorld()
+	world.tabs[6] = { session = 7, host = 1 }
+	world:advance(3100)
+	world:control(rail, "workspace"); world:advance(100)
+
+	world:click(rail, wsPart(world, rail, "tab:local#5", "menu"))
+	local single = nonMoveLabels(world)
+	assert(#single == 4 and single[3] == "Park (keep program alive)" and single[4] == "Close",
+		"a one-pane tab offers Park and Close without a count")
+	world:choose(nil)
+
+	assert(not wsRow(world, rail, "tab:local#6"), "an empty tab has no Workspace row")
+
+
+	local expected = tabPaneIds(world, 3)
+	assert(#expected >= 2, "fixture: the first tab holds its agent and its rail")
+	world.models[10] = "zz-private-model"
+	world:click(rail, wsPart(world, rail, "tab:local#3", "menu"))
+	local multi = nonMoveLabels(world)
+	local suffix = " · " .. #expected .. " panes"
+	local park, close = #multi - 1, #multi
+	assert(multi[close] == "Close" .. suffix and multi[park] == "Park (keep program alive)" .. suffix
+		and multi[park - 1] == "New tab here" and multi[park - 2] == "Rename tab…",
+		"a multi-pane tab counts its panes in both labels, after its target conversation's tracking items")
+	assert(multi[1] == "Set priority · P0–P3 or unset",
+		"the first item is the target conversation's first tracking label, ahead of the tab actions")
+	for _, item in ipairs(world.pickers[#world.pickers].options.items) do
+		for _, field in item do
+			assert(not string.find(tostring(field), "zz-private-model", 1, true), "a menu item never carries the agent model")
+		end
+	end
+	local writes = world.layoutWrites
+	world:chooseLabel(if op == "park" then "Park (keep program alive)" .. suffix else "Close" .. suffix)
+	local done, untouched = if op == "park" then world.parks else world.closes, if op == "park" then world.closes else world.parks
+	table.sort(done)
+	assert(equalValue(done, expected) and #untouched == 0
+		and world.layoutWrites == writes + #expected and toastCount(world, "error", "") == 0,
+		op .. " reaches every pane of that tab exactly once and nothing else")
+	for _, pane in ipairs(tabPaneIds(world, 4)) do
+		assert(world.membership[pane] == 4 and not world.parked[pane], "another tab's panes are untouched")
+	end
+	if op == "park" then
+		for _, pane in ipairs(expected) do assert(world.parked[pane], "the pane is parked, not closed") end
+	else
+		for _, pane in ipairs(expected) do assert(world.membership[pane] == nil, "the pane is closed") end
+	end
+end
+
+-- A refused park is reported, and the tab's other panes are still parked.
+do
+	local world, rail = workspaceWorld()
+	world:advance(3100)
+	world:control(rail, "workspace"); world:advance(100)
+	local expected = tabPaneIds(world, 3)
+	world.refusePark = { [10] = true }
+	world:click(rail, wsPart(world, rail, "tab:local#3", "menu"))
+	world:chooseLabel("Park (keep program alive) · " .. #expected .. " panes")
+	assert(#world.parks == #expected and toastCount(world, "error", "native park refused") == 1,
+		"every pane is attempted and the refusal is reported once")
+	for _, pane in ipairs(expected) do assert((world.parked[pane] == true) == (pane ~= 10), "only the refused pane stays docked") end
+end
+
+-- A tab row's More menu lists its target conversation's tracking choices first, then the tab actions. An idle
+-- conversation's Finished for now moves its tracking only: no focus change and the agent's state is unchanged.
+do
+	local world, rail = workspaceWorld()
+	world:control(rail, "workspace"); world:advance(100)
+	world:click(rail, wsPart(world, rail, "tab:local#3", "menu"))
+	local labels = menuLabels(world)
+	assert(#labels >= 5 and labels[1] == "Set priority · P0–P3 or unset" and labels[2] == "Keep as reference"
+		and labels[3] == "Finished for now · current scope" and labels[4] == "Inspect recorded facts · does not navigate or acknowledge"
+		and labels[5] == "Rename tab…" and not hasLabel(labels, "Open existing pane"),
+		"an idle conversation's tab offers its tracking choices, then the tab actions, and never Open existing pane")
+	local focuses, agent = world.focusWrites, world.agentState
+	world:chooseLabel("Finished for now · current scope"); world:advance(100)
+	assert(savedItemFor(world, 10).disposition == "finished" and world.focusWrites == focuses and world.agentState == agent
+		and toastCount(world, "error", "") == 0, "Finished from a tab row sets tracking only: no focus change and the agent state is unchanged")
+end
+
+-- Inspect from a tab row's menu expands that conversation's recorded facts and does nothing else.
+do
+	local world, rail = workspaceWorld()
+	world:control(rail, "workspace"); world:advance(100)
+	world:click(rail, wsPart(world, rail, "tab:local#3", "menu"))
+	local item = savedItemFor(world, 10)
+	local disposition, focuses = item.disposition, world.focusWrites
+	world:chooseLabel("Inspect recorded facts · does not navigate or acknowledge"); world:advance(100)
+	assert(world:inspect().logical.expandedWorkId == "work:" .. item.serial,
+		"Inspect from a tab row expands that tab's target conversation")
+	assert(world.focusWrites == focuses and savedItemFor(world, 10).disposition == disposition
+		and toastCount(world, "error", "") == 0, "Inspect from a tab row neither navigates, changes tracking, nor reports an error")
+end
+
+-- The row's target is the first content pane when focus is on the Attention rail: its menu and its title both follow
+-- that conversation, not the focused rail pane.
+do
+	local world, rail = workspaceWorld()
+	world.paneInfo[10] = { title = "Ledger agent" }
+	world.focused = rail
+	world:emit("title", { pane = 10 }); world:emit("focus", { pane = rail }); world:advance(100)
+	world:control(rail, "workspace"); world:advance(100)
+	assert(world.membership[rail] == 3 and world.focused == rail, "fixture: focus is on the tab's Attention rail")
+	assert(string.find(visibleText(wsRow(world, rail, "tab:local#3")), savedItemFor(world, 10).title, 1, true)
+		and savedItemFor(world, 10).title == "Ledger agent", "the tab row is titled with its target conversation")
+	world:click(rail, wsPart(world, rail, "tab:local#3", "menu"))
+	local labels = menuLabels(world)
+	assert(hasLabel(labels, "Finished for now") and hasLabel(labels, "Keep as reference"),
+		"the tab menu lists the target conversation's tracking items although the rail has focus")
+end
+
+-- A reference conversation's tab row offers Resume tracking and Bring back. Resume restores tracking without
+-- navigating and leaves the agent's state unchanged.
+do
+	local world, rail = workspaceWorld()
+	world:control(rail, "workspace"); world:advance(100)
+	world:click(rail, wsPart(world, rail, "tab:local#4", "menu"))
+	world:chooseLabel("Keep as reference"); world:advance(100)
+	assert(savedItemFor(world, 11).disposition == "reference", "fixture: the tab's conversation is kept as reference from its tab row")
+	world:click(rail, wsPart(world, rail, "tab:local#4", "menu"))
+	local labels = menuLabels(world)
+	assert(hasLabel(labels, "Resume tracking · does not run agent") and hasLabel(labels, "Bring back now")
+		and hasLabel(labels, "Rename tab…"), "a reference conversation's tab offers resume and bring back beside the tab actions")
+	local focuses, agent = world.focusWrites, world.additionalAgents[11]
+	world:chooseLabel("Resume tracking · does not run agent"); world:advance(100)
+	assert(savedItemFor(world, 11).disposition == "active" and world.focusWrites == focuses
+		and world.additionalAgents[11] == agent and toastCount(world, "error", "") == 0,
+		"Resume from a tab row restores tracking without navigating and leaves the agent state unchanged")
+end
+
+-- A tab menu opened before its conversation changed refuses its choice and writes nothing.
+do
+	local world, rail = workspaceWorld()
+	world:control(rail, "workspace"); world:advance(100)
+	world:click(rail, wsPart(world, rail, "tab:local#3", "menu"))
+	local opened = world.pickers[#world.pickers]
+	world:click(rail, wsPart(world, rail, "tab:local#3", "menu"))
+	world:chooseLabel("Keep as reference"); world:advance(100)
+	assert(savedItemFor(world, 10).disposition == "reference", "fixture: a second tab menu changes the conversation's tracking")
+	local focuses = world.focusWrites
+	world.pickers[#world.pickers + 1] = opened -- the first menu is still the one the user chooses from
+	world:chooseLabel("Finished for now · current scope"); world:advance(100)
+	assert(savedItemFor(world, 10).disposition == "reference" and world.focusWrites == focuses
+		and toastCount(world, "error", "This conversation menu is no longer current") == 1,
+		"a stale tab menu refuses its choice with the current-menu message and writes nothing")
+end
+
+-- Disable leaves every rail where it is; Disable and close rails retires each rail pane and still disables.
+do
+	local world = native(true)
+	world:addTab(4, 11)
+	world:advance(3100)
+	local first = world.opens[1].pane
+	world:switch(4); world:advance(3100)
+	local second = world.opens[2].pane
+	assert(world.canvases[first] and world.canvases[second], "fixture: two mounted rails")
+	world:command("disable")
+	assert(not world.prefs.enabled and #world.closes == 0 and world.canvases[first] and world.canvases[second],
+		"plain Disable retires nothing")
+end
+
+do
+	local world = native(true)
+	world:addTab(4, 11)
+	world:advance(3100)
+	local first = world.opens[1].pane
+	world:switch(4); world:advance(3100)
+	local second = world.opens[2].pane
+	assert(world.canvases[first] and world.canvases[second], "fixture: two mounted rails")
+	world:command("disable-and-close-rails")
+	local closed = copy(world.closes)
+	table.sort(closed)
+	assert(not world.prefs.enabled and equalValue(closed, { first, second }) and not world.canvases[first]
+		and not world.canvases[second], "Disable and close rails disables and retires every rail pane")
+	assert(world.membership[10] == 3 and world.membership[11] == 4 and world:activeTimers() == 0
+		and world.settingsWrites == 0 and toastCount(world, "error", "") == 0,
+		"content panes survive, no work stays scheduled, and no native setting is written")
+	assert(world.prefs.instances["local"] == nil or next(world.prefs.instances["local"]) == nil,
+		"each retired rail leaves the store")
 end
 
 -- LIFE-02 / LIFE-06: the conversation menu offers what the record supports, never Reopen, and says when a pane is
@@ -6907,7 +7535,11 @@ do
 	assert(world:inspect().logical.expandedWorkId ~= nil and world.focusWrites == 0 and savedItemFor(world, 11).reviewRevision ~= nil,
 		"Inspect expands the recorded facts without navigating or acknowledging")
 	world:click(rail, rowAction(renderedRowFor(world, rail, 11), "menu")); world:chooseLabel("Keep as reference"); world:advance(100)
-	world:control(rail, "workspace"); world:advance(100)
+	-- A reference conversation is in no queue while idle; native execution adds it to Working, whose row carries
+	-- the same menu.
+	world.additionalAgents[11] = "working"
+	world:emit("agent_state", { pane = 11, old = "idle", new = "working" }); world:advance(100)
+	world:control(rail, "working"); world:advance(100)
 	world:click(rail, rowAction(renderedRowFor(world, rail, 11), "menu"))
 	local reference = menuLabels(world)
 	assert(hasLabel(reference, "Resume tracking · does not run agent") and hasLabel(reference, "Bring back now")
@@ -6916,13 +7548,14 @@ do
 	assert(world.focused == 11 and savedItemFor(world, 11).disposition == "reference",
 		"Open existing pane navigates without changing tracking")
 	world:switch(3); world:advance(100)
+	world:control(rail, "attention"); world:advance(100)
 	world:click(rail, rowAction(renderedRowFor(world, rail, 10), "menu"))
-	world:chooseLabel("Later · no date"); world:advance(100)
-	world:control(rail, "later"); world:advance(100)
-	world:click(rail, rowAction(renderedRowFor(world, rail, 10), "menu"))
-	local later = menuLabels(world)
-	assert(hasLabel(later, "Bring back now") and not hasLabel(later, "Resume tracking") and not hasLabel(later, "Reopen"),
-		"a Later conversation can be brought back")
+	world:chooseLabel("Finished for now · current scope"); world:advance(100)
+	world:control(rail, "workspace"); world:advance(100)
+	world:click(rail, wsPart(world, rail, "tab:local#3", "menu"))
+	local finished = menuLabels(world)
+	assert(hasLabel(finished, "Bring back now") and hasLabel(finished, "Resume tracking") and not hasLabel(finished, "Reopen"),
+		"a Finished conversation can be brought back")
 	world:choose(nil)
 end
 
@@ -6930,8 +7563,8 @@ for _, placement in ipairs({ "parked", "floating" }) do
 	local world, rail = workspaceWorld()
 	if placement == "parked" then world.parked[11] = true
 	else world.floating[11], world.floats[4] = true, { { pane = 11, over = 13, corner = "top_right" } } end
-	world:advance(100)
-	world:control(rail, "workspace"); world:advance(100)
+	world:advance(3100)
+	world:control(rail, "attention"); world:advance(100)
 	world:click(rail, rowAction(renderedRowFor(world, rail, 11), "menu"))
 	local labels = menuLabels(world)
 	assert(hasLabel(labels, if placement == "parked" then "parked, restore it from Parked panes" else "floating, shown without docking"),
@@ -6946,20 +7579,6 @@ for _, placement in ipairs({ "parked", "floating" }) do
 			"a floating conversation is focused without docking")
 	end
 	assert(savedItemFor(world, 11).reviewRevision ~= nil, "opening a pane never acknowledges")
-end
-
-do
-	local world, rail = workspaceWorld()
-	local serial = savedItemFor(world, 10).serial
-	world:click(rail, rowAction(renderedRowFor(world, rail, 10), "menu")); world:chooseLabel("Keep as reference"); world:advance(100)
-	world:closePane(10); world:advance(100)
-	world:switch(4); world:advance(3100)
-	rail = world.opens[#world.opens].pane
-	world:control(rail, "workspace"); world:advance(100)
-	world:click(rail, rowAction(wsRow(world, rail, "retained:work:" .. serial), "menu"))
-	assert(not hasLabel(menuLabels(world), "Open existing pane") and not hasLabel(menuLabels(world), "Reopen"),
-		"a saved conversation with no open pane offers no route and no reopen")
-	world:choose(nil)
 end
 
 -- Focus navigator never focuses a parked canvas; Enable here (D6) retires the old owner's pending actions.
@@ -6978,7 +7597,7 @@ end
 do
 	local world, rail = workspaceWorld()
 	world:control(rail, "workspace"); world:advance(100)
-	local note = wsPart(world, rail, "pane:local#12", "open")
+	local note = wsPart(world, rail, "tab:local#5", "open")
 	world:control(rail, "search")
 	local index = pickerIndex(world, "pane:local#12")
 	local writes = { world.layoutWrites, world.focusWrites, world.preferenceWrites, world.triageWrites }
@@ -7022,13 +7641,13 @@ do
 	world:emit("agent_state", { pane = 10, old = "idle", new = "working" }); world:advance(100)
 	world:control(rail, "working"); world:advance(100)
 	local state = world:inspect()
-	local rows = nativeCanvas.childAt(world.canvases[rail].view, "rows").c
+	local rows = sectionRows(world, rail).c
 	assert(state.logical.section == "working" and state.workingCount == 1 and state.attentionCount == 1
 		and #rows == 1 and rows[1] == renderedRowFor(world, rail, 10), "only the live working conversation is shown")
 	assert(queueCount(world, rail, "working") == "1" and visibleText(headerPart(world, rail, "location")) == "")
 	local queues = headerPart(world, rail, "queues")
-	assert(queues.c[1].p.key == "attention" and queues.c[2].p.key == "later"
-		and queues.c[3].p.key == "working" and queues.c[4].p.key == "workspace", "mode order is stable")
+	assert(queues.c[1].p.key == "attention" and queues.c[2].p.key == "working" and queues.c[3].p.key == "workspace"
+		and #queues.c == 3, "mode order is stable and Workspace stays last")
 	local open = rowAction(rows[1], "route-open")
 	assert(open and rowAction(rows[1], "details") and rowAction(rows[1], "menu"), "working retains all three row actions")
 	world.focused = rail
@@ -7041,18 +7660,16 @@ do
 		"Working open does not consume or redirect the Next attention target")
 	world:switch(3); world:advance(100)
 	world:click(rail, rowAction(renderedRowFor(world, rail, 10), "menu"))
-	world:chooseLabel("Later · no date"); world:advance(100)
-	assert(world:inspect().workingCount == 1 and world:inspect().laterCount == 1
-		and savedItemFor(world, 10).disposition == "later", "live deferred work remains in Working and Later")
+	world:chooseLabel("Finished for now · current scope"); world:advance(100)
+	assert(world:inspect().workingCount == 1 and savedItemFor(world, 10).disposition == "finished",
+		"live finished work remains in Working while it executes")
 	local snapshot = world:phoneSnapshot()
-	local deferred, working = nil, nil
+	local working = nil
 	for _, published in ipairs(snapshot.rows) do
-		if published.serial == savedItemFor(world, 10).serial then
-			if published.section == "later" then deferred = published elseif published.section == "working" then working = published end
-		end
+		if published.serial == savedItemFor(world, 10).serial and published.section == "working" then working = published end
 	end
-	assert(snapshot.schema == 2 and snapshot.counts.working == 1 and deferred and working
-		and deferred.workId == working.workId, "owner publishes both explicit modes for the same live deferred work")
+	assert(snapshot.schema == 2 and snapshot.counts.working == 1 and working,
+		"owner publishes the live finished work in Working")
 	world:click(rail, rowAction(renderedRowFor(world, rail, 10), "details")); world:advance(100)
 	assert(world:inspect().logical.expandedWorkId ~= nil, "working details expand")
 	local focusBefore = world.focusWrites
@@ -7063,11 +7680,127 @@ do
 	world.agentState = "waiting_input"
 	world:emit("agent_state", { pane = 10, old = "working", new = "waiting_input" }); world:advance(100)
 	state = world:inspect()
-	assert(state.workingCount == 0 and state.laterCount == 0 and state.attentionCount == 2
-		and savedItemFor(world, 10).disposition == "active", "a new native request follows existing Later-to-Attention semantics")
-	assert(#nativeCanvas.childAt(world.canvases[rail].view, "rows").c == 0
+	assert(state.workingCount == 0 and state.attentionCount == 1
+		and savedItemFor(world, 10).disposition == "finished", "a new native request does not reactivate Finished work")
+	assert(#sectionRows(world, rail).c == 0
 		and nativeCanvas.childAt(world.canvases[rail].view, "empty").p.hidden, "Working becomes cleanly empty")
-	assert(world:phoneSnapshot().counts.working == 0 and world:phoneSnapshot().counts.attention == 2)
+	assert(world:phoneSnapshot().counts.working == 0 and world:phoneSnapshot().counts.attention == 1)
+end
+
+-- Manual reorder from the ⋯ menus: a tab row's menu moves the tab (natively, one order_tab call with a readback)
+-- or its session (Attention's own order); a queue head's menu moves the queue. Only moves that change the order
+-- are offered, the order persists across reloads, and a target that changed before the choice refuses.
+local function nodeByKey(node, key)
+	if node.p and node.p.key == key then return node end
+	for _, child in node.c or {} do
+		local found = nodeByKey(child, key)
+		if found then return found end
+	end
+	return nil
+end
+local function rowMenu(world, rail, rowKey)
+	local row = assert(nodeByKey(world.canvases[rail].view, rowKey), "row is painted: " .. rowKey)
+	return assert(keyedAction(row, "menu"), "row carries its ⋯ menu: " .. rowKey)
+end
+local function pickerLabels(world)
+	local labels = {}
+	for _, item in ipairs(world.pickers[#world.pickers].options.items) do table.insert(labels, item.label) end
+	return labels
+end
+local function hasLabel(labels, label) return table.find(labels, label) ~= nil end
+local function errorToasts(world)
+	local count = 0
+	for _, toast in world.toasts do if toast.kind == "error" then count += 1 end end
+	return count
+end
+
+do
+	local world = native(true)
+	world:advance(3100)
+	local rail = world.opens[1].pane
+	world:addTab(41, 201, 1, 2)
+	world:addTab(42, 202, 1, 2)
+	world.tabs[3].position, world.tabs[41].position, world.tabs[42].position = 1, 2, 3
+	world:advance(2100)
+	world:control(rail, "workspace"); world:advance(100)
+	world:openSessions(rail)
+	world:click(rail, rowMenu(world, rail, "tab_3alocal_2342")); world:advance(32)
+	local labels = pickerLabels(world)
+	assert(hasLabel(labels, "Move tab up") and hasLabel(labels, "Move tab to top")
+		and not hasLabel(labels, "Move tab down") and not hasLabel(labels, "Move tab to bottom"),
+		"the last tab offers only the moves that change the order")
+	world:chooseLabel("Move tab to top"); world:advance(100)
+	assert(#world.orders == 1 and world.orders[1].tab == 42 and world.orders[1].position == 1,
+		"Move tab to top makes exactly one native order_tab call at position one")
+	assert(errorToasts(world) == 0, "a menu move reports no error")
+	assert(world.tabs[42].position == 1 and world.tabs[3].position == 2 and world.tabs[41].position == 3,
+		"native re-denses the session's positions")
+	-- The ledger shows the new native order, the same one the native sidebar holds.
+	local order = {}
+	for _, block in ipairs(sectionRows(world, rail, "workspace").c) do
+		if block.p.role == "workspace.ledger-current" or block.p.role == "workspace.ledger" then
+			for _, row in ipairs(nativeCanvas.childAt(block, "rows").c or {}) do
+				table.insert(order, row.p.key)
+			end
+		end
+	end
+	assert(equalValue(order, { "tab_3alocal_2342", "tab_3alocal_233", "tab_3alocal_2341" }), "the ledger repaints in the native order")
+	-- Move down from the middle lands one place later.
+	world:click(rail, rowMenu(world, rail, "tab_3alocal_233")); world:advance(32)
+	world:chooseLabel("Move tab down"); world:advance(100)
+	assert(#world.orders == 2 and world.orders[2].tab == 3 and world.orders[2].position == 3,
+		"Move tab down from the middle of three lands last")
+	-- A tab that closes before the choice refuses rather than moving anything.
+	world:click(rail, rowMenu(world, rail, "tab_3alocal_2341")); world:advance(32)
+	world:closePane(201); world:advance(100)
+	world:chooseLabel("Move tab up"); world:advance(100)
+	assert(#world.orders == 2, "a vanished target never calls order_tab")
+end
+
+do
+	local world = native(true)
+	world:advance(3100)
+	local rail = world.opens[1].pane
+	world:addTab(41, 201, 1, 7)
+	world:advance(2100)
+	world:control(rail, "workspace"); world:advance(100)
+	world:openSessions(rail)
+	world:click(rail, rowMenu(world, rail, "tab_3alocal_2341")); world:advance(32)
+	local labels = pickerLabels(world)
+	assert(hasLabel(labels, "Move session up") and not hasLabel(labels, "Move session down")
+		and not hasLabel(labels, "Move session to top"), "the last of two sessions offers only Move session up")
+	world:chooseLabel("Move session up"); world:advance(100)
+	assert(equalValue(world.prefs.sessionOrder, { ["local"] = { 7, 2 } }),
+		"the session move persists the host's full session order")
+	local function blocks()
+		local keys = {}
+		for _, block in ipairs(sectionRows(world, rail, "workspace").c) do
+			if block.p.role == "workspace.ledger-current" or block.p.role == "workspace.ledger" then
+				table.insert(keys, block.p.key)
+			end
+		end
+		return keys
+	end
+	assert(equalValue(blocks(), { "session_3alocal_237", "session_3alocal_232" }), "the ledger follows the stored order")
+	world:reload(); world:advance(3100)
+	world:control(rail, "workspace"); world:advance(100)
+	assert(equalValue(blocks(), { "session_3alocal_237", "session_3alocal_232" }), "reload restores the stored session order")
+end
+
+do
+	local world = native(true)
+	world:advance(3100)
+	local rail = world.opens[1].pane
+	world:click(rail, rowMenu(world, rail, "attention")); world:advance(32)
+	local labels = pickerLabels(world)
+	assert(equalValue(labels, { "Move down" }), "the first of two queues offers only Move down")
+	world:chooseLabel("Move down"); world:advance(100)
+	assert(errorToasts(world) == 0, "a queue move reports no error")
+	assert(equalValue(world.prefs.queueOrder, { "working", "attention" }), "the queue move persists")
+	local stack = descend(world.canvases[rail].view, "top", "stack")
+	local sections = {}
+	for _, section in ipairs(stack.c or {}) do table.insert(sections, section.p.key) end
+	assert(equalValue(sections, { "working", "attention" }), "the stack repaints in the stored order")
 end
 
 return true

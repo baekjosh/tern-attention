@@ -34,7 +34,7 @@ end
 
 local function snapshot(rows, fields)
 	local result = { schema = 2, revision = 1, generatedUtc = NOW, status = "ok", host = "Ada's MacBook Pro", rows = rows }
-	local counts = { attention = 0, later = 0, working = 0 }
+	local counts = { attention = 0, working = 0 }
 	for _, item in rows do counts[item.section] += 1 end
 	result.counts = counts
 	for key, value in fields or {} do result[key] = value end
@@ -296,17 +296,16 @@ do
 		row(3, "attention", { session = "app", tab = "release prep", title = "Fix the install" }),
 		row(1, "attention", { session = "sori", tab = "sori", title = "Draft the changelog", state = "Idle",
 			clock = { kind = "replied", atUtc = NOW - 90000, recorded = false } }),
-		row(2, "later", { title = "Later thing", state = "Working" }),
 		row(2, "working", { title = "Working thing", state = "Working" }),
 	}
-	world:publish(snapshot(rows, { counts = { attention = 4, later = 2, working = 3 } }))
+	world:publish(snapshot(rows, { counts = { attention = 4, working = 3 } }))
 	local block = start(world)
 	local tabs = block:tabs()
 	assert(tabs and tabs.p.variant == "segmented" and tabs.p.active == "attention", "a segmented control starts on Attention")
-	assert(ownText(tabs) == "Attention 4  Later 2  Currently working 3", "tabs show all three full conversation counts, not capped row counts")
+	assert(ownText(tabs) == "Attention 4  Currently working 3", "tabs show both full conversation counts, not capped row counts")
 	assert(block:title() == "Attention 4", "the pane title carries the Attention count")
 	local shown = block:rows()
-	assert(sameList(rowNumbers(block), { 3, 1 }), "Attention rows keep the desktop queue order and hide Later rows")
+	assert(sameList(rowNumbers(block), { 3, 1 }), "Attention rows keep the desktop queue order and hide Working rows")
 	assert(contains(shown[1].who, "app") and contains(shown[1].who, "release prep"), "a row names its session and tab")
 	assert(shown[1].title == "Fix the install", "a row shows the conversation title")
 	assert(shown[1].clock == phone.clockText(rows[1].clock, world.utc), "the clock chip uses the shared desktop wording")
@@ -319,16 +318,12 @@ do
 	assert(equal(block:view(), block:view()), "an unchanged state must produce an identical view")
 
 	-- Section switch, saved state, restore.
-	block:select("later")
-	assert(sameList(rowNumbers(block), { 2 }) and block:tabs().p.active == "later", "Later shows only deferred rows")
-	assert(equal(block:save(), { section = "later" }), "the selected section is saved")
-	local restored = start(world, block:save())
-	assert(restored:tabs().p.active == "later" and sameList(rowNumbers(restored), { 2 }), "a restart returns to the saved section")
 	block:select("working")
 	assert(sameList(rowNumbers(block), { 2 }) and block:rows()[1].title == "Working thing", "Currently working shows only its live rows")
 	assert(equal(block:save(), { section = "working" }), "Currently working selection is saved")
-	assert(start(world, block:save()):tabs().p.active == "working", "Currently working restores")
-	for _, bad in { { section = "reference" }, { section = 7 }, "later", 5 } do
+	local restored = start(world, block:save())
+	assert(restored:tabs().p.active == "working" and sameList(rowNumbers(restored), { 2 }), "a restart returns to the saved section")
+	for _, bad in { { section = "reference" }, { section = 7 }, { section = "later" }, "working", 5 } do
 		assert(start(world, bad):tabs().p.active == "attention", "unusable saved state falls back to Attention")
 	end
 	block:select("not-a-section")
@@ -522,7 +517,7 @@ end
 -- An empty section renders no filler text.
 do
 	local world = newWorld()
-	world:publish(snapshot({ row(1, "later") }))
+	world:publish(snapshot({ row(1, "working", { state = "Working" }) }))
 	local block = start(world)
 	local function textNodes()
 		local nodes = {}
@@ -532,8 +527,11 @@ do
 	end
 	assert(#block:rows() == 0, "Attention is empty")
 	assert(#textNodes() == 2, "an empty section shows only the control and the updated line")
-	block:select("later")
+	block:select("working")
 	assert(#block:rows() == 1)
+	world = newWorld()
+	world:publish(snapshot({ row(1, "attention") }))
+	block = start(world)
 	block:select("working")
 	assert(#block:rows() == 0 and #textNodes() == 2, "an empty Currently working section has no filler")
 	world = newWorld()
@@ -646,7 +644,7 @@ do
 	local world = newWorld()
 	local rows = {}
 	for serial = 1, 60 do
-		table.insert(rows, row(serial, if serial % 3 == 0 then "later" else "attention", {
+		table.insert(rows, row(serial, if serial % 3 == 0 then "working" else "attention", {
 			title = string.rep("t", 160), tab = string.rep("b", 64), session = string.rep("s", 64),
 			state = "Offline · waiting for input", cwd = string.rep("/c", 100) }))
 	end
@@ -660,8 +658,8 @@ do
 	assert(nodes <= 1000, "sixty rows must stay far below the 2000-node cap, got " .. nodes)
 	assert(weigh(view) <= 256 * 1024 / 2, "the view must stay well below 256 KiB")
 	assert(depth(view.main) <= 12, "row nesting must stay far below the depth cap")
-	block:select("later")
-	assert(#block:rows() == 20, "Later shows its 20 rows")
+	block:select("working")
+	assert(#block:rows() == 20, "Currently working shows its 20 rows")
 end
 
 -- Serials are the owner's; a repeat (validation does not forbid one) must not make the worker reject the view.
@@ -757,12 +755,11 @@ do
 	assert(#world.opened == 1, "a removed and reappearing route does not revive an old tap")
 end
 
--- Every displayed section owns its action, even when one conversation appears in Later and Working.
+-- Every displayed section owns its action, even when one conversation appears in Attention and Working.
 do
 	local world = newWorld()
 	local rows = {
 		row(7, "attention", { paneTitle = "Attention target" }),
-		row(7, "later", { paneTitle = "Later target" }),
 		row(7, "working", { paneTitle = "Working target", state = "Working" }),
 	}
 	world:publish(snapshot(rows))
@@ -772,26 +769,26 @@ do
 		return { ev = "action", id = "main.rows.r7", act = "jump", value = string.match(click, "^jump=(.*)$") }
 	end
 	local old = action()
-	for position, section in { "attention", "later", "working" } do
+	for position, section in { "attention", "working" } do
 		block:select(section)
 		block:click("main.rows.r7")
 		assert(world.opened[position] == phone.jumpUrl(rows[position]), section .. " must open its own row, not the first equal serial")
 	end
 	block:event(old)
-	assert(#world.opened == 3, "an action from another displayed section is stale")
+	assert(#world.opened == 2, "an action from another displayed section is stale")
 	local stale = action()
 	local changed = copy(rows)
-	changed[3].paneTitle = "Replacement target"
+	changed[2].paneTitle = "Replacement target"
 	world:publish(snapshot(changed))
 	-- No poll yet: a tap must validate against the latest snapshot, not cached pane evidence.
 	block:event(stale)
-	assert(#world.opened == 3 and #world.toasts == 2, "a stale action cannot open replacement evidence even with the same revision")
+	assert(#world.opened == 2 and #world.toasts == 2, "a stale action cannot open replacement evidence even with the same revision")
 	block:click("main.rows.r7")
-	assert(world.opened[4] == phone.jumpUrl(changed[3]), "a newly rendered action opens the current evidence")
+	assert(world.opened[3] == phone.jumpUrl(changed[2]), "a newly rendered action opens the current evidence")
 	local live = action()
 	world:publish(snapshot({}, { status = "disabled" }))
 	block:event(live)
-	assert(#world.opened == 4, "an action cannot open after the owner disables Attention")
+	assert(#world.opened == 3, "an action cannot open after the owner disables Attention")
 end
 
 -- Whole Unicode labels survive updates and section switches; a repeated tab/title is only shown once.
@@ -800,25 +797,24 @@ do
 	local title = "修復 café — 전체 제목 🚀 preserve every word"
 	local rows = {
 		row(1, "attention", { title = title, tab = title, session = "세션 café", paneTitle = title }),
-		row(2, "later", { title = "Later — 明日", tab = "Planning" }),
-		row(3, "working", { title = "Working — 실행 중", tab = "Build", state = "Working" }),
+		row(2, "working", { title = "Working — 실행 중", tab = "Build", state = "Working" }),
 	}
 	world:publish(snapshot(rows))
 	local block = start(world)
 	assert(block:rows()[1].title == title and block:rows()[1].who == "세션 café", "whole Unicode title is visible without duplicating it as the tab")
 	block:click("main.rows.r1")
 	assert(phone.parseJump(world.opened[1]).title == title, "matching evidence retains the original whole title")
-	for position, section in { "attention", "later", "working" } do
+	for position, section in { "attention", "working" } do
 		block:select(section)
 		assert(block:rows()[1].title == rows[position].title, "section changes preserve the entire title")
 	end
 	world:advance(60000)
 	assert(contains(block:allText(), "Updated 1m ago"), "the complete status label updates over time")
-	rows[3].title = "Renamed — 変更済み café"
-	rows[3].state = "Working · compiling"
+	rows[2].title = "Renamed — 変更済み café"
+	rows[2].state = "Working · compiling"
 	world:publish(snapshot(rows, { revision = 2, generatedUtc = world.utc }))
 	world:advance(2000)
-	assert(block:rows()[1].title == rows[3].title and block:rows()[1].state == rows[3].state,
+	assert(block:rows()[1].title == rows[2].title and block:rows()[1].state == rows[2].state,
 		"changed Unicode title and state replace the prior full labels")
 	assert(contains(block:allText(), "Updated just now"), "the heartbeat restores the complete updated label")
 end
@@ -840,9 +836,9 @@ end
 
 do
 	local world = newWorld()
-	world:publish(snapshot({}, { counts = { attention = 100001, later = 200002, working = 300003 } }))
+	world:publish(snapshot({}, { counts = { attention = 100001, working = 300003 } }))
 	local block = start(world)
-	assert(ownText(block:tabs()) == "Attention 100001  Later 200002  Currently working 300003",
+	assert(ownText(block:tabs()) == "Attention 100001  Currently working 300003",
 		"validated full counts are never truncated to a smaller number")
 	assert(block:title() == "Attention 100001", "the title also preserves the full count")
 end

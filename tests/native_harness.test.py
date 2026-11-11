@@ -111,13 +111,14 @@ class Parsing(unittest.TestCase):
         self.assertEqual(harness.as_list([{"pane": 4}]), [{"pane": 4}])
 
     def test_flatten_texts_walks_children_in_order(self):
-        nodes = [{"text": "Attention", "children": [{"text": "0"}, {"children": [{"text": "Later"}]}]}, {"text": ""}]
-        self.assertEqual(harness.flatten_texts(nodes), ["Attention", "0", "Later"])
+        nodes = [{"text": "Attention", "children": [{"text": "0"}, {"children": [{"text": "Working"}]}]}, {"text": ""}]
+        self.assertEqual(harness.flatten_texts(nodes), ["Attention", "0", "Working"])
 
     def test_rail_rendered_needs_mode_search_and_gear_or_return_buttons(self):
         mode, search = {"title": "Attention \u00b7 2 need you"}, {"title": "Search workspace"}
         gear, back = {"title": "More \u00b7 Settings"}, {"title": "Return to Workspace"}
         self.assertTrue(harness.rail_rendered([mode, search, gear]))
+        self.assertTrue(harness.rail_rendered([mode, search, {"title": "Back to Attention"}]))
         self.assertTrue(harness.rail_rendered([{"title": "Go to \u00b7 x"}, mode, search, back]))
         self.assertFalse(harness.rail_rendered([mode, search]))
         self.assertFalse(harness.rail_rendered([search, gear]))

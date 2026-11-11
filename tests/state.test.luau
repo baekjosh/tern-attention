@@ -53,15 +53,14 @@ local function fullRecord(serial)
 	return {
 		serial = serial, pane = 4002909519943, window = "window-a", hostKey = "ssh:forge", host = 2, tab = 20, session = 200,
 		title = "Exact title", sessionName = "Session", hostName = "Forge", localHost = false, parked = true, floating = true,
-		identityKey = "exact-identity", firstSeenUtc = 1234.5, disposition = "later", queueOrder = 5,
+		identityKey = "exact-identity", firstSeenUtc = 1234.5, disposition = "reference", queueOrder = 5,
 		attentionRevision = 9, reviewRevision = 8, reviewKind = "done", reviewSuperseded = false,
 		waiting = false, delivery = true, startup = true, nativeState = "idle", alert = true, turn = 3,
 		finishedTurn = 3, finishedResult = "failed", legacy = true,
 		deferredPane = 4, deferredWork = true, deferredResult = "done", deferredUtc = 1200,
 		deferredWorkAfter = false, deferredWorkBefore = true, deferredWaitingUtc = 1201,
-		retained = true, priority = 2, untilUtc = 5000, availableOn = "2026-11-03", availableTime = "09:30",
-		zone = "America/New_York", manualRevisit = true, blockerEpisode = 2, laterEpisode = 1,
-		sourceSessionId = "session-uuid", noOpenPane = true, replacedSource = true, waitingTurn = 2, laterUtc = 1100,
+		retained = true, priority = 2, manualRevisit = true,
+		sourceSessionId = "session-uuid", noOpenPane = true, replacedSource = true, waitingTurn = 2,
 		sourceGap = true, sourceQuestionSuperseded = false, sourceQuestionRevision = 6, sourceWorkUtc = 1050,
 		sourceQuestionBaseline = { revision = "rev-1", capturedAtUtc = 1000, ids = { "q1", "q2" } },
 		source = {
@@ -93,9 +92,7 @@ local function pair()
 		} }
 end
 
-local LATER = { untilUtc = 9000000, availableOn = "2026-11-03", availableTime = "09:30", zone = "America/New_York" }
-
--- Two real conversations: one deferred with a civil schedule and a priority, one with an unread completion.
+-- Two real conversations: one kept as reference with no priority, one with an unread completion and a priority.
 local function builtStore()
 	local state = model.new()
 	local presentation = model.reconcile(state, pair(), { { kind = "finished", pane = 22, result = "done", at = 1 } }, context(100))
@@ -103,11 +100,11 @@ local function builtStore()
 	for _, row in ipairs(presentation.rows) do
 		if row.pane == 11 then alpha = row else beta = row end
 	end
-	assert(model.setDisposition(state, alpha.workId, "later", 101, LATER))
+	assert(model.setDisposition(state, alpha.workId, "reference", 101))
 	assert(model.setPriority(state, beta.workId, 1))
 	model.reconcile(state, pair(), {}, context(150))
 	local saved = model.snapshot(state)
-	assert(#saved.items == 2 and saved.items[1].disposition == "later" and saved.items[2].priority == 1
+	assert(#saved.items == 2 and saved.items[1].disposition == "reference" and saved.items[2].priority == 1
 		and saved.items[2].reviewRevision ~= nil)
 	return saved, alpha.workId, beta.workId
 end
@@ -134,7 +131,7 @@ test("reload, reconcile and save are a fixed point for a store built by real ope
 		assert(state.persistenceRevision == 0, "generation " .. tostring(generation) .. " loads clean")
 		for pass = 1, 2 do
 			model.reconcile(state, pair(), {}, context(200 + pass))
-			assert(not model.setDisposition(state, alpha, "later", 300, LATER), "an unchanged schedule is a no-op")
+			assert(not model.setDisposition(state, alpha, "reference", 300), "an unchanged disposition is a no-op")
 			assert(not model.setPriority(state, beta, 1), "an unchanged priority is a no-op")
 		end
 		assert(state.persistenceRevision == 0, "generation " .. tostring(generation) .. " writes nothing")
@@ -239,7 +236,7 @@ test("same-title remote records without proof never merge, gain attention or los
 			old[row.workId] = row
 		end
 		if kept then
-			for workId in pairs(old) do assert(model.setDisposition(state, workId, "later", 101)) end
+			for workId in pairs(old) do assert(model.setDisposition(state, workId, "reference", 101)) end
 		end
 
 		local offline = model.reconcile(state, remote({ connected = false }), {}, context(110))
@@ -263,14 +260,14 @@ test("same-title remote records without proof never merge, gain attention or los
 			else
 				assert(kept, label .. ": unretained proofless records close with their host's pane, they are not merged")
 				assert(row.pane == nil and row.retained and not row.navigable and not row.attention
-					and row.disposition == "later" and row.unavailableReason == "No open pane", label)
+					and row.disposition == "reference" and row.unavailableReason == "No open pane", label)
 				assert(row.attentionRevision == old[row.workId].attentionRevision, label)
 			end
 		end
 		assert(#back.rows == (if kept then 3 else 1), label)
 		assert(fresh ~= nil and fresh.pane == 32 and fresh.title == "omp" and fresh.identityKey == nil, label)
 		assert(fresh.disposition == "active" and fresh.navigable and fresh.attention, label .. ": a same-title pane is a new record")
-		assert(back.attentionCount == 1 and back.laterCount == (if kept then 2 else 0), label)
+		assert(back.attentionCount == 1, label)
 	end
 end)
 
@@ -315,14 +312,14 @@ test("a changed address or provenance is a different conversation that never inh
 			assert(original ~= nil and moved ~= nil and moved ~= original, label)
 			local state = model.new()
 			local first = model.reconcile(state, remote({ panes = { { id = 22, title = "omp", key = original } } }), {}, context(100)).rows[1]
-			assert(model.setDisposition(state, first.workId, "later", 101))
+			assert(model.setDisposition(state, first.workId, "reference", 101))
 			state = outage(state, reload)
 
 			local back = model.reconcile(state, remote({ panes = { { id = 55, title = "omp", key = moved } } }), {}, context(130))
-			assert(#back.rows == 2 and back.laterCount == 1 and back.attentionCount == 1, label)
+			assert(#back.rows == 2 and back.attentionCount == 1, label)
 			for _, row in ipairs(back.rows) do
 				if row.workId == first.workId then
-					assert(row.identityKey == original and row.pane == nil and row.retained and row.disposition == "later", label)
+					assert(row.identityKey == original and row.pane == nil and row.retained and row.disposition == "reference", label)
 					assert(not row.navigable and not row.attention and row.unavailableReason == "No open pane", label)
 				else
 					assert(row.identityKey == moved and row.pane == 55 and row.disposition == "active", label)

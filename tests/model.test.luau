@@ -212,52 +212,49 @@ test("current completion waits for settled runtime while older and duplicate com
 end)
 
 test("fresh qualified source questions independently enter Attention after resumed work settles", function()
-	for _, later in ipairs({ false, true }) do
-		local state = model.new()
-		local live = snapshot(1, { agent(11, "idle") })
-		live.sessions, live.tabs, live.sessionOrder = { [100] = { host = 1, name = "Workspace" } }, { [10] = { session = 100 } }, { 100 }
-		live.sources = { [11] = { key = "conversation:11", path = "/exact/session", localSource = true } }
-		local fact = { key = "conversation:11", path = "/exact/session", sessionId = "question-turns",
-			status = "ready", capturedAtUtc = 100, revision = "old-question", schemaVersion = 3,
-			writerVersions = { "18.14.0" }, selection = "disk-replayed", complete = true, coverage = {},
-			questionCoverage = { status = "complete", knownTotal = 1, included = 1, omitted = 0 },
-			questions = { { id = "old-question", status = "open", askedAtUtc = 90, text = "Old request" } },
-			lastFinal = { id = "old-reply", atUtc = 95, timeKind = "completed", text = "Original completed reply" } }
-		live.sourceFacts = { [fact.key] = fact }
-		local function replay(now, events)
-			return model.reconcile(state, live, events or {}, { window = "", nowUtc = now, coherent = true,
-				hostKeys = { [1] = "local" }, connected = { ["local"] = true } })
-		end
-		local original = row(replay(100, { { kind = "finished", pane = 11, result = "done", at = 1 } }), 11)
-		live.now, live.agents[1].state = 2, "working"
-		assert(not row(replay(101), 11).sourceQuestionCurrent)
-		live.now, live.agents[1].state = 3, "idle"
-		local quiet = replay(102)
-		healthy(quiet, 0)
-		assert(not row(quiet, 11).sourceQuestionCurrent and row(quiet, 11).reviewSuperseded)
-		assert(model.next(state) == nil and model.sessionGroups(quiet, live, true)[1].attentionConversations == 0)
-		if later then assert(model.setDisposition(state, original.workId, "later", 103)) end
-		fact = table.clone(fact)
-		fact.capturedAtUtc, fact.revision = 104, "fresh-question"
-		fact.questions = { fact.questions[1], { id = "fresh-question", status = "open", askedAtUtc = 104, text = "Choose current target" } }
-		fact.questionCoverage = { status = "complete", knownTotal = 2, included = 2, omitted = 0 }
-		live.sourceFacts[fact.key] = fact
-		local current = replay(104)
-		local fresh = row(current, 11)
-		healthy(current, 1)
-		assert(fresh.disposition == "active" and fresh.sourceQuestionCurrent and fresh.nativeState == "idle" and fresh.condition == nil)
-		assert(fresh.reviewSuperseded and fresh.reviewRevision == original.reviewRevision and fresh.reviewKind == "done")
-		assert(fresh.reason == "Recorded question unresolved" and fresh.source.lastFinal.id == "old-reply")
-		assert(fresh.source.questions[1].status == "open" and fresh.source.questions[2].text == "Choose current target")
-		assert(current.attentionTargets[11] and current.reachableCount == 1 and model.next(state) == 11)
-		local session = model.sessionGroups(current, live, true)[1]
-		assert(session.attentionConversations == 1 and session.attentionTabs == 1)
-		local repeated = row(replay(105), 11)
-		assert(repeated.attentionRevision == fresh.attentionRevision and repeated.sourceQuestionCurrent)
-		assert(model.visit(state, 11, original.reviewRevision, original.serial))
-		assert(row(model.current(state), 11).attention and row(model.current(state), 11).sourceQuestionCurrent,
-			"acknowledging an old completed review does not answer the fresh recorded question")
+	local state = model.new()
+	local live = snapshot(1, { agent(11, "idle") })
+	live.sessions, live.tabs, live.sessionOrder = { [100] = { host = 1, name = "Workspace" } }, { [10] = { session = 100 } }, { 100 }
+	live.sources = { [11] = { key = "conversation:11", path = "/exact/session", localSource = true } }
+	local fact = { key = "conversation:11", path = "/exact/session", sessionId = "question-turns",
+		status = "ready", capturedAtUtc = 100, revision = "old-question", schemaVersion = 3,
+		writerVersions = { "18.14.0" }, selection = "disk-replayed", complete = true, coverage = {},
+		questionCoverage = { status = "complete", knownTotal = 1, included = 1, omitted = 0 },
+		questions = { { id = "old-question", status = "open", askedAtUtc = 90, text = "Old request" } },
+		lastFinal = { id = "old-reply", atUtc = 95, timeKind = "completed", text = "Original completed reply" } }
+	live.sourceFacts = { [fact.key] = fact }
+	local function replay(now, events)
+		return model.reconcile(state, live, events or {}, { window = "", nowUtc = now, coherent = true,
+			hostKeys = { [1] = "local" }, connected = { ["local"] = true } })
 	end
+	local original = row(replay(100, { { kind = "finished", pane = 11, result = "done", at = 1 } }), 11)
+	live.now, live.agents[1].state = 2, "working"
+	assert(not row(replay(101), 11).sourceQuestionCurrent)
+	live.now, live.agents[1].state = 3, "idle"
+	local quiet = replay(102)
+	healthy(quiet, 0)
+	assert(not row(quiet, 11).sourceQuestionCurrent and row(quiet, 11).reviewSuperseded)
+	assert(model.next(state) == nil and model.sessionGroups(quiet, live, true)[1].attentionConversations == 0)
+	fact = table.clone(fact)
+	fact.capturedAtUtc, fact.revision = 104, "fresh-question"
+	fact.questions = { fact.questions[1], { id = "fresh-question", status = "open", askedAtUtc = 104, text = "Choose current target" } }
+	fact.questionCoverage = { status = "complete", knownTotal = 2, included = 2, omitted = 0 }
+	live.sourceFacts[fact.key] = fact
+	local current = replay(104)
+	local fresh = row(current, 11)
+	healthy(current, 1)
+	assert(fresh.disposition == "active" and fresh.sourceQuestionCurrent and fresh.nativeState == "idle" and fresh.condition == nil)
+	assert(fresh.reviewSuperseded and fresh.reviewRevision == original.reviewRevision and fresh.reviewKind == "done")
+	assert(fresh.reason == "Recorded question unresolved" and fresh.source.lastFinal.id == "old-reply")
+	assert(fresh.source.questions[1].status == "open" and fresh.source.questions[2].text == "Choose current target")
+	assert(current.attentionTargets[11] and current.reachableCount == 1 and model.next(state) == 11)
+	local session = model.sessionGroups(current, live, true)[1]
+	assert(session.attentionConversations == 1 and session.attentionTabs == 1)
+	local repeated = row(replay(105), 11)
+	assert(repeated.attentionRevision == fresh.attentionRevision and repeated.sourceQuestionCurrent)
+	assert(model.visit(state, 11, original.reviewRevision, original.serial))
+	assert(row(model.current(state), 11).attention and row(model.current(state), 11).sourceQuestionCurrent,
+		"acknowledging an old completed review does not answer the fresh recorded question")
 end)
 
 test("working alerts stay out of Attention while live blockers remain reachable after Open", function()
@@ -482,6 +479,45 @@ test("restored keyless identity stays unverified until the same pane's identity 
 	assert(proven.rows[1].identityKey == "conversation:11" and proven.rows[1].queueOrder == original.queueOrder)
 end)
 
+test("a settled snapshot after a restart deletes unretained rows whose pane is gone", function()
+	local state = model.new()
+	local original = model.reconcile(state, snapshot(1, { agent(11, "waiting_input") }), {}).rows[1]
+	state = model.new(model.snapshot(state))
+	local after = model.reconcile(state, snapshot(2, { agent(99, "idle") }), {})
+	for _, entry in ipairs(after.rows) do
+		assert(entry.serial ~= original.serial, "the row is deleted by observed state, not by a close event")
+	end
+end)
+
+test("a retained row whose pane vanished across a restart becomes the no-open-pane terminal", function()
+	local state = model.new()
+	local original = model.reconcile(state, snapshot(1, { agent(11, "waiting_input") }), {}).rows[1]
+	assert(model.setDisposition(state, original.workId, "reference", 2))
+	state = model.new(model.snapshot(state))
+	local after = model.reconcile(state, snapshot(3, { agent(99, "idle") }), {})
+	local kept
+	for _, entry in ipairs(after.rows) do if entry.serial == original.serial then kept = entry end end
+	assert(kept and kept.retained and kept.pane == nil and kept.orphaned and not kept.navigable
+		and kept.unavailableReason == "No open pane",
+		"the retained keep survives as the explicit terminal with no pane to navigate")
+	assert(model.removeRetained(state, kept.workId), "the terminal row stays removable")
+end)
+
+test("an unsettled or identity-pending snapshot never deletes a restored row", function()
+	local state = model.new()
+	local original = model.reconcile(state, snapshot(1, { agent(11, "waiting_input") }), {}).rows[1]
+	state = model.new(model.snapshot(state))
+	local data = snapshot(2, {})
+	data.identityReady, data.identities = false, {}
+	local held = model.reconcile(state, data, {})
+	local saved
+	for _, entry in ipairs(held.rows) do if entry.serial == original.serial then saved = entry end end
+	assert(saved, "only a settled, identity-ready snapshot reconciles a vanished pane away")
+	local failed = model.reconcile(state, { ok = false, error = "coverage" }, {})
+	assert(#failed.rows == 1, "a failed snapshot holds rows untouched")
+end)
+
+
 test("restored blockers become reviewable history rather than disappearing on idle readback", function()
 	local state = model.new()
 	local first = model.reconcile(state, snapshot(10000, { agent(11, "waiting_input") }), {}).rows[1]
@@ -532,7 +568,6 @@ test("observed work between unchanged waiting snapshots is a new request without
 	local state = model.new()
 	local data = snapshot(1, { agent(11, "waiting_input") })
 	local first = model.reconcile(state, data, {}).rows[1]
-	model.setDisposition(state, "work:" .. tostring(first.serial), "later", 0)
 	local fresh = model.reconcile(state, data, {
 		{ kind = "state", pane = 11, old = "waiting_input", new = "working", at = 2 },
 		{ kind = "state", pane = 11, old = "working", new = "waiting_input", at = 3 },
@@ -630,8 +665,8 @@ test("native inventory reorder cannot reorder P0 or the in-progress navigation r
 	local repeated = model.reconcile(state, data, {})
 	assert(repeated == first)
 	assert(model.next(state) == 20)
-	model.setDisposition(state, "work:" .. tostring(row(repeated, 10).serial), "later", 0)
-	model.setDisposition(state, "work:" .. tostring(row(model.current(state), 10).serial), "active", 1)
+	model.setDisposition(state, "work:" .. tostring(row(repeated, 10).serial), "reference", 0)
+	model.setDisposition(state, "work:" .. tostring(row(model.current(state), 10).serial), "active", 1, { bringBack = true })
 	local restored = model.current(state)
 	assert(restored.rows[1].pane == 10 and restored.rows[2].pane == 20 and restored.rows[3].pane == 30, "All work is not queue order")
 	take(state, 20)
@@ -735,10 +770,10 @@ test("session groups count distinct P0 tabs in native order and retain quiet con
 	assert(#groups == 2 and groups[1].session == 200 and groups[2].session == 100)
 	local quiet, active = groups[1], groups[2]
 	assert(quiet.attentionTabs == 0 and quiet.attentionConversations == 0 and quiet.target == nil)
-	assert(quiet.laterTabs == 0 and quiet.laterConversations == 0)
+	assert(quiet.laterTabs == nil and quiet.laterConversations == nil)
 	assert(quiet.known and quiet.available and not quiet.current)
 	assert(active.attentionTabs == 2 and active.attentionConversations == 4 and active.current)
-	assert(active.laterTabs == 0 and active.laterConversations == 0)
+	assert(active.laterTabs == nil and active.laterConversations == nil)
 	assert(active.host == 1 and active.hostKey == "local" and active.localHost)
 	assert(active.name == "Workspace" and active.label == "Workspace" and active.hostName == "Local")
 	assert(active.target.pane == 11 and active.target.serial == row(presentation, 11).serial)
@@ -748,7 +783,7 @@ test("session groups count distinct P0 tabs in native order and retain quiet con
 	assert(model.sessionGroups(presentation, data, true)[2].target.pane == 11)
 end)
 
-test("session grouping counts Backlog independently from P0 and excludes snoozed evidence", function()
+test("session grouping counts only active rows as Attention; Reference and Finished leave the group counts", function()
 	local state = model.new()
 	local data = sessionInventory({
 		agent(11, "waiting_input"), agent(12, "waiting_input"),
@@ -761,84 +796,39 @@ test("session grouping counts Backlog independently from P0 and excludes snoozed
 	projection.rows = {}
 	for _, source in ipairs(native.rows) do
 		local projected = table.clone(source)
-		projected.disposition = if source.pane == 12 then "reference" elseif source.pane == 13 then "active" else "later"
+		projected.disposition = if source.pane == 12 then "reference" elseif source.pane == 13 then "active" else "finished"
 		projected.attention = source.pane == 13
 		table.insert(projection.rows, projected)
 	end
 	local group = model.sessionGroups(projection, data, true)[1]
 	assert(group.attentionConversations == 1 and group.attentionTabs == 1 and group.target.pane == 13)
-	assert(group.laterConversations == 2 and group.laterTabs == 2)
-	row(projection, 13).disposition = "later"
+	assert(group.laterConversations == nil and group.laterTabs == nil)
+	row(projection, 13).disposition = "finished"
+	row(projection, 13).attention = false
 	group = model.sessionGroups(projection, data, true)[1]
 	assert(group.attentionConversations == 0 and group.attentionTabs == 0 and group.target == nil and group.known)
-	assert(group.laterConversations == 3 and group.laterTabs == 2)
 end)
 
-test("Snooze moves P0 into Backlog without creating a target or changing the global round", function()
+test("Finished moves P0 out of Attention without creating a target or changing the global round", function()
 	local state = model.new()
 	local data = sessionInventory({ agent(11, "waiting_input"), agent(12, "waiting_input") })
 	local projection = model.reconcile(state, data, {})
 	local group = model.sessionGroups(projection, data, true)[1]
 	assert(group.attentionTabs == 1 and group.attentionConversations == 2 and group.target.pane == 11)
-	assert(group.laterTabs == 0 and group.laterConversations == 0)
 	assert(model.next(state) == 11)
 	visit(state, 11)
-	assert(model.setDisposition(state, "work:" .. tostring(row(projection, 11).serial), "later", 100))
+	assert(model.setDisposition(state, "work:" .. tostring(row(projection, 11).serial), "finished", 100))
 	projection = model.current(state)
 	group = model.sessionGroups(projection, data, true)[1]
 	assert(group.attentionTabs == 1 and group.attentionConversations == 1 and group.target.pane == 12)
-	assert(group.laterTabs == 1 and group.laterConversations == 1)
-	assert(model.next(state) == 12, "snoozing one row must preserve the remaining round")
-	assert(model.setDisposition(state, "work:" .. tostring(row(projection, 12).serial), "later", 100))
+	assert(model.next(state) == 12, "finishing one row must preserve the remaining round")
+	assert(model.setDisposition(state, "work:" .. tostring(row(projection, 12).serial), "reference", 100))
 	projection = model.current(state)
 	for _ = 1, 3 do
 		group = model.sessionGroups(projection, data, true)[1]
-		assert(group.attentionTabs == 0 and group.attentionConversations == 0 and group.target == nil)
-		assert(group.laterTabs == 1 and group.laterConversations == 2 and group.known)
+		assert(group.attentionTabs == 0 and group.attentionConversations == 0 and group.target == nil and group.known)
 	end
-	assert(model.next(state) == nil, "Backlog rows never remain Next targets")
-end)
-
-test("stale retained Backlog counts stay positive and unknown without a navigation target", function()
-	local state = model.new()
-	local data = sessionInventory({ agent(11, "waiting_input"), agent(12, "waiting_input") })
-	local projection = model.reconcile(state, data, {})
-	for _, source in ipairs(projection.rows) do model.setDisposition(state, "work:" .. tostring(source.serial), "later", 100) end
-	projection = model.reconcile(state, { ok = false, error = "offline" }, {})
-	assert(row(projection, 11).stale and row(projection, 11).disposition == "later")
-	for _, coherent in ipairs({ false, true }) do
-		local group = model.sessionGroups(projection, data, coherent)[1]
-		assert(group.laterTabs == 1 and group.laterConversations == 2 and not group.known)
-		assert(group.attentionTabs == 0 and group.attentionConversations == 0 and group.target == nil)
-		assert(group.available == coherent)
-	end
-end)
-
-test("Backlog counts reject obsolete native tab and session identities", function()
-	local state = model.new()
-	local data = sessionInventory({ agent(11, "waiting_input"), agent(12, "waiting_input") }, {
-		[11] = pane(11), [12] = pane(12), [21] = pane(21, { tab = 20, session = 200 }),
-	})
-	local native = model.reconcile(state, data, {})
-	local projection = table.clone(native)
-	projection.rows = {}
-	for _, source in ipairs(native.rows) do
-		local projected = table.clone(source)
-		projected.disposition = "later"
-		table.insert(projection.rows, projected)
-	end
-	data.panes[11].session, data.panes[11].tab = 200, 20
-	local groups = model.sessionGroups(projection, data, true)
-	assert(groups[1].laterTabs == 0 and groups[1].laterConversations == 0 and not groups[1].known)
-	assert(groups[2].laterTabs == 1 and groups[2].laterConversations == 1 and not groups[2].known)
-	assert(groups[1].target == nil and groups[2].target == nil)
-	data.panes[12].tab = 11
-	groups = model.sessionGroups(projection, data, true)
-	assert(groups[2].laterTabs == 0 and groups[2].laterConversations == 0 and not groups[2].known)
-	data.panes[12] = nil
-	groups = model.sessionGroups(projection, data, true)
-	assert(#groups == 1 and groups[1].session == 200)
-	assert(groups[1].laterTabs == 0 and groups[1].laterConversations == 0 and groups[1].target == nil)
+	assert(model.next(state) == nil, "Reference and Finished rows never remain Next targets")
 end)
 
 test("stale and incomplete coverage never become known quiet session counts", function()
@@ -861,8 +851,7 @@ test("stale and incomplete coverage never become known quiet session counts", fu
 	groups = model.sessionGroups(nil, data, false)
 	assert(#groups == 2 and not groups[1].known and not groups[2].known)
 	assert(groups[2].attentionConversations == 0 and groups[2].target == nil)
-	assert(groups[1].laterTabs == 0 and groups[1].laterConversations == 0)
-	assert(groups[2].laterTabs == 0 and groups[2].laterConversations == 0)
+	assert(groups[1].laterTabs == nil and groups[2].laterConversations == nil)
 	data.sessionOrder = nil
 	assert(#model.sessionGroups(stale, data, false) == 0, "unknown native order must not become hash order")
 end)
@@ -1193,6 +1182,85 @@ test("a quiet cursor whose pane disappears on a healthy host is an observed clos
 	local gone = model.reconcile(remote, snapshot(3, {}, {}, hosts), {}, { nowUtc = 102 })
 	assert(#gone.rows == 0 and #model.snapshot(remote).items == 0 and remote.persistenceRevision > savedRevision,
 		"a remote keyless cursor is pruned once its healthy host no longer lists its pane")
+end)
+
+local function needOf(presentation, id)
+	local need = row(presentation, id).need
+	if need == nil then return nil end
+	return need.kind .. "|" .. need.text .. "|" .. tostring(need.sinceUtc)
+end
+
+test("each row's need names what it waits on, a blocker before Working, and nothing for a quiet row", function()
+	local state = model.new()
+	local hosts = { [1] = { key = "local", connected = true }, [2] = { key = "remote", name = "Remote", connected = true } }
+	local data = snapshot(1, {
+		agent(11, "waiting_input"), agent(12, "working", "delivery refused"), agent(13, "idle"), agent(14, "idle"),
+		agent(15, "idle"), agent(16, "working"), agent(17, "idle"), agent(18, "working"), agent(22, "waiting_input"),
+	}, { [11] = pane(11), [12] = pane(12), [13] = pane(13, { startupError = "launch refused" }), [14] = pane(14),
+		[15] = pane(15), [16] = pane(16), [17] = pane(17), [18] = pane(18), [22] = pane(22, { host = 2 }) }, hosts)
+	local first = model.reconcile(state, data, {
+		{ kind = "finished", pane = 14, result = "done", at = 1 }, { kind = "finished", pane = 15, result = "failed", at = 1 },
+	}, { nowUtc = 100 })
+	assert(needOf(first, 11) == "waiting|Waiting for input|nil")
+	assert(needOf(first, 12) == "undelivered|Prompt not delivered|nil", "a blocked working row names its blocker")
+	assert(needOf(first, 13) == "startup|Agent didn't start|nil")
+	assert(needOf(first, 14) == "review|Reply to review|nil")
+	assert(needOf(first, 15) == "review|Agent reported failure|nil")
+	assert(needOf(first, 16) == "working|Working|nil", "no readable source means no stall clock")
+	assert(needOf(first, 17) == nil, "a quiet idle row has nothing to say")
+	assert(model.setDisposition(state, row(first, 18).workId, "reference", 100))
+	assert(row(model.current(state), 18).need == nil, "a Reference row is outside the queues")
+	local kept = row(first, 11).need
+	data.panes[11].title = "Renamed"
+	local renamed = model.reconcile(state, data, {}, { nowUtc = 101 })
+	assert(row(renamed, 11) ~= row(first, 11) and row(renamed, 11).need == kept,
+		"an unchanged need keeps its table so the row compares equal on it")
+	hosts[2].connected = false
+	local offline = model.reconcile(state, data, {}, { nowUtc = 120 })
+	assert(row(offline, 22).stale and needOf(offline, 22) == "offline|Last known: Waiting for input|nil")
+end)
+
+test("source questions, provider errors and recorded activity word a row's need", function()
+	local state = model.new()
+	local live = snapshot(1, { agent(11, "idle") })
+	live.sources = { [11] = { key = "conversation:11", path = "/exact/session", localSource = true } }
+	local fact = { key = "conversation:11", path = "/exact/session", sessionId = "needs", status = "ready",
+		capturedAtUtc = 100, revision = "question", schemaVersion = 3, writerVersions = { "18.18.7" },
+		selection = "disk-replayed", complete = true, coverage = { fields = { clock = "supported", questions = "supported" } },
+		questionCoverage = { status = "complete", knownTotal = 1, included = 1, omitted = 0 },
+		questions = { { id = "q", status = "open", askedAtUtc = 90, text = "  Which   database should\nwe use for sessions?  " } } }
+	live.sourceFacts = { [fact.key] = fact }
+	local function replay(now, changes)
+		if changes then
+			fact = table.clone(fact)
+			for key, value in pairs(changes) do fact[key] = value end
+			fact.capturedAtUtc, fact.revision = now, "revision-" .. tostring(now)
+			live.sourceFacts[fact.key] = fact
+		end
+		return model.reconcile(state, live, {}, { window = "", nowUtc = now, coherent = true,
+			hostKeys = { [1] = "local" }, connected = { ["local"] = true } })
+	end
+	local asked = replay(100)
+	assert(needOf(asked, 11) == "question|Asks: Which database should we use for…|nil", needOf(asked, 11))
+	assert(utf8.len(row(asked, 11).need.text) <= 40)
+	local failed = replay(102, { questions = {}, questionCoverage = { status = "complete", knownTotal = 0, included = 0, omitted = 0 },
+		lastError = { id = "e", kind = "usage_limit", atUtc = 101 }, lastActivityAtUtc = 101 })
+	assert(row(failed, 11).attention and failed.attentionCount == 1, "a provider error that ended the turn needs attention")
+	assert(needOf(failed, 11) == "provider|Usage limit reached|nil" and row(failed, 11).reason == "Recorded: Usage limit reached")
+	live.now, live.agents[1].state = 2, "working"
+	local working = replay(103)
+	assert(not row(working, 11).attention and needOf(working, 11) == "working|Working|103",
+		"working again clears the error; the stall clock starts at the observed work")
+	local held = row(working, 11).need
+	local active = replay(110, { lastActivityAtUtc = 109 })
+	assert(needOf(active, 11) == "working|Working|109" and row(active, 11).need ~= held, "new recorded activity moves the clock")
+	live.now, live.agents[1].state = 3, "idle"
+	local settled = replay(111)
+	assert(not row(settled, 11).attention and needOf(settled, 11) == nil, "an error recorded before the new work is history")
+	local again = replay(120, { lastError = { id = "e2", kind = "rate_limit", atUtc = 115 } })
+	assert(row(again, 11).attention and needOf(again, 11) == "provider|Rate limited|nil")
+	local unknownClock = replay(121, { coverage = { fields = { clock = "unknown", questions = "supported" } } })
+	assert(not row(unknownClock, 11).attention and needOf(unknownClock, 11) == nil, "an unparsed clock asserts no provider error")
 end)
 
 require("./lifecycle.test")

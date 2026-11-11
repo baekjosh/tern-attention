@@ -1,7 +1,15 @@
 local layout = {}
 
-local BATCH = 2
+-- Native operations one placement pass may issue: a tab the user is waiting on converges in few passes. A field,
+-- so a test can shorten a pass to stop a job mid-flight.
+layout.BATCH = 4
 local FIT_LIMIT = 12
+-- Measured cell sizes kept per divider; see cellRange.
+local CELL_MEMORY = 6
+-- Writes before a cell size may decide a stop or a bracket. Native measures from the geometry it last drew, and its first
+-- two measurements have come from geometry not yet drawn: 16 and 18 cells against 75 to 100 on a 700 px left edge, and
+-- 34 and 36 against about 145 on a 1280 px one.
+local SETTLED_WRITES = 3
 local GUESS_CELLS = 180
 local REVEAL = { focus = false }
 -- Each content leaf costs a native move plus sized dividers; beyond this the rail stays beside its first pane.
@@ -171,7 +179,7 @@ local function plan(tree, rail, tab, edge, share, expected, content)
 		rebuild(content)
 	end
 	table.insert(job.steps, { kind = "fit", path = {}, ratio = ratio, pane = rail,
-		dir = spec.grow, sign = spec.sign, attempts = 0, above = spec.rail == 1,
+		dir = spec.grow, sign = spec.sign, attempts = 0, moves = {}, above = spec.rail == 1,
 		bound = if share > FLOOR then (if spec.rail == 1 then FLOOR else 1 - FLOOR) else nil })
 	local function size(node, path)
 		if node.pane then return end
@@ -193,7 +201,7 @@ local function plan(tree, rail, tab, edge, share, expected, content)
 			evacuate(node[1])
 		end
 		table.insert(job.steps, { kind = "fit", path = table.clone(path), ratio = node.ratio or 0.5,
-			pane = pane, dir = node.split, sign = 1, attempts = 0 })
+			pane = pane, dir = node.split, sign = 1, attempts = 0, moves = {} })
 		if hidden then rebuild(node[1]) end
 		for index = 1, 2 do
 			table.insert(path, index)
@@ -334,6 +342,19 @@ local function transientDrift(job, before, after, scope)
 	return compare(before, after, 0, fitPath ~= nil, false)
 end
 
+-- Cell sizes measured on one divider. The smallest is the largest native move, which caps steps; the largest is the
+-- least move, which the stop test uses. A stale measurement reads a smaller cell than native's steady state, because
+-- native moved more cells than were asked; it can cap steps for at most CELL_MEMORY writes. Nil until a write measures.
+local function cellRange(fit)
+	local latest: number? = fit.extent
+	if latest == nil then return nil, nil end
+	local smallest: number, largest: number = latest, latest
+	for _, extent: number in fit.moves do
+		smallest, largest = math.min(smallest, extent), math.max(largest, extent)
+	end
+	return smallest, largest
+end
+
 local function finishPending(job, after)
 	local pending = job.pending
 	if not after or not equal(after.floats, pending.before.floats) then return false end
@@ -369,14 +390,12 @@ local function finishPending(job, after)
 			fit.applied = nextRatio
 		else
 			fit.extent = math.abs(pending.cells / delta)
-			-- Native converts cells with the geometry it last drew, so one write can move several times what
-			-- the next does. Steps are sized by the largest move observed, so a write may fall short of the
-			-- target but cannot throw the divider across it into a native limit.
-			fit.cautious = math.min(fit.cautious or fit.extent, fit.extent)
+			table.insert(fit.moves, fit.extent)
+			if #fit.moves > CELL_MEMORY then table.remove(fit.moves, 1) end
 			local previousError, nextError = aim(fit) - pending.ratio, aim(fit) - nextRatio
-			-- One native cell brackets adjacent attainable sizes. Choose the nearer
-			-- endpoint (either on a tie), rather than rounding half a cell forever.
-			if math.abs(pending.cells) == 1 and previousError * nextError <= 0
+			-- One native cell brackets adjacent attainable sizes, once SETTLED_WRITES writes have measured it. Choose the
+			-- nearer endpoint (either on a tie), rather than rounding half a cell forever.
+			if pending.attempts >= SETTLED_WRITES and math.abs(pending.cells) == 1 and previousError * nextError <= 0
 				and math.abs(nextError) <= math.abs(previousError) then
 				job.index = pending.index + 1
 				fit.applied = nextRatio
@@ -406,11 +425,11 @@ local function fitOne(cx, job, fit, before)
 	local ratio = node.ratio or 0.5
 	local error = aim(fit) - ratio
 	local extent = fit.extent or GUESS_CELLS
-	-- The first write on a divider moves one native cell toward its target: that measures the cell size
-	-- without risking a jump into a native limit, which would mislead every later estimate.
-	local cells = if fit.extent == nil then (if error / fit.sign > 0 then 1 else -1)
-		else math.round(error * (fit.cautious or extent) / fit.sign)
-	if math.abs(error) < 0.000001 or (cells == 0 and fit.extent ~= nil) then
+	local direction = if error / fit.sign > 0 then 1 else -1
+	local smallest, largest = cellRange(fit)
+	-- Stop once the largest recent cell size says the rail is within half a cell, and only after SETTLED_WRITES writes.
+	-- The first writes can measure geometry native has not drawn yet, and a stale size is too small: it would stop early.
+	if math.abs(error) < 0.000001 or (fit.attempts >= SETTLED_WRITES and largest ~= nil and math.round(error * largest / fit.sign) == 0) then
 		job.index += 1
 		fit.applied = ratio
 		return false
@@ -421,6 +440,10 @@ local function fitOne(cx, job, fit, before)
 		fit.applied = ratio
 		return false
 	end
+	-- The first write moves one native cell toward its target and so measures the cell size. Later steps are capped by
+	-- the smallest recent size, and a step is never empty while a cell is still due.
+	local cells = if smallest == nil then direction else math.round(error * smallest / fit.sign)
+	if cells == 0 then cells = direction end
 	cells = math.clamp(cells, -512, 512)
 	local pending = { kind = "fit", before = before, fit = fit, index = job.index,
 		ratio = ratio, extent = extent, cells = cells, attempts = fit.attempts + 1 }
@@ -487,7 +510,7 @@ function layout.reconcile(state, cx, request)
 	end
 
 	local changed = false
-	for _ = 1, BATCH do
+	for _ = 1, layout.BATCH do
 		local live, guardReason, guardParked = readGuard(cx, request)
 		if not live then
 			local result = stopped(guardReason, guardParked)

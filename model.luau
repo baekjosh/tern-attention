@@ -7,9 +7,9 @@ local fields = {
 	"attentionRevision", "reviewRevision", "reviewKind", "reviewSuperseded", "waiting", "delivery", "startup", "nativeState",
 	"alert", "turn", "finishedTurn", "finishedResult", "legacy",
 	"deferredPane", "deferredWork", "deferredResult", "deferredUtc", "deferredWorkAfter", "deferredWorkBefore", "deferredWaitingUtc",
-	"retained", "priority", "untilUtc", "availableOn", "availableTime", "zone", "manualRevisit", "blockerEpisode",
-	"laterEpisode", "sourceSessionId", "source", "noOpenPane", "replacedSource",
-	"waitingTurn", "laterUtc", "sourceGap", "sourceQuestionSuperseded", "sourceQuestionRevision",
+	"retained", "priority", "manualRevisit",
+	"sourceSessionId", "source", "noOpenPane", "replacedSource",
+	"waitingTurn", "sourceGap", "sourceQuestionSuperseded", "sourceQuestionRevision",
 	"sourceQuestionBaseline", "sourceWorkUtc",
 }
 local deferredFields = { "deferredPane", "deferredWork", "deferredResult", "deferredUtc", "deferredWorkAfter", "deferredWorkBefore", "deferredWaitingUtc" }
@@ -17,7 +17,8 @@ local known = {}
 for _, key in ipairs(fields) do known[key] = true end
 -- Retired record fields are discarded on load; any other field this runtime does not model is carried
 -- through every save unchanged so a newer writer's durable facts survive.
-local retiredRecordFields = { semantic = true, correction = true, scopeHumanId = true, scopePendingBaseline = true, scopeBaselineRevision = true }
+local retiredRecordFields = { semantic = true, correction = true, scopeHumanId = true, scopePendingBaseline = true, scopeBaselineRevision = true,
+	untilUtc = true, availableOn = true, availableTime = true, zone = true, blockerEpisode = true, laterEpisode = true, laterUtc = true }
 
 local function label(value, fallback)
 	return if type(value) == "string" and value ~= "" then value else fallback
@@ -33,12 +34,6 @@ end
 
 local function identifier(value)
 	return integer(value) or (type(value) == "string" and value ~= "")
-end
-
-local function civilTime(value)
-	if type(value) ~= "string" then return false end
-	local hour, minute = string.match(value, "^(%d%d):(%d%d)$")
-	return hour ~= nil and tonumber(hour) < 24 and tonumber(minute) < 60
 end
 
 local function plain(value)
@@ -68,11 +63,17 @@ local function pending(entry)
 	return entry.reviewRevision ~= nil or entry.waiting or entry.delivery or entry.startup or entry.deferredResult ~= nil
 end
 
+-- The source reader's per-field trust (source_facts.py coverage.fields): "unknown" means that field's records did not
+-- parse; an absent table (older captures, fixtures) asserts nothing.
+local function fieldUnknown(coverage, field)
+	return type(coverage) == "table" and type(coverage.fields) == "table" and coverage.fields[field] == "unknown"
+end
+
 local function historyApplicable(source)
 	local coverage = if type(source.coverage) == "table" then source.coverage else {}
 	return source.selection == "disk-replayed" and coverage.recordsComplete ~= false
 		and coverage.historyScope ~= "unavailable" and coverage.historyScope ~= "observed-prefix"
-		and coverage.selectionSupport ~= "unknown" and coverage.selectionSupport ~= "prefix-only"
+		and not fieldUnknown(coverage, "questions")
 end
 
 local function historyCurrent(entry)
@@ -81,7 +82,7 @@ local function historyCurrent(entry)
 		and observation ~= nil and (observation.status == "ready" or observation.status == "unchanged")
 		and observation.revision == entry.source.revision and observation.selection == "disk-replayed" and observation.recordsComplete ~= false
 		and observation.historyScope ~= "unavailable" and observation.historyScope ~= "observed-prefix"
-		and observation.selectionSupport ~= "unknown" and observation.selectionSupport ~= "prefix-only"
+		and observation.questionSupport ~= "unknown"
 end
 
 local function questionCoverageComplete(source)
@@ -122,8 +123,29 @@ local function sourceQuestionCurrent(entry)
 	return entry.sourceOpen == true and entry.nativeState ~= "working" and entry.sourceQuestionSuperseded ~= true
 end
 
+-- Line-two wording of a row's need (view.luau renders need.text verbatim).
+local PROVIDER_NEEDS = { rate_limit = "Rate limited", usage_limit = "Usage limit reached", api_error = "API error",
+	provider = "Provider error" }
+local REVIEW_NEEDS = { done = "Reply to review", update = "New update", failed = "Agent reported failure",
+	exited = "Agent exited", waiting = "Previous input request", delivery = "Previous delivery problem",
+	startup = "Previous startup problem", manual = "Manual revisit", legacy = "Saved review" }
+-- "Asks: " plus this many characters stays within the ~40 the line has room for.
+local QUESTION_NEED_CHARS = 34
+
+-- The kind of provider error that ended the agent's last recorded turn, while it still stands: not while the agent works
+-- again, and not when that work started after the error was recorded (`sourceWorkUtc`).
+local function providerError(entry)
+	local source = entry.source
+	local failure = if source then source.lastError else nil
+	if type(failure) ~= "table" or PROVIDER_NEEDS[failure.kind] == nil or not finite(failure.atUtc)
+		or entry.nativeState == "working" or fieldUnknown(source.coverage, "clock")
+		or (entry.sourceWorkUtc ~= nil and failure.atUtc <= entry.sourceWorkUtc) then return nil end
+	return failure.kind
+end
+
 local function attentionEligible(entry)
-	return entry.disposition == "active" and (conditionFor(entry) ~= nil or sourceQuestionCurrent(entry) or (passiveCurrent(entry)
+	return entry.disposition == "active" and (conditionFor(entry) ~= nil or sourceQuestionCurrent(entry)
+		or providerError(entry) ~= nil or (passiveCurrent(entry)
 		and (entry.reviewRevision ~= nil or entry.deferredResult ~= nil or entry.manualRevisit == true)))
 end
 
@@ -150,13 +172,85 @@ local function reasonFor(entry)
 	if condition == nil and sourceQuestionCurrent(entry) then
 		return if entry.sourceOpenLastKnown or entry.stale or not historyCurrent(entry) then "Last recorded question unresolved" else "Recorded question unresolved"
 	end
+	local provider = if condition == nil then providerError(entry) else nil
+	if provider then
+		local phrase = (if entry.stale then "Last known: " else "Recorded: ") .. PROVIDER_NEEDS[provider]
+		return if review then phrase .. " · review pending" else phrase
+	end
 	if condition or review then return if condition and review then condition .. " · " .. review else condition or review end
 	if passiveCurrent(entry) and entry.manualRevisit then return "Manual revisit" end
-	if entry.disposition == "later" then return "Deferred" end
 	if entry.disposition == "reference" then return "Kept as reference" end
 	if entry.disposition == "finished" then return "Finished for now" end
 	return if entry.nativeState == "working" then "Working" elseif entry.nativeState == "exited" then "Agent exited"
 		elseif entry.source and entry.source.lastFinal then "Recorded final reply" else "No established next move"
+end
+
+-- One open question's words for line two: whitespace collapsed, no closing punctuation, cut at a word with "…".
+local function questionNeed(source)
+	local ledgers = { source.questions or {} }
+	if type(source.lastKnown) == "table" then table.insert(ledgers, source.lastKnown.questions or {}) end
+	for _, ledger in ipairs(ledgers) do
+		for index = #ledger, 1, -1 do
+			local question = ledger[index]
+			if question.status == "open" and type(question.text) == "string" then
+				local words = string.match((string.gsub(question.text, "%s+", " ")), "^%s*(.-)%s*$")
+				words = string.gsub(words, "[%?%.:;,!%s]+$", "")
+				if words ~= "" then
+					local length = utf8.len(words)
+					if length == nil then break end
+					if length > QUESTION_NEED_CHARS then
+						local cut = string.sub(words, 1, utf8.offset(words, QUESTION_NEED_CHARS + 1) - 1)
+						local atWord = string.match(cut, "^(.*%S)%s+%S*$")
+						if atWord and utf8.len(atWord) > QUESTION_NEED_CHARS // 2 then cut = atWord end
+						words = string.gsub(cut, "[%?%.:;,!%s]+$", "") .. "…"
+					end
+					return "Asks: " .. words
+				end
+			end
+		end
+	end
+	return "Asks a question"
+end
+
+-- When a working agent last did something on record: its newest assistant/tool record, the prompt that started the
+-- turn, or the observed start of work, whichever is latest. Nil without a source whose clock parsed.
+local function workingSince(entry)
+	local source = entry.source
+	if source == nil or fieldUnknown(source.coverage, "clock") then return nil end
+	local since = nil
+	-- Not ipairs: any of the three may be nil.
+	for _, at in { source.lastActivityAtUtc or false, source.lastInteractionAtUtc or false, entry.sourceWorkUtc or false } do
+		if finite(at) and (since == nil or at > since) then since = at end
+	end
+	return since
+end
+
+-- The row's need (kind, text, sinceUtc), in reasonFor's precedence; a stale row's need is its last known one.
+local function needFor(entry)
+	local condition, kind, text, since = conditionFor(entry), nil, nil, nil
+	local provider = if condition == nil then providerError(entry) else nil
+	if condition == "waiting" then kind, text = "waiting", "Waiting for input"
+	elseif condition == "delivery" then kind, text = "undelivered", "Prompt not delivered"
+	elseif condition == "startup" then kind, text = "startup", "Agent didn't start"
+	elseif sourceQuestionCurrent(entry) then kind, text = "question", questionNeed(entry.source)
+	elseif provider then kind, text = "provider", PROVIDER_NEEDS[provider]
+	elseif passiveCurrent(entry) and entry.reviewRevision ~= nil then kind, text = "review", REVIEW_NEEDS[entry.reviewKind] or "New update"
+	elseif passiveCurrent(entry) and entry.deferredResult ~= nil then kind, text = "review", "Completion unverified"
+	elseif passiveCurrent(entry) and entry.manualRevisit then kind, text = "review", "Manual revisit"
+	elseif entry.disposition == "active" and entry.nativeState == "working" then
+		kind, text, since = "working", "Working", workingSince(entry)
+	else return nil end
+	if entry.stale then return "offline", "Last known: " .. text, nil end
+	return kind, text, since
+end
+
+-- Rows compare shallowly (publish), so an unchanged need keeps the previous row's table.
+local function needOf(entry)
+	local kind, text, since = needFor(entry)
+	if kind == nil then return nil end
+	local previous = if entry.row then entry.row.need else nil
+	if previous and previous.kind == kind and previous.text == text and previous.sinceUtc == since then return previous end
+	return { kind = kind, text = text, sinceUtc = since }
 end
 
 local function ranked(a, b)
@@ -186,7 +280,7 @@ local function publish(state)
 		return a.serial < b.serial
 	end)
 	local old, rows, targets = state.presentation, {}, {}
-	local attentionCount, laterCount, reachableCount, awaitingHeaderCount = 0, 0, 0, 0
+	local attentionCount, reachableCount, awaitingHeaderCount = 0, 0, 0
 	local counted = state.complete or state.status == "unsaved"
 	local offline = if state.status == "partial" then state.offlineHosts else nil
 	local different = old.status ~= state.status or old.message ~= state.message
@@ -203,18 +297,18 @@ local function publish(state)
 		local candidate = {
 			workId = "work:" .. tostring(entry.serial), serial = entry.serial,
 			pane = if entry.noOpenPane then nil else entry.pane, host = entry.host, hostKey = entry.hostKey,
+			live = state.byPane[entry.pane] == entry,
 			tab = entry.tab, session = entry.session, title = entry.title, sessionName = entry.sessionName,
 			hostName = entry.hostName, localHost = entry.localHost, context = context, reason = reasonFor(entry),
 			firstSeenUtc = entry.firstSeenUtc, disposition = entry.disposition, retained = entry.retained == true,
 			priority = entry.priority, queueOrder = entry.queueOrder, identityKey = entry.identityKey,
 			attention = attentionEligible(entry), attentionRevision = entry.attentionRevision, reviewRevision = entry.reviewRevision,
 			condition = conditionFor(entry), reviewKind = entry.reviewKind, reviewSuperseded = entry.reviewSuperseded == true,
-			sourceQuestionCurrent = sourceQuestionCurrent(entry),
+			sourceQuestionCurrent = sourceQuestionCurrent(entry), need = needOf(entry),
 			stale = entry.stale == true, navigable = entry.navigable == true, orphaned = entry.orphaned == true,
 			retryableHeaderRoute = entry.retryableHeaderRoute == true,
 			unavailableReason = entry.unavailableReason, parked = entry.parked, floating = entry.floating,
 			nativeState = entry.nativeState or "unknown", runtimeObservedAtUtc = entry.runtimeObservedAtUtc,
-			untilUtc = entry.untilUtc, availableOn = entry.availableOn, availableTime = entry.availableTime, zone = entry.zone,
 			source = entry.source, sourceObservation = entry.sourceObservation, sourceSessionId = entry.sourceSessionId,
 		}
 		local row, same = entry.row, entry.row ~= nil
@@ -232,13 +326,12 @@ local function publish(state)
 				if row.navigable then reachableCount += 1 else awaitingHeaderCount += 1 end
 			end
 		end
-		if entry.disposition == "later" then laterCount += 1 end
 	end
 	if different then
 		state.presentation = {
 			rows = rows, status = state.status, message = state.message, revision = old.revision + 1,
 			count = if counted then #rows else nil, knownCount = #rows, allCount = #rows,
-			attentionCount = attentionCount, laterCount = laterCount, reachableCount = reachableCount,
+			attentionCount = attentionCount, reachableCount = reachableCount,
 			awaitingHeaderCount = awaitingHeaderCount,
 			attentionTargets = targets, offlineHosts = offline,
 		}
@@ -247,6 +340,47 @@ local function publish(state)
 end
 
 local retiredSourceFields = { context = true, semanticRevision = true, state = true, messages = true, contextCoverage = true }
+
+-- A stored reply keeps only the excerpt the rail shows (view.luau's source details label 300 characters); the whole reply
+-- stays in the agent's own session file. Human input is shown only by its time, so its text is not stored. The source
+-- reader applies the same bound (source_facts.py REPLY_TEXT); this one migrates records saved before it.
+local REPLY_TEXT_CHARS = 300
+
+-- A copy of `source` with replies bounded, or nil when it already is.
+local function boundedReplies(source)
+	local changed = false
+	local function bound(ledger)
+		if type(ledger) ~= "table" then return ledger end
+		local copy = nil
+		for _, field in ipairs({ "lastFinal", "lastAssistant" }) do
+			local reply = ledger[field]
+			if type(reply) == "table" and type(reply.text) == "string" then
+				local cut = utf8.offset(reply.text, REPLY_TEXT_CHARS + 1)
+				if cut and cut <= #reply.text then
+					copy = copy or table.clone(ledger)
+					copy[field] = table.clone(reply)
+					copy[field].text, copy[field].textTruncated = string.sub(reply.text, 1, cut - 1), true
+				end
+			end
+		end
+		if type(ledger.lastHuman) == "table" and ledger.lastHuman.text ~= nil then
+			copy = copy or table.clone(ledger)
+			copy.lastHuman = table.clone(ledger.lastHuman)
+			copy.lastHuman.text = nil
+		end
+		if copy then changed = true end
+		return copy or ledger
+	end
+	local result = bound(source)
+	if type(result.lastKnown) == "table" then
+		local lastKnown = bound(result.lastKnown)
+		if lastKnown ~= result.lastKnown then
+			if result == source then result = table.clone(source) end
+			result.lastKnown = lastKnown
+		end
+	end
+	return if changed then result else nil
+end
 
 local function copyValue(value, depth, factual)
 	if type(value) ~= "table" then return value end
@@ -269,8 +403,8 @@ local function validateRecord(record)
 		and type(record.window) == "string" and type(record.hostKey) == "string"
 		and finite(record.firstSeenUtc) and record.firstSeenUtc >= 0
 		and integer(record.queueOrder) and integer(record.attentionRevision) and integer(record.turn)
-		and (record.disposition == "active" or record.disposition == "later"
-			or record.disposition == "reference" or record.disposition == "finished"), "Invalid triage durable record")
+		and (record.disposition == "active" or record.disposition == "reference" or record.disposition == "finished"),
+		"Invalid triage durable record")
 	assert(record.lastResultAt == nil and record.eventObservedAt == nil and record.workObservedAt == nil
 		and record.deferredWorkAt == nil and record.deferredAt == nil and record.deferredWaitingAt == nil, "Unsupported triage runtime-clock record")
 	for _, key in ipairs({ "title", "sessionName", "hostName" }) do
@@ -303,9 +437,6 @@ local function validateRecord(record)
 		and record.deferredPane ~= nil), "Invalid triage deferred input request")
 	assert(record.priority == nil or (integer(record.priority) and record.priority <= 3), "Invalid triage priority")
 	assert(record.retained == nil or type(record.retained) == "boolean", "Invalid triage retention")
-	assert(record.untilUtc == nil or finite(record.untilUtc), "Invalid triage Later date")
-	assert(record.availableTime == nil or (civilTime(record.availableTime) and record.untilUtc ~= nil
-		and record.availableOn ~= nil), "Invalid triage civil time")
 	assert(record.sourceWorkUtc == nil or finite(record.sourceWorkUtc), "Invalid triage source work cutoff")
 	if record.sourceQuestionBaseline ~= nil then
 		local baseline = record.sourceQuestionBaseline
@@ -317,10 +448,10 @@ local function validateRecord(record)
 			ids[id] = true
 		end
 	end
-	for _, key in ipairs({ "availableOn", "zone", "sourceSessionId" }) do
+	for _, key in ipairs({ "sourceSessionId" }) do
 		assert(record[key] == nil or type(record[key]) == "string", "Invalid triage source metadata")
 	end
-	for _, key in ipairs({ "blockerEpisode", "laterEpisode", "waitingTurn" }) do
+	for _, key in ipairs({ "waitingTurn" }) do
 		assert(record[key] == nil or integer(record[key]), "Invalid triage episode")
 	end
 	for _, key in ipairs({ "source" }) do
@@ -329,7 +460,6 @@ local function validateRecord(record)
 	for _, key in ipairs({ "noOpenPane", "replacedSource", "sourceGap", "manualRevisit" }) do
 		assert(record[key] == nil or type(record[key]) == "boolean", "Invalid triage evidence state")
 	end
-	assert(record.laterUtc == nil or finite(record.laterUtc), "Invalid triage deferral observation")
 	if record.source then
 		assert(record.source.key == record.identityKey and record.source.sessionId == record.sourceSessionId
 			and finite(record.source.capturedAtUtc)
@@ -342,7 +472,7 @@ function model.new(saved)
 		entries = {}, byPane = {}, hosts = {}, hostHealth = {}, serial = 0, queueOrder = 0, attentionRevision = 0,
 		persistenceRevision = 0, snapshotRevision = -1, status = "loading", complete = false, message = "Loading native agents",
 		presentation = { rows = {}, status = "loading", knownCount = 0, revision = 0,
-			attentionCount = 0, laterCount = 0, allCount = 0, reachableCount = 0, awaitingHeaderCount = 0,
+			attentionCount = 0, allCount = 0, reachableCount = 0, awaitingHeaderCount = 0,
 			attentionTargets = {}, message = "Loading native agents" },
 	}
 	if saved == nil then return state end
@@ -352,12 +482,18 @@ function model.new(saved)
 	local identities, locators = {}, {}
 	local function insert(record)
 		assert(plain(record), "Invalid triage durable record")
+		-- The retired Later queue (disposition `later`, legacy bucket `backlog`): a set-aside record loads as Finished for
+		-- now, retained; its Later dates and episodes are retired fields, discarded below.
 		if saved.schema ~= 3 then
 			record = table.clone(record)
 			assert(record.bucket == "p0" or record.bucket == "backlog", "Invalid triage legacy bucket")
-			record.disposition = if record.bucket == "backlog" then "later" else "active"
+			record.disposition = if record.bucket == "backlog" then "finished" else "active"
 			record.retained = if record.bucket == "backlog" then true else nil
 			record.priority = nil
+		elseif record.disposition == "later" then
+			record = table.clone(record)
+			record.disposition, record.retained = "finished", true
+			state.persistenceRevision += 1
 		end
 		for obsolete in pairs(retiredRecordFields) do
 			if record[obsolete] ~= nil then state.persistenceRevision += 1; break end
@@ -365,6 +501,12 @@ function model.new(saved)
 		if type(record.source) == "table" then
 			for obsolete in pairs(retiredSourceFields) do
 				if record.source[obsolete] ~= nil then state.persistenceRevision += 1; break end
+			end
+			local bounded = boundedReplies(record.source)
+			if bounded then
+				record = table.clone(record)
+				record.source = bounded
+				state.persistenceRevision += 1
 			end
 		end
 		validateRecord(record)
@@ -384,7 +526,6 @@ function model.new(saved)
 				end
 			end
 		end
-		if entry.disposition == "later" and entry.retained ~= true then changed(state, entry, "retained", true) end
 		if entry.reviewSuperseded == nil and entry.nativeState == "working" then
 			changed(state, entry, "reviewSuperseded", true)
 		end
@@ -481,19 +622,8 @@ local function newEntry(state, pane, context)
 	return entry
 end
 
-local function attention(state, entry, now, reviewKind, direct)
-	local wasPending, wasLater = pending(entry), entry.disposition == "later"
-	if direct then
-		changed(state, entry, "blockerEpisode", (entry.blockerEpisode or 0) + 1)
-		if entry.disposition == "later" and (entry.blockerEpisode or 0) > (entry.laterEpisode or 0) then
-			changed(state, entry, "disposition", "active")
-			changed(state, entry, "untilUtc", nil)
-			changed(state, entry, "availableOn", nil)
-			changed(state, entry, "availableTime", nil)
-			changed(state, entry, "zone", nil)
-		end
-	end
-	if not wasPending or (direct and wasLater) then
+local function attention(state, entry, now, reviewKind)
+	if not pending(entry) then
 		state.queueOrder += 1
 		changed(state, entry, "queueOrder", state.queueOrder)
 	end
@@ -541,7 +671,7 @@ local function observe(state, entry, event, now, historical)
 	if waiting then
 		if entry.waiting and not entry.conditionRaised and entry.turn > (entry.waitingTurn or 0)
 			and (entry.eventObservedAt == nil or (at ~= nil and at > entry.eventObservedAt)) then
-			attention(state, entry, now, nil, true)
+			attention(state, entry, now, nil)
 			changed(state, entry, "waitingTurn", entry.turn)
 		end
 		if at ~= nil then entry.eventObservedAt = at end
@@ -608,9 +738,6 @@ local function absorb(state, keep, other)
 	merged.sourceQuestionBaseline = sourceOwner.sourceQuestionBaseline
 	merged.sourceWorkUtc = if keep.sourceWorkUtc and other.sourceWorkUtc then math.max(keep.sourceWorkUtc, other.sourceWorkUtc)
 		else keep.sourceWorkUtc or other.sourceWorkUtc
-	if merged.disposition ~= "later" then
-		merged.untilUtc, merged.availableOn, merged.availableTime, merged.zone = nil, nil, nil, nil
-	end
 	for _, key in ipairs({ "waiting", "delivery", "startup", "alert" }) do
 		if keep[key] or other[key] then merged[key] = true end
 	end
@@ -620,7 +747,7 @@ local function absorb(state, keep, other)
 	keep.durableCopy = nil
 	for _, key in ipairs(fields) do keep[key] = merged[key] end
 	keep.sourceOpen, keep.sourceOpenLastKnown = questionState(keep.source)
-	keep.sourceObservation = sourceOwner.sourceObservation
+	keep.sourceObservation, keep.sourceObservedAtUtc = sourceOwner.sourceObservation, sourceOwner.sourceObservedAtUtc
 	keep.eventObservedAt, keep.workObservedAt, keep.lastResultAt = newer.eventObservedAt, newer.workObservedAt, newer.lastResultAt
 	keep.deferredWorkAt, keep.deferredAt = deferred.deferredWorkAt, deferred.deferredAt
 	keep.deferredObservedAt, keep.deferredWaitingAt = deferred.deferredObservedAt, deferred.deferredWaitingAt
@@ -735,9 +862,11 @@ local function observeSource(entry, snapshot, pane, key, now)
 				elseif type(observed.coverage) == "table" then observed.coverage else {}
 			local sessionId = if body then body.sessionId else observed.sessionId
 			if entry.sourceSessionId and sessionId and entry.sourceSessionId ~= sessionId and sourceHeaderShape(body) then status = "header-mismatch" end
+			local fields = if type(coverage.fields) == "table" then coverage.fields else {}
 			candidate = { status = status, capturedAtUtc = observed.capturedAtUtc, path = observed.path, sessionId = sessionId,
 				revision = observed.revision, selection = if body then body.selection else observed.selection,
-				recordsComplete = coverage.recordsComplete, historyScope = coverage.historyScope, selectionSupport = coverage.selectionSupport }
+				recordsComplete = coverage.recordsComplete, historyScope = coverage.historyScope,
+				clockSupport = fields.clock, questionSupport = fields.questions }
 		end
 	end
 	if headerSupersedes(header, observed, body) then
@@ -748,17 +877,26 @@ local function observeSource(entry, snapshot, pane, key, now)
 		if status then
 			candidate = { status = status, capturedAtUtc = header.capturedAtUtc, path = header.path, sessionId = header.sessionId,
 				revision = header.revision, selection = "unknown", recordsComplete = false, historyScope = "unavailable",
-				selectionSupport = "unknown", historyRead = false }
+				clockSupport = "unknown", questionSupport = "unknown", historyRead = false }
 		end
 	end
 	if candidate then
 		local previous = entry.sourceObservation
-		if (previous and candidate.capturedAtUtc < previous.capturedAtUtc)
+		if (entry.sourceObservedAtUtc and candidate.capturedAtUtc < entry.sourceObservedAtUtc)
 			or (entry.source and candidate.capturedAtUtc < entry.source.capturedAtUtc) then return nil end
+		-- `sourceObservedAtUtc` is the latest capture, for ordering; the observation itself keeps the time this availability
+		-- was first seen, so a periodic re-check that finds nothing new leaves the presentation (and every rail) untouched.
+		entry.sourceObservedAtUtc = candidate.capturedAtUtc
 		local same = previous ~= nil
 		if previous then
-			for field, value in pairs(candidate) do if previous[field] ~= value then same = false; break end end
-			if same then for field, value in pairs(previous) do if candidate[field] ~= value then same = false; break end end end
+			for field, value in pairs(candidate) do
+				if field ~= "capturedAtUtc" and previous[field] ~= value then same = false; break end
+			end
+			if same then
+				for field, value in pairs(previous) do
+					if field ~= "capturedAtUtc" and candidate[field] ~= value then same = false; break end
+				end
+			end
 		end
 		if not same then entry.sourceObservation = candidate end
 	end
@@ -778,7 +916,7 @@ local function sourceHeader(snapshot, pane, key, now, entry)
 		proof = { key = key, path = locator.path, sessionId = body.sessionId, revision = observed.revision,
 			capturedAtUtc = if header then math.max(observed.capturedAtUtc, header.capturedAtUtc) else observed.capturedAtUtc }
 	else return nil end
-	if entry and ((entry.sourceObservation and proof.capturedAtUtc < entry.sourceObservation.capturedAtUtc)
+	if entry and ((entry.sourceObservedAtUtc and proof.capturedAtUtc < entry.sourceObservedAtUtc)
 		or (entry.source and proof.capturedAtUtc < entry.source.capturedAtUtc)) then return nil end
 	return proof
 end
@@ -789,7 +927,7 @@ local function acceptedSource(snapshot, pane, key, now, entry)
 	if observed == nil or not sourceHeaderShape(fact) or fact.selection ~= "disk-replayed"
 		or fact.coverage.recordsComplete == false or fact.coverage.historyScope == "unavailable"
 		or fact.coverage.historyScope == "observed-prefix" or headerSupersedes(header, observed, fact) then return nil end
-	if entry and entry.sourceObservation and observed.capturedAtUtc < entry.sourceObservation.capturedAtUtc then return nil end
+	if entry and entry.sourceObservedAtUtc and observed.capturedAtUtc < entry.sourceObservedAtUtc then return nil end
 	if fact.questions ~= nil and type(fact.questions) ~= "table" then return nil end
 	local ids = {}
 	for index, question in ipairs(fact.questions or {}) do
@@ -868,6 +1006,7 @@ local function applySource(state, entry, fact, snapshot, now, verifiedAtUtc)
 	if old == nil or old.revision ~= fact.revision or old.status ~= fact.status then
 		local accepted = copyValue(fact, 0, true)
 		accepted.lastKnown = nil
+		accepted = boundedReplies(accepted) or accepted
 		if old and not questionCoverageComplete(fact) then
 			local prior, lastKnown = old.lastKnown or {}, {}
 			local previousProvenance = prior.provenance or {}
@@ -958,8 +1097,7 @@ local function applySource(state, entry, fact, snapshot, now, verifiedAtUtc)
 					if entry.disposition == "active" and qualifiedBaseline and finite(question.askedAtUtc)
 						and question.askedAtUtc > math.max(qualifiedBaseline.capturedAtUtc, entry.sourceWorkUtc or 0)
 						and question.askedAtUtc <= now then newQuestion = true end
-				elseif entry.disposition ~= "later" or (finite(question.askedAtUtc)
-					and question.askedAtUtc > (entry.laterUtc or math.huge) and question.askedAtUtc <= now) then
+				else
 					newQuestion = true
 				end
 			end
@@ -970,7 +1108,7 @@ local function applySource(state, entry, fact, snapshot, now, verifiedAtUtc)
 			and (not recovering and questionCoverageComplete(old)
 				or recovering and entry.disposition == "active" and qualifiedBaseline ~= nil) then
 			if newQuestion then
-				attention(state, entry, now, nil, true)
+				attention(state, entry, now, nil)
 				changed(state, entry, "sourceQuestionSuperseded", false)
 				changed(state, entry, "sourceQuestionRevision", state.attentionRevision)
 			end
@@ -983,6 +1121,13 @@ local function applySource(state, entry, fact, snapshot, now, verifiedAtUtc)
 		changed(state, entry, "sourceQuestionBaseline", { revision = fact.revision, capturedAtUtc = fact.capturedAtUtc, ids = ids })
 	end
 	changed(state, entry, "sourceGap", not fact.complete or nil)
+end
+-- One transition into the retained terminal state: the record keeps its identity and history, but its pane is
+-- gone and it can only reopen, never navigate. Every path that decides a pane is gone funnels through here.
+local function markNoOpenPane(state, entry)
+	changed(state, entry, "noOpenPane", true)
+	entry.navigable, entry.orphaned, entry.stale = false, true, true
+	entry.unavailableReason = "No open pane"
 end
 
 function model.reconcile(state, snapshot, events, context)
@@ -1004,6 +1149,19 @@ function model.reconcile(state, snapshot, events, context)
 	for _, event in ipairs(events) do
 		if event.kind == "closed" or (event.kind == "finished" and event.result == "closed") then closed[event.pane] = true end
 	end
+	-- A record's host id is a native runtime id and goes stale across restarts while its stable key persists.
+	-- Re-resolve by key before any pass judges liveness, so a vanished pane is judged against its own host.
+	local hostsByKey = {}
+	for hostId, host in pairs(hosts) do if host.key ~= nil then hostsByKey[host.key] = hostId end end
+	for _, entry in pairs(state.entries) do
+		if entry.hostKey ~= nil then
+			local current = hosts[entry.host]
+			if current == nil or current.key ~= entry.hostKey then
+				local resolved = hostsByKey[entry.hostKey]
+				if resolved ~= nil then changed(state, entry, "host", resolved) end
+			end
+		end
+	end
 	for serial, entry in pairs(state.entries) do
 		local fact = if entry.identityKey then sourceHeader(snapshot, entry.pane, entry.identityKey, now, entry) else nil
 		local observed = if entry.identityKey then observeSource(entry, snapshot, entry.pane, entry.identityKey, now) else nil
@@ -1018,9 +1176,7 @@ function model.reconcile(state, snapshot, events, context)
 			and (entry.source == nil or fact.capturedAtUtc >= entry.source.capturedAtUtc) then
 			if entry.retained then
 				changed(state, entry, "replacedSource", true)
-				changed(state, entry, "noOpenPane", true)
-				entry.navigable, entry.orphaned, entry.stale = false, true, true
-				entry.unavailableReason = "No open pane"
+				markNoOpenPane(state, entry)
 			else
 				state.entries[serial] = nil
 				state.persistenceRevision += 1
@@ -1048,9 +1204,7 @@ function model.reconcile(state, snapshot, events, context)
 			end
 			if survivor then changed(state, entry, "pane", survivor)
 			elseif entry.retained then
-				changed(state, entry, "noOpenPane", true)
-				entry.navigable, entry.orphaned, entry.stale = false, true, true
-				entry.unavailableReason = "No open pane"
+				markNoOpenPane(state, entry)
 			else
 				state.entries[serial] = nil
 				state.persistenceRevision += 1
@@ -1359,9 +1513,8 @@ function model.reconcile(state, snapshot, events, context)
 				and entry.turn == turnsBeforeReplay[paneId] and not callbackWork[paneId] then
 				snapshotWork[paneId] = { kind = "state", old = entry.nativeState, new = "working", at = snapshot.now }
 			end
-			local direct = freshCondition and not entry.conditionGap and not entry.restored
 			if not entry.legacy and (freshCondition or freshAlert) then
-				attention(state, entry, now, if freshAlert then "update" else nil, direct)
+				attention(state, entry, now, if freshAlert then "update" else nil)
 				if freshAlert then changed(state, entry, "reviewSuperseded", nativeState == "working") end
 			end
 			if entry.nativeState ~= nativeState then entry.runtimeObservedAtUtc = now end
@@ -1434,9 +1587,7 @@ function model.reconcile(state, snapshot, events, context)
 			and entry.host ~= nil and hosts[entry.host] ~= nil and healthy[entry.host]
 			and (entry.identityKey == nil or (ready and not undecided)) then
 			if entry.retained then
-				changed(state, entry, "noOpenPane", true)
-				entry.navigable, entry.orphaned, entry.stale = false, true, true
-				entry.unavailableReason = "No open pane"
+				markNoOpenPane(state, entry)
 			else
 				state.entries[serial] = nil
 				state.persistenceRevision += 1
@@ -1469,34 +1620,6 @@ function model.reconcile(state, snapshot, events, context)
 				and not entry.orphaned and entry.localHost == true and locator ~= nil
 				and locator.localSource == true and locator.key == entry.identityKey and not mismatched
 		end
-		if entry.disposition == "later" and entry.untilUtc ~= nil and now >= entry.untilUtc then
-			changed(state, entry, "disposition", "active")
-			changed(state, entry, "untilUtc", nil)
-			changed(state, entry, "availableOn", nil)
-			changed(state, entry, "availableTime", nil)
-			changed(state, entry, "zone", nil)
-			changed(state, entry, "manualRevisit", true)
-			changed(state, entry, "firstSeenUtc", now)
-			state.attentionRevision += 1
-			changed(state, entry, "attentionRevision", state.attentionRevision)
-			changed(state, entry, "reviewRevision", state.attentionRevision)
-			changed(state, entry, "reviewKind", "manual")
-			changed(state, entry, "reviewSuperseded", false)
-			state.queueOrder += 1
-			changed(state, entry, "queueOrder", state.queueOrder)
-		end
-	end
-	local afterSeconds = context.afterSeconds or 0
-	if afterSeconds > 0 then
-		for _, entry in pairs(state.entries) do
-			if attentionEligible(entry) and now - entry.firstSeenUtc >= afterSeconds then
-				changed(state, entry, "disposition", "later")
-				changed(state, entry, "retained", true)
-				changed(state, entry, "sourceQuestionBaseline", nil)
-				changed(state, entry, "laterEpisode", entry.blockerEpisode or 0)
-				changed(state, entry, "laterUtc", now)
-			end
-		end
 	end
 	return publish(state)
 end
@@ -1512,43 +1635,21 @@ local function work(state, workId)
 end
 
 function model.setDisposition(state, workId, disposition, nowUtc, options)
-	assert(disposition == "active" or disposition == "later" or disposition == "reference" or disposition == "finished",
-		"Invalid triage disposition")
+	assert(disposition == "active" or disposition == "reference" or disposition == "finished", "Invalid triage disposition")
 	assert(finite(nowUtc), "Invalid triage action time")
 	local entry = work(state, workId)
 	if entry == nil then return false end
 	options = options or {}
-	assert(options.untilUtc == nil or finite(options.untilUtc), "Invalid triage Later date")
-	assert(options.availableOn == nil or (type(options.availableOn) == "string"
-		and string.match(options.availableOn, "^%d%d%d%d%-%d%d%-%d%d$")), "Invalid triage civil date")
-	assert(options.zone == nil or (type(options.zone) == "string" and options.zone ~= ""), "Invalid triage timezone")
-	assert(options.availableOn == nil or options.untilUtc ~= nil, "Invalid triage unresolved civil date")
-	assert(options.availableTime == nil or (civilTime(options.availableTime) and options.availableOn ~= nil
-		and options.untilUtc ~= nil), "Invalid triage civil time")
-	local untilUtc = if disposition == "later" then options.untilUtc else nil
-	local availableOn = if disposition == "later" then options.availableOn else nil
-	local availableTime = if disposition == "later" then options.availableTime else nil
-	local zone = if disposition == "later" then options.zone else nil
-	if entry.disposition == disposition and entry.untilUtc == untilUtc and entry.availableOn == availableOn
-		and entry.availableTime == availableTime and entry.zone == zone and options.bringBack ~= true then
+	if entry.disposition == disposition and options.bringBack ~= true then
 		if disposition ~= "active" and changed(state, entry, "retained", true) then publish(state); return true end
 		return false
 	end
-	local wasLater = entry.disposition == "later"
 	changed(state, entry, "disposition", disposition)
-	changed(state, entry, "untilUtc", untilUtc)
-	changed(state, entry, "availableOn", availableOn)
-	changed(state, entry, "availableTime", availableTime)
-	changed(state, entry, "zone", zone)
 	if disposition ~= "active" then
 		changed(state, entry, "retained", true)
 		changed(state, entry, "sourceQuestionBaseline", nil)
 	end
-	if disposition == "later" then
-		changed(state, entry, "laterEpisode", entry.blockerEpisode or 0)
-		changed(state, entry, "laterUtc", nowUtc)
-		changed(state, entry, "manualRevisit", nil)
-	elseif disposition == "active" and (wasLater or options.bringBack == true) then
+	if disposition == "active" and options.bringBack == true then
 		state.queueOrder += 1
 		changed(state, entry, "queueOrder", state.queueOrder)
 		changed(state, entry, "firstSeenUtc", nowUtc or entry.firstSeenUtc)
@@ -1676,9 +1777,9 @@ function model.sessionGroups(presentation, data, coherent)
 				name = name, label = name, hostName = label(host.name, "Host"), localHost = host.key == "local",
 				current = data.currentHost == session.host and data.currentSession == sessionId,
 				available = available, known = available,
-				attentionTabs = 0, attentionConversations = 0, laterTabs = 0, laterConversations = 0, allConversations = 0,
+				attentionTabs = 0, attentionConversations = 0, allConversations = 0,
 			}
-			local record = { group = group, tabs = {}, laterTabs = {}, content = false }
+			local record = { group = group, tabs = {}, content = false }
 			records[sessionId] = record
 			table.insert(ordered, record)
 		end
@@ -1718,10 +1819,7 @@ function model.sessionGroups(presentation, data, coherent)
 		record.content = true
 		if row.stale or not row.navigable then group.known = false end
 		group.allConversations += 1
-		if row.disposition == "later" then
-			group.laterConversations += 1
-			if not record.laterTabs[row.tab] then record.laterTabs[row.tab] = true; group.laterTabs += 1 end
-		elseif row.attention then
+		if row.attention then
 			group.attentionConversations += 1
 			if not record.tabs[row.tab] then record.tabs[row.tab] = true; group.attentionTabs += 1 end
 			if matches and group.available and (row.navigable or row.retryableHeaderRoute) and not row.stale

@@ -2,16 +2,50 @@ local phone = require("./phone")
 local navigation = require("./navigation")
 
 local view = {}
-local PAGE_SIZE = 40
-local SECTIONS = { "attention", "later", "working", "workspace" }
+-- One canvas emits at most MAX_CANVAS_ROWS rows across every section, and its whole update stays under
+-- MAX_CANVAS_NODES native nodes (the native cap is 2000; CHROME_NODES is reserved for the toolbar, headers, section
+-- heads, notices and the footer, which together build well under it). Whatever does not fit is counted in one footer
+-- row, never dropped silently.
+local MAX_CANVAS_ROWS = 200
+local MAX_CANVAS_NODES = 1500
+local CHROME_NODES = 150
+local SECTIONS = { "attention", "working", "workspace" }
 local MAX_UI_KEYS, MAX_UI_KEY = 512, 256
+-- Left/right rails are a two-region stack (attention stack above, Workspace below) in one native `split`. Each
+-- region keeps at least a section header and three rows; the divider between them is dragged natively.
+local REGION_MIN = 140
+-- The top share at rest (the queues a third) and while the Workspace tree is minimized to its header.
+local DEFAULT_SHARE, MINIMIZED_SHARE = 1 / 3, 0.9
+local LOCAL_HOST_KEY = "local"
+-- Native keeps a user-dragged fraction until the program sends a DIFFERENT `sizes` array, so a share change that
+-- lands on the value already sent would be ignored after a drag. Every change flips this nudge to differ.
+local SHARE_NUDGE = 0.0001
+local QUEUE_SECTIONS = { "attention", "working" }
+local QUEUE_SECTION_SET = { attention = true, working = true }
+-- A Working row whose agent has recorded no activity for this long reads "Stalled" on its second line.
+local STALL_AFTER_SECONDS = 600
+
+-- The stored queue order, or the default when absent/foreign: exactly the two queues, each once.
+-- Preferences are validated at parse; this only guarantees the renderer a complete order.
+local function queueOrderOf(value)
+	local order = {}
+	if type(value) == "table" then
+		for _, name in ipairs(value) do
+			if QUEUE_SECTION_SET[name] and not table.find(order, name) then table.insert(order, name) end
+		end
+	end
+	for _, name in ipairs(QUEUE_SECTIONS) do
+		if not table.find(order, name) then table.insert(order, name) end
+	end
+	return order
+end
 
 local function node(kind, props, children)
 	return { k = kind, p = props, c = children }
 end
 
 local function text(key, role, value)
-	return node("text", { key = key, role = role, text = value, wrap = "none", truncate = "middle" })
+	return node("text", { key = key, role = role, text = value, wrap = "none", truncate = "end" })
 end
 
 local function bounded(value, limit)
@@ -70,11 +104,19 @@ local function condition(row)
 	return row.condition or (if row.nativeState == "waiting_input" then "waiting" else nil)
 end
 
+-- A stale row with no live pane has lost its source: its runtime and clock are the last recorded ones and say so.
+-- A stale row whose pane is still live only awaits proof, so it keeps its runtime words and its Open waits.
+local function offlineRow(row)
+	return row.stale == true and row.live ~= true
+end
+
 local function inQueue(row, section)
-	return (section == "later" and row.disposition == "later")
-		or (section == "attention" and row.attention == true and row.disposition ~= "later")
-		or (section == "working" and row.nativeState == "working" and row.pane ~= nil
-			and not row.stale and not row.offline and not row.noOpenPane and not row.orphaned)
+	-- A set-aside conversation (kept as reference, finished) or a record with no live route sits in no queue:
+	-- Search and the Workspace tree's saved conversations still reach it.
+	return (section == "attention" and row.attention == true)
+		-- A pane matched to the live inventory is working. Its source or identity proof gates Open, not membership.
+		or (section == "working" and row.nativeState == "working" and row.live == true
+			and not row.offline and not row.noOpenPane and not row.orphaned)
 end
 
 -- Presentation rows of one conversation queue; the Workspace tree comes from `navigation.rows`.
@@ -96,10 +138,6 @@ local function derive(presentation, section)
 		end)
 	else
 		table.sort(rows, function(a, b)
-			if section == "later" then
-				local ad, bd = if finite(a.untilUtc) then a.untilUtc else math.huge, if finite(b.untilUtc) then b.untilUtc else math.huge
-				if ad ~= bd then return ad < bd end
-			end
 			local aq, bq = a.queueOrder or a.serial, b.queueOrder or b.serial
 			return if aq ~= bq then aq < bq else a.serial < b.serial
 		end)
@@ -109,44 +147,40 @@ end
 
 -- Every row fact `derive` reads, projected to the exact values the filters and sorts consume, so equal facts
 -- guarantee the identical list for every section.
-local FACTS = 13
+local FACTS = 10
 local function facts(item)
 	return
-		(if item.disposition == "later" then 1 else 0),
 		(if item.attention == true then 1 else 0),
 		(if item.nativeState == "working" then 1 else 0),
-		(if item.pane ~= nil then 1 else 0),
-		(if item.stale then 1 else 0),
+		(if item.live == true then 1 else 0),
 		(if item.offline then 1 else 0),
 		(if item.noOpenPane then 1 else 0),
 		(if item.orphaned then 1 else 0),
 		(if item.condition or item.nativeState == "waiting_input" then 1 else 0),
 		(item.priority or 4),
 		(item.queueOrder or item.serial),
-		item.serial,
-		(if finite(item.untilUtc) then item.untilUtc else math.huge)
+		item.serial
 end
 
 local function stampRows(rows)
 	local stamp = table.create(#rows * FACTS)
 	for index, item in ipairs(rows) do
-		local f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13 = facts(item)
+		local f1, f2, f3, f4, f5, f6, f7, f8, f9, f10 = facts(item)
 		local at = (index - 1) * FACTS
 		stamp[at + 1], stamp[at + 2], stamp[at + 3], stamp[at + 4] = f1, f2, f3, f4
 		stamp[at + 5], stamp[at + 6], stamp[at + 7], stamp[at + 8] = f5, f6, f7, f8
-		stamp[at + 9], stamp[at + 10], stamp[at + 11], stamp[at + 12], stamp[at + 13] = f9, f10, f11, f12, f13
+		stamp[at + 9], stamp[at + 10] = f9, f10
 	end
 	return stamp
 end
 
 local function stampCurrent(stamp, rows)
 	for index, item in ipairs(rows) do
-		local f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13 = facts(item)
+		local f1, f2, f3, f4, f5, f6, f7, f8, f9, f10 = facts(item)
 		local at = (index - 1) * FACTS
 		if stamp[at + 1] ~= f1 or stamp[at + 2] ~= f2 or stamp[at + 3] ~= f3 or stamp[at + 4] ~= f4
 			or stamp[at + 5] ~= f5 or stamp[at + 6] ~= f6 or stamp[at + 7] ~= f7 or stamp[at + 8] ~= f8
-			or stamp[at + 9] ~= f9 or stamp[at + 10] ~= f10 or stamp[at + 11] ~= f11 or stamp[at + 12] ~= f12
-			or stamp[at + 13] ~= f13
+			or stamp[at + 9] ~= f9 or stamp[at + 10] ~= f10
 		then return false end
 	end
 	return true
@@ -171,15 +205,36 @@ local function ordered(presentation, section)
 	return cached
 end
 view.queue = ordered
+view.inQueue = inQueue
 
--- Every section paginates and anchors on row keys: conversation queues use "r"..serial, the Workspace tree its
--- navigation row keys, so a collapse or a membership change keeps the anchor on a surviving neighbor.
+local function stackedPlacement(options)
+	return options ~= nil and (options.position == "left" or options.position == "right")
+end
+
+-- Navigation reads `collapsed[key] == true` as closed and anything else as open. A left/right rail starts with its
+-- sessions collapsed, except this Mac's, which open in full (sessions and tabs). A stored value (true
+-- collapsed, false opened) always wins over these defaults, so only never-toggled session keys are filled in.
+local function workspaceUi(logical, snapshot, stacked)
+	if not stacked then return logical.workspace end
+	local collapsed = table.clone(logical.workspace.collapsed)
+	for _, host in ipairs(snapshot.hosts) do
+		local localOpen = host.hostKey == LOCAL_HOST_KEY
+		for _, session in ipairs(host.sessions) do
+			if collapsed[session.key] == nil and not localOpen then collapsed[session.key] = true end
+		end
+	end
+	return { collapsed = collapsed }
+end
+
+-- Every section's rows, keyed for the canvas: conversation queues use "r"..serial, the Workspace tree its
+-- navigation row keys. Nothing pages; render emits them all, up to the canvas row and node budget.
 local function sectionItems(logical, presentation, options, section)
 	local items = {}
 	if section == "workspace" then
 		local snapshot = if options then options.workspace else nil
 		if snapshot then
-			for _, navRow in ipairs(navigation.rows(snapshot, logical.workspace).rows) do
+			local ui = workspaceUi(logical, snapshot, stackedPlacement(options))
+			for _, navRow in ipairs(navigation.rows(snapshot, ui).rows) do
 				table.insert(items, { key = navRow.key, navRow = navRow })
 			end
 		end
@@ -194,8 +249,9 @@ end
 function view.newState()
 	return {
 		section = "attention", settings = false,
-		pages = { attention = 1, workspace = 1, later = 1, working = 1 }, starts = { attention = 1, workspace = 1, later = 1, working = 1 },
-		anchors = {}, pendingPages = {}, workspace = { collapsed = {}, setAsideOpen = {} },
+		workspace = { collapsed = {} },
+		-- Top share of the left/right two-region divider; `nonce` makes every share change send a different array.
+		divider = { share = DEFAULT_SHARE, nonce = 0 },
 		revision = 1, intentRevision = 1,
 	}
 end
@@ -205,13 +261,13 @@ function view.newRenderer(epoch)
 end
 
 function view.invalidate(renderer, retryPaint)
-	renderer.previous, renderer.arrival, renderer.arrivalRevision = nil, nil, nil
+	renderer.previous, renderer.arrival, renderer.arrivalRevision, renderer.inputs = nil, nil, nil, nil
 	renderer.bindings, renderer.targets = {}, {}
 	renderer.initialized = retryPaint == true and renderer.initialized == true
 end
 
 function view.section(logical, section)
-	assert(section == "attention" or section == "workspace" or section == "later" or section == "working" or section == "settings", "Unknown Attention section")
+	assert(section == "attention" or section == "workspace" or section == "working" or section == "settings", "Unknown Attention section")
 	if section == "settings" then logical.settings = not logical.settings
 	elseif logical.section == section and not logical.settings then return
 	else logical.section, logical.settings = section, false end
@@ -220,39 +276,71 @@ function view.section(logical, section)
 end
 
 -- Explicit disclosure changes publish a new view and fence captured async actions, like any other intent.
-function view.toggleGroup(logical, key)
+-- `collapsed[key]`: true closed, false opened, nil the key's default (expanded, except sessions in a left/right
+-- rail). A caller that knows the state the user saw passes it as `expanded`, so the toggle always flips what was
+-- displayed; without it the key flips between closed and its default.
+function view.toggleGroup(logical, key, expanded)
 	assert(type(key) == "string" and key ~= "", "Workspace group key unavailable")
-	logical.workspace.collapsed[key] = if logical.workspace.collapsed[key] then nil else true
+	assert(expanded == nil or type(expanded) == "boolean", "Workspace group state unavailable")
+	local collapsed = logical.workspace.collapsed
+	if expanded == nil then collapsed[key] = if collapsed[key] then nil else true
+	else collapsed[key] = expanded end
 	logical.revision += 1
 	logical.intentRevision += 1
 end
 
-function view.toggleAside(logical, tabKey)
-	assert(type(tabKey) == "string" and tabKey ~= "", "Workspace tab key unavailable")
-	logical.workspace.setAsideOpen[tabKey] = if logical.workspace.setAsideOpen[tabKey] then nil else true
+-- A conversation arrived in queue section `name` (Working or Attention): a folded section opens so the arrival is
+-- seen without a click. The user can fold it again; the next arrival reopens it. Layout only, like the divider: it
+-- publishes a new view without fencing captured navigation intents. Returns whether anything changed.
+function view.revealQueue(logical, name)
+	local key = "queue:" .. name
+	if logical.workspace.collapsed[key] ~= true then return false end
+	logical.workspace.collapsed[key] = nil
 	logical.revision += 1
-	logical.intentRevision += 1
+	return true
 end
 
--- The only persisted navigator state (D3): the last section and the disclosure sets. Scroll anchors, pages,
--- search, expansion and the settings panel are memory-only.
+-- Sets the left/right divider's top share. Layout only, so it publishes a new view without fencing captured
+-- navigation intents.
+function view.divider(logical, share)
+	assert(finite(share) and share > 0 and share < 1, "Divider share unavailable")
+	logical.divider = { share = share, nonce = logical.divider.nonce + 1 }
+	logical.revision += 1
+end
+
+-- Folds the Workspace tree into its header (the top share moves to MINIMIZED_SHARE and the rows hide), or restores
+-- the share that was showing. The flag rides on divider state, so any share change clears it.
+function view.minimizeWorkspace(logical)
+	local divider = logical.divider
+	if divider.minimized == true then
+		view.divider(logical, divider.restore or DEFAULT_SHARE)
+	else
+		view.divider(logical, MINIMIZED_SHARE)
+		logical.divider.minimized, logical.divider.restore = true, divider.share
+	end
+end
+
+-- The only persisted navigator state (D3): the last section and the disclosure set. Search, expansion and the
+-- settings panel are memory-only.
 function view.ui(logical)
-	local ui = { section = logical.section, collapsed = {}, setAsideOpen = {} }
-	for key in pairs(logical.workspace.collapsed) do ui.collapsed[key] = true end
-	for key in pairs(logical.workspace.setAsideOpen) do ui.setAsideOpen[key] = true end
+	local ui = { section = logical.section, collapsed = {} }
+	for key, closed in pairs(logical.workspace.collapsed) do ui.collapsed[key] = closed end
 	return ui
 end
 
-local function restoredKeys(saved)
+-- `tri` keeps explicit `false` (opened against a closed default) as well as `true`.
+local function restoredKeys(saved, tri)
 	local keys = {}
 	if type(saved) == "table" then
 		for key, open in pairs(saved) do
-			if type(key) == "string" and key ~= "" and #key <= MAX_UI_KEY and open == true then table.insert(keys, key) end
+			if type(key) == "string" and key ~= "" and #key <= MAX_UI_KEY and (open == true or tri and open == false) then
+				table.insert(keys, key)
+			end
 		end
 	end
 	table.sort(keys)
 	local kept = {}
-	for index = 1, math.min(#keys, MAX_UI_KEYS) do kept[keys[index]] = true end
+	for index = 1, math.min(#keys, MAX_UI_KEYS) do kept[keys[index]] = saved[keys[index]] end
 	return kept
 end
 
@@ -264,44 +352,31 @@ end
 
 -- A long-lived VM keeps every disclosure key ever toggled; the same cap restore and the persisted sanitizer
 -- apply (512 sorted keys) bounds the live maps during normalization, with key order alone deciding eviction.
-local function boundedKeys(map)
+local function boundedKeys(map, tri)
 	if countKeys(map) <= MAX_UI_KEYS then return map, false end
-	return restoredKeys(map), true
+	return restoredKeys(map, tri), true
 end
 
 local function boundDisclosures(logical)
-	local collapsed, collapsedOver = boundedKeys(logical.workspace.collapsed)
-	local setAside, setAsideOver = boundedKeys(logical.workspace.setAsideOpen)
-	if not collapsedOver and not setAsideOver then return false end
-	logical.workspace.collapsed, logical.workspace.setAsideOpen = collapsed, setAside
+	local collapsed, over = boundedKeys(logical.workspace.collapsed, true)
+	if not over then return false end
+	logical.workspace.collapsed = collapsed
 	return true
 end
 
 -- Applies a persisted value to a fresh state; anything unrecognized falls back to Attention with no
 -- disclosures, and nothing transient is ever restored.
 function view.restore(logical, saved)
-	local section, collapsed, setAsideOpen = "attention", {}, {}
+	local section, collapsed = "attention", {}
 	if type(saved) == "table" then
 		for _, name in ipairs(SECTIONS) do
 			if saved.section == name then section = name end
 		end
-		collapsed, setAsideOpen = restoredKeys(saved.collapsed), restoredKeys(saved.setAsideOpen)
+		collapsed = restoredKeys(saved.collapsed, true)
 	end
 	logical.section, logical.settings = section, false
-	logical.workspace = { collapsed = collapsed, setAsideOpen = setAsideOpen }
-	logical.pages = { attention = 1, workspace = 1, later = 1, working = 1 }
-	logical.starts = { attention = 1, workspace = 1, later = 1, working = 1 }
-	logical.anchors, logical.pendingPages, logical.expandedWorkId = {}, {}, nil
-	logical.revision += 1
-	logical.intentRevision += 1
-end
-
-function view.page(logical, delta)
-	if logical.settings or not finite(delta) then return end
-	delta = math.floor(delta)
-	if delta == 0 then return end
-	local section = logical.section
-	logical.pendingPages[section] = (logical.pendingPages[section] or 0) + delta
+	logical.workspace = { collapsed = collapsed }
+	logical.expandedWorkId = nil
 	logical.revision += 1
 	logical.intentRevision += 1
 end
@@ -314,50 +389,13 @@ function view.expand(logical, workId)
 	logical.intentRevision += 1
 end
 
-function view.normalize(logical, presentation, options)
+function view.normalize(logical, presentation)
 	local changed, existing = false, {}
 	-- Capping can re-expand groups, a visible change like a toggle, so it dirties the view revision.
 	if boundDisclosures(logical) then changed = true end
 	for _, row in ipairs(presentation.rows) do existing[row.workId] = true end
 	if logical.expandedWorkId and not existing[logical.expandedWorkId] then
 		logical.expandedWorkId, changed = nil, true
-	end
-	for _, section in ipairs(SECTIONS) do
-		local rows, ids, positions = sectionItems(logical, presentation, options, section), {}, {}
-		for index, item in ipairs(rows) do ids[index], positions[item.key] = item.key, index end
-		local pages = math.max(1, math.ceil(#rows / PAGE_SIZE))
-		local start = logical.starts[section] or 1
-		local anchor = logical.anchors[section]
-		if anchor then
-			local found = positions[anchor.key]
-			if not found then
-				for index = anchor.index, #anchor.order do
-					found = positions[anchor.order[index]]
-					if found then break end
-				end
-			end
-			if not found then
-				for index = anchor.index - 1, 1, -1 do
-					found = positions[anchor.order[index]]
-					if found then break end
-				end
-			end
-			if found then start = found end
-		end
-		start = math.clamp(start, 1, math.max(1, #rows))
-		local delta = logical.pendingPages[section] or 0
-		if delta > 0 then
-			local finalStart = start + math.floor(math.max(0, #rows - start) / PAGE_SIZE) * PAGE_SIZE
-			start = math.min(start + delta * PAGE_SIZE, finalStart)
-		elseif delta < 0 then
-			start = math.max(1, start + delta * PAGE_SIZE)
-		end
-		if pages == 1 then start = 1 end
-		local page = math.min(pages, math.floor((start - 1) / PAGE_SIZE) + 1)
-		local nextAnchor = if #rows > 0 then { key = ids[start], index = start, order = ids } else nil
-		if logical.pages[section] ~= page or logical.starts[section] ~= start or not equal(anchor, nextAnchor) then changed = true end
-		logical.pages[section], logical.starts[section], logical.anchors[section] = page, start, nextAnchor
-		logical.pendingPages[section] = nil
 	end
 	if changed then logical.revision += 1 end
 end
@@ -378,8 +416,9 @@ local function sourceUnavailable(row)
 	local observation = row.sourceObservation
 	if observation == nil then return row.source ~= nil end
 	local coverage = row.source and row.source.coverage
-	return historyUnavailable(observation) or observation.selectionSupport == "unknown"
-		or type(coverage) == "table" and coverage.selectionSupport == "unknown"
+	-- Only a clock the reader cannot support is recorded; a newer omp writer alone never qualifies the time.
+	return historyUnavailable(observation) or observation.clockSupport == "unknown"
+		or type(coverage) == "table" and type(coverage.fields) == "table" and coverage.fields.clock == "unknown"
 		or observation.status ~= "ready" and observation.status ~= "partial" and observation.status ~= "unchanged"
 end
 
@@ -411,7 +450,8 @@ local function sourceQuestions(source)
 		end
 	end
 	local priorCount = #entries
-	local unqualified = type(source.coverage) == "table" and source.coverage.selectionSupport == "unknown"
+	local fields = if type(source.coverage) == "table" then source.coverage.fields else nil
+	local unqualified = type(fields) == "table" and fields.questions == "unknown"
 	if historyUnavailable(source) then return entries end
 	for index, question in ipairs(source.questions or {}) do
 		local position = positions[question.id]
@@ -432,26 +472,6 @@ local function sourceQuestions(source)
 	return entries
 end
 
-local monthDays = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
-local function availability(row)
-	if row.untilUtc == nil and row.availableOn == nil and row.availableTime == nil then return "No return date" end
-	if not finite(row.untilUtc) then return "Return time unknown" end
-	local year, month, day = string.match(if type(row.availableOn) == "string" then row.availableOn else "", "^(%d%d%d%d)%-(%d%d)%-(%d%d)$")
-	local hour, minute = string.match(if type(row.availableTime) == "string" then row.availableTime else "", "^(%d%d):(%d%d)$")
-	year, month, day, hour, minute = tonumber(year), tonumber(month), tonumber(day), tonumber(hour), tonumber(minute)
-	local leap = year and year % 4 == 0 and (year % 100 ~= 0 or year % 400 == 0)
-	local days = if month == 2 and leap then 29 else monthDays[month]
-	if year and year >= 1 and days and day and day >= 1 and day <= days
-		and hour and hour < 24 and minute and minute < 60 and bounded(row.zone, 64) ~= "" then
-		return row.availableOn .. " " .. row.availableTime .. " · " .. bounded(row.zone, 64)
-	end
-	if row.untilUtc >= -62135596800 and row.untilUtc <= 253402300799 then
-		local ok, utc = pcall(os.date, "!%Y-%m-%d %H:%M:%S UTC", row.untilUtc)
-		if ok and type(utc) == "string" and utc ~= "" then return utc end
-	end
-	return "Return time unknown"
-end
-
 -- What the chip says, as data: the clock of the agent's last ask, reply or update (`phone.clockText` words it).
 -- `recorded` marks a time taken from a record rather than a readable source. A row that names a failure, or whose
 -- history records no time at all, has a fixed chip instead: nil, the chip text, its tooltip.
@@ -466,7 +486,7 @@ local function primaryClock(row)
 	if not source then
 		return { kind = if blocker == "waiting" or sourceQuestion then "asked" else "updated", notRecorded = true, recorded = false }
 	end
-	local offline = row.stale == true
+	local offline = offlineRow(row)
 	if blocker == "waiting" or sourceQuestion then
 		local newest, newestRank
 		for _, entry in ipairs(sourceQuestions(source)) do
@@ -517,6 +537,7 @@ local reviewLabels = {
 }
 local friendlyUnavailable = {
 	unverified = "Checking identity", ["identity proof pending"] = "Checking identity", missing = "Checking identity",
+	["source header proof pending"] = "Checking identity",
 	["coverage unavailable"] = "Coverage unavailable", disconnected = "Host offline",
 }
 
@@ -524,13 +545,78 @@ local function runtimeWords(row)
 	return conditionLabels[condition(row)] or runtimeLabels[row.nativeState] or "Runtime unknown"
 end
 
--- The state words a conversation row shows (`Waiting for input`, `Offline · idle`) and, when offline, why.
+-- The state words a conversation row shows (`Waiting for input`, `Offline · idle`) and, when offline, why. A stale row
+-- whose pane is still live is not offline: its words are the last runtime the model observed, and Open waits for proof.
 function view.stateText(row)
 	local words = runtimeWords(row)
-	if row.stale then
+	if offlineRow(row) then
 		return "Offline · " .. string.lower(words), "Offline: shown from the last recorded state, which cannot be refreshed right now."
 	end
 	return words
+end
+
+-- A rail row's state marker says only what is abnormal, in one short word; the full runtime sentence moves to
+-- the row's tooltip. Working and Idle are normal and render no marker. A stale row with no live pane is Offline.
+local conditionMarkers = { waiting = "Waiting", delivery = "Undelivered", startup = "Failed" }
+local runtimeMarkers = { waiting_input = "Waiting", exited = "Exited", unknown = "Unknown" }
+local priorityNames = { "P0 Now", "P1 Next", "P2 Planned", "P3 Optional" }
+
+local function stateMarker(row)
+	if offlineRow(row) then return "Offline" end
+	local blocker = conditionMarkers[condition(row)]
+	if blocker then return blocker end
+	local state = row.nativeState
+	if state == "idle" or state == "working" then return nil end
+	return runtimeMarkers[state] or "Unknown"
+end
+
+-- Line two of a rail queue row: model · need · age, with a separator only between present parts. The need is the
+-- model's own worded phrase (`row.need`, model.luau); the view decides only whether a Working row has stalled. CSS
+-- truncates the need first, then the model; the age never truncates and keeps its full sentence in its tooltip.
+local function railDetail(row, model, ageNode, nowUtc)
+	local parts = {}
+	local function add(item)
+		if #parts > 0 then
+			local separator = text("sep-" .. item.p.key, "attention.detail-sep", "·")
+			separator.p.truncate = nil
+			table.insert(parts, separator)
+		end
+		item.p.truncate, item.p.wrap = nil, nil
+		table.insert(parts, item)
+	end
+	if model ~= "" then
+		local modelNode = text("model", "attention.model-line", model)
+		modelNode.p.title = model
+		add(modelNode)
+	end
+	local need = row.need
+	if type(need) == "table" then
+		local phrase, tip = label(need.text, "", 80), nil
+		-- An ordinary Working row says nothing here: it already sits under the Working header.
+		if need.kind == "working" then
+			local idle = if finite(need.sinceUtc) and finite(nowUtc) then nowUtc - need.sinceUtc else nil
+			if idle and idle >= STALL_AFTER_SECONDS then
+				phrase = "Stalled " .. phone.age(idle)
+				tip = "Working · last recorded activity " .. phone.relativeLong(need.sinceUtc, nowUtc)
+			else
+				phrase = ""
+			end
+		end
+		if phrase ~= "" then
+			local needNode = text("need", "attention.need", phrase)
+			needNode.p.title = tip or label(need.text, phrase, 160)
+			add(needNode)
+		end
+	end
+	local clock = if ageNode then primaryClock(row) else nil
+	-- The short age ("2m", "≈ 3h"); a row with a fixed chip (no clock) leaves its sentence to the row tooltip.
+	if clock then
+		local elapsed = if finite(clock.atUtc) and finite(nowUtc) and nowUtc >= clock.atUtc
+			then phone.age(nowUtc - clock.atUtc) else "?"
+		ageNode.p.text = (if clock.recorded == true then "≈ " else "") .. elapsed
+		add(ageNode)
+	end
+	return node("row", { key = "detail", role = "attention.detail-line", gap = "none", wrap = false }, parts)
 end
 
 local function details(row, nowUtc)
@@ -546,8 +632,12 @@ local function details(row, nowUtc)
 		for _, field in ipairs({ { "recordsComplete", "record scan" }, { "ancestryComplete", "selected ancestry" } }) do
 			if value[field[1]] ~= nil then table.insert(parts, field[2] .. (if value[field[1]] then " complete" else " incomplete")) end
 		end
-		for _, field in ipairs({ { "writerSupport", "writer support" }, { "selectionSupport", "selection support" }, { "historyScope", "history" } }) do
+		for _, field in ipairs({ { "writerSupport", "writer support" }, { "historyScope", "history" } }) do
 			if value[field[1]] ~= nil then table.insert(parts, field[2] .. ": " .. label(value[field[1]], "unknown", 48)) end
+		end
+		local fields = if type(value.fields) == "table" then value.fields else {}
+		for _, field in ipairs({ { "clock", "clock support" }, { "questions", "question support" } }) do
+			if fields[field[1]] ~= nil then table.insert(parts, field[2] .. ": " .. label(fields[field[1]], "unknown", 48)) end
 		end
 		for _, field in ipairs({
 			{ "records", "records" }, { "offBranchEntries", "off-branch entries" }, { "controlsExcluded", "controls excluded" },
@@ -580,9 +670,6 @@ local function details(row, nowUtc)
 	add("tracking", "Tracking: " .. label(row.disposition, "unknown", 30)
 		.. (if row.retained then " · explicitly retained" else " · live only")
 		.. (if row.parked then " · parked" elseif row.floating then " · floating" else ""))
-	if row.disposition == "later" or row.availableOn or row.untilUtc then
-		add("later", "Available: " .. availability(row))
-	end
 	if row.stale then add("stale", "Last known evidence · refresh unavailable") end
 	lines = diagnostics
 	local function clock(key, title, atUtc)
@@ -592,7 +679,7 @@ local function details(row, nowUtc)
 	local unavailable = sourceUnavailable(row)
 	if observation then
 		add("source-availability", "Latest source availability: " .. label(observation.status, "unknown", 32))
-		clock("source-observed", "Source availability observed", observation.capturedAtUtc)
+		clock("source-observed", "Source availability unchanged since", observation.capturedAtUtc)
 		if observation.path then add("source-path", "Recorded locator: " .. label(observation.path, "unknown", 256)) end
 	elseif row.source then
 		add("source-availability", "Latest source availability: unknown · saved facts not refreshed in this owner")
@@ -749,25 +836,91 @@ local function nodeKey(key)
 	return (string.gsub(key, "[^%w]", function(char) return string.format("_%02x", string.byte(char)) end))
 end
 
-local function placesLabel(count)
-	return count .. (if count == 1 then " place" else " places")
+local function tabsLabel(count)
+	return count .. (if count == 1 then " tab" else " tabs")
+end
+
+-- Keyed native patches turning `old` into `new` at `path` (dot-joined node keys; every key is alphanumeric or an
+-- escape, never a dot). Equal subtrees send nothing and nodes whose own props or kind changed are replaced whole.
+-- Among keyed siblings a patch can remove a child or append ONE new child at the end; any other membership or
+-- order change replaces the container, exactly as the bottom strip's row list does.
+local function diffNodes(patches, path, old, new)
+	if equal(old, new) then return end
+	local oldKids, newKids = old.c or {}, new.c or {}
+	if old.k ~= new.k or not equal(old.p, new.p) or #oldKids == 0 and #newKids == 0 then
+		patches[path] = new
+		return
+	end
+	local sameKeys = #oldKids == #newKids
+	if sameKeys then
+		for index, kid in ipairs(newKids) do
+			if oldKids[index].p.key ~= kid.p.key then sameKeys = false; break end
+		end
+	end
+	if sameKeys then
+		for index, kid in ipairs(newKids) do diffNodes(patches, path .. "." .. kid.p.key, oldKids[index], kid) end
+		return
+	end
+	local oldByKey, newByKey, surviving, appended, appendStarted, needsOrder = {}, {}, {}, 0, false, false
+	for _, kid in ipairs(oldKids) do oldByKey[kid.p.key] = kid end
+	for _, kid in ipairs(newKids) do
+		newByKey[kid.p.key] = kid
+		if oldByKey[kid.p.key] then
+			table.insert(surviving, kid.p.key)
+			if appendStarted then needsOrder = true end
+		else appendStarted, appended = true, appended + 1 end
+	end
+	local survivorIndex = 0
+	for _, kid in ipairs(oldKids) do
+		if newByKey[kid.p.key] then
+			survivorIndex += 1
+			if surviving[survivorIndex] ~= kid.p.key then needsOrder = true end
+		end
+	end
+	if appended > 1 or needsOrder then
+		patches[path] = new
+		return
+	end
+	for key, kid in pairs(oldByKey) do
+		if not newByKey[key] then patches[path .. "." .. key] = false
+		else diffNodes(patches, path .. "." .. key, kid, newByKey[key]) end
+	end
+	for key, kid in pairs(newByKey) do
+		if not oldByKey[key] then patches[path .. "." .. key] = kid end
+	end
 end
 
 function view.render(renderer, logical, presentation, options)
 	options = options or {}
 	local section = logical.section
-	local rows = sectionItems(logical, presentation, options, section)
-	local first = logical.starts[section] or 1
-	local last = math.min(#rows, first + PAGE_SIZE - 1)
-	local page = logical.pages[section]
-	local pages = math.max(1, math.ceil(#rows / PAGE_SIZE))
+	-- The bottom strip keeps its two-line session-column rows and one-line wide toolbar. A left or right rail is a
+	-- two-region stack: every section at once, the attention stack above Workspace, with single-line rows.
+	local stacked = stackedPlacement(options)
+	local wide = not stacked
+	local queueOrder = queueOrderOf(options.queueOrder)
+	-- One section's rows. Every row is emitted (up to the canvas row and node budget); nothing pages.
+	local lists = {}
+	local function listOf(name)
+		local list = lists[name]
+		if list == nil then
+			list = sectionItems(logical, presentation, options, name)
+			lists[name] = list
+		end
+		return list
+	end
+	local rows = listOf(section)
 	local now = options.now or 0
-	local selection = section .. ":" .. tostring(logical.settings) .. ":" .. first
-		.. ":" .. tostring(logical.expandedWorkId)
-	if renderer.arrival and (now >= renderer.arrival.untilTime or logical.settings or section ~= "attention"
+	local attentionOpen = not stacked or logical.workspace.collapsed["queue:attention"] ~= true
+	-- The one queue whose arrival highlight can show: the selected one in the strip, Attention in the stack.
+	local focus = if stacked then "attention" else section
+	local focusList = listOf(focus)
+	-- Opening Attention is not a selection change: an arrival opens a folded Attention itself, in the same pass that
+	-- plays its cue, so no arrival can wait behind a folded section to replay when it is opened by hand.
+	local selection = focus .. ":" .. tostring(logical.settings) .. ":" .. tostring(logical.expandedWorkId)
+	if renderer.arrival and (now >= renderer.arrival.untilTime or logical.settings or focus ~= "attention"
 		or renderer.selection ~= selection) then renderer.arrival = nil end
-	if options.arrival and renderer.initialized and section == "attention" and not logical.settings
-		and first <= last and renderer.selection == selection and not renderer.arrival
+	if options.arrival and renderer.initialized and focus == "attention" and not logical.settings
+		and #focusList > 0 and attentionOpen and renderer.selection == selection and not renderer.arrival
 		and renderer.arrivalRevision ~= presentation.revision then
 		renderer.arrivalAgain = not renderer.arrivalAgain
 		renderer.arrival = { untilTime = now + 900,
@@ -787,15 +940,14 @@ function view.render(renderer, logical, presentation, options)
 		return node("el", { key = key, role = if selected then "attention.selected" else "attention.control",
 			tag = "button", text = caption, actions = { click = bind(key, binding) } })
 	end
-	local attentionCount, laterCount, workingCount = 0, 0, 0
+	local attentionCount, workingCount = 0, 0
 	local reachable, retained, awaitingHeader = 0, 0, 0
 	local collisions, byWorkId = {}, {}
 	for _, row in ipairs(presentation.rows) do
 		byWorkId[row.workId] = row
-		if inQueue(row, "later") then laterCount += 1 end
 		if inQueue(row, "attention") then attentionCount += 1 end
 		if inQueue(row, "working") then workingCount += 1 end
-		if row.attention == true and row.disposition ~= "later" then
+		if row.attention == true then
 			if row.navigable then reachable += 1 elseif openable(row) then awaitingHeader += 1 end
 		end
 		if not row.pane and row.retained then retained += 1 end
@@ -803,17 +955,41 @@ function view.render(renderer, logical, presentation, options)
 		collisions[key] = (collisions[key] or 0) + 1
 	end
 
-	-- One tracked conversation: an Attention, Later or Working queue row, a Workspace conversation leaf, or a saved
-	-- conversation without an open pane. Only the Attention queue acknowledges review (`open`); every other
-	-- activation is the navigation-only `route-open`.
+	-- Display-only model. A Workspace leaf shows its conversation's model; a queue row shows the model of its pane.
+	-- It is shown whenever it is known, so two rows on one model still say which model runs them.
+	local destinationsByPane = if options.workspace then options.workspace.byPane else nil
+	local function modelOfPane(hostKey, pane)
+		local destination = if destinationsByPane ~= nil and pane ~= nil then destinationsByPane[pane] else nil
+		if destination == nil or destination.hostKey ~= hostKey then return "" end
+		return label(destination.model, "", 160)
+	end
+	local function leafModel(nav)
+		if nav.kind ~= "leaf" or nav.leaf == nil then return "" end
+		return label(nav.leaf.model, "", 160)
+	end
+
+	-- Saved-conversations nodes by work id: a conversation with no open pane is listed there, once.
+	local savedNodes = {}
+	if options.workspace ~= nil then
+		for _, saved in ipairs(options.workspace.retained) do savedNodes[saved.workId] = saved end
+	end
+	-- Every Workspace row at depth 1 or deeper reserves the toggle column; a row with nothing to open leaves it empty.
+	local function toggleSpacer()
+		return node("el", { key = "toggle", role = "workspace.toggle-none", tag = "span" })
+	end
+
+	-- One tracked conversation: an Attention or Working queue row, or a Workspace conversation leaf. Only the
+	-- Attention queue acknowledges review (`open`); every other activation is the navigation-only `route-open`.
 	local function conversationNode(item, row, mode)
 		local nav = item.navRow
-		local queue = mode == "attention" or mode == "later" or mode == "working"
+		local queue = mode == "attention" or mode == "working"
+		-- Stack sections can list the same conversation twice; their binding slots stay apart per section.
+		local slotPrefix = if stacked then (if queue then mode else "workspace") .. ":" else ""
 		local title, session = label(row.title, "Untitled conversation"), label(row.sessionName, "Unknown session")
 		local host = label(row.hostName, "unknown host", 100)
 		local currentCondition = condition(row)
 		local runtime = runtimeWords(row)
-		local settled = row.disposition == "later" or row.disposition == "reference" or row.disposition == "finished"
+		local settled = row.disposition == "reference" or row.disposition == "finished"
 		local reason = if not queue or currentCondition or row.nativeState == "working" or settled then ""
 			elseif row.sourceQuestionCurrent == true then label(row.reason, "Source question recorded", 90)
 			elseif row.reviewSuperseded == true then "" else label(reviewLabels[row.reviewKind] or row.reason, "", 90)
@@ -826,6 +1002,9 @@ function view.render(renderer, logical, presentation, options)
 		if queue then canOpen = openable(row)
 		elseif mode == "leaf" then canOpen = nav.leaf.availability ~= "offline"
 		else canOpen = false end
+		-- A conversation with no open pane is listed once under Saved conversations. Its row never dead-ends: it
+		-- reveals that entry.
+		local saved = if canOpen then nil else savedNodes[row.workId]
 		local pending = options.navigation
 		local navigationPhase = if pending and pending.workId == row.workId and pending.serial == row.serial
 			and pending.pane == routePane and pending.identityKey == row.identityKey then pending.phase else nil
@@ -858,100 +1037,160 @@ function view.render(renderer, logical, presentation, options)
 				binding.pane = routePane
 			end
 			binding.op = op
-			return bind(item.key .. ":" .. op, binding)
+			return bind(slotPrefix .. item.key .. ":" .. op, binding)
 		end
 		local dim = not queue and settled
-		local wide = options.position == "bottom"
 		local titleNode = text("title", if dim then "workspace.title-dim" else "attention.title", title)
 		titleNode.p.truncate, titleNode.p.title = "end", title
-		local summary = { titleNode }
+		-- A rail queue title wraps to at most two lines (CSS clamps it): the queues are short and each item matters.
+		if queue and stacked then titleNode.p.wrap, titleNode.p.truncate = nil, nil end
+		local pendingNode
 		if navigationTitle then
-			local pendingNode = text("navigation-pending", "attention.navigation-pending", navigationText)
+			pendingNode = text("navigation-pending", "attention.navigation-pending", navigationText)
 			pendingNode.p.title, pendingNode.p.truncate, pendingNode.p.wrap = navigationTitle, nil, nil
-			table.insert(summary, pendingNode)
 		end
-		-- Bottom strip: the session is a bold column spanning both lines, the title above the metadata beside it.
-		-- A left or right rail is too narrow for a column, so the session stays the first item of line two.
-		local summaryRow = node("row", { key = "summary", role = "attention.summary", gap = "xs", wrap = false }, summary)
-		local metadata = {}
-		if queue and not wide then
-			local sessionNode = text("session", "attention.session", session)
-			sessionNode.p.title = session
-			table.insert(metadata, sessionNode)
-		end
-		if reason ~= "" then
-			local reasonNode = text("reason", "attention.reason", "(" .. reason .. ")")
-			reasonNode.p.title = reason
-			table.insert(metadata, reasonNode)
-		end
-		if nav and nav.context then
-			local context = text("context", "workspace.context", label(nav.context, "", 160))
-			context.p.title, context.p.truncate, context.p.wrap = context.p.text, nil, nil
-			table.insert(metadata, context)
-		end
-		if #qualifiers > 0 then
-			local qualifier = text("qualifiers", "attention.qualifiers", table.concat(qualifiers, " · "))
-			qualifier.p.title = qualifier.p.text
-			table.insert(metadata, qualifier)
-		end
-		local clock, clockTitle, clockRecorded
-		if row.disposition == "later" then clock, clockTitle = availability(row), nil
-		else clock, clockTitle, clockRecorded = primaryAge(row, options.nowUtc) end
-		if finite(row.priority) and row.priority >= 0 and row.priority <= 3 and row.priority % 1 == 0 then
-			table.insert(metadata, text("priority", "attention.priority", "P" .. row.priority))
-		end
+		local clock, clockTitle, clockRecorded = primaryAge(row, options.nowUtc)
+		local ageNode
 		if clock then
-			local ageNode = text("age", if clockRecorded then "attention.age-recorded" else "attention.age", clock)
+			ageNode = text("age", if clockRecorded then "attention.age-recorded" else "attention.age", clock)
 			ageNode.p.title, ageNode.p.truncate, ageNode.p.wrap = clockTitle or clock, nil, nil
-			table.insert(metadata, ageNode)
 		end
-		local runtimeNode = text("runtime", "attention.runtime", runtime)
-		runtimeNode.p.title, runtimeNode.p.truncate, runtimeNode.p.wrap = runtimeTitle, nil, nil
-		table.insert(metadata, runtimeNode)
-		local metadataRow = node("row", { key = "metadata", role = "attention.metadata", gap = "xs", wrap = true }, metadata)
-		local baseline
-		if wide then
-			local sessionName = text("name", "attention.session-name", session)
-			sessionName.p.truncate, sessionName.p.title = "end", session
-			baseline = { node("row", { key = "cells", role = "attention.cells", gap = "sm", wrap = false }, {
-				node("row", { key = "session-cell", role = "attention.session-cell", gap = "none", wrap = false }, { sessionName }),
-				node("col", { key = "body", role = "attention.body", gap = "none" }, { summaryRow, metadataRow }),
-			}) }
-		else
-			baseline = { summaryRow, metadataRow }
-		end
-		local openOp = if mode == "attention" then "open" else "route-open"
-		local open = node("el", {
-			key = "open", role = if navigationTitle then "attention.open-pending" elseif canOpen then "attention.open" else "attention.unavailable", tag = "button",
-			title = (if navigationTitle then navigationTitle .. " · " elseif mode ~= "attention" and canOpen then "Go to · "
-				elseif row.navigable then "Open · "
-				elseif canOpen then "Verify header, then open · " else unavailable .. " · ")
-				.. title .. " · " .. session .. " · " .. host .. " · " .. reason .. " · " .. label(row.context, "Context unknown", 256),
-			actions = if canOpen and not navigationTitle then { click = rowAction(openOp) } else nil,
-		}, baseline)
+		local priority = if finite(row.priority) and row.priority >= 0 and row.priority <= 3 and row.priority % 1 == 0
+			then row.priority else nil
 		local expanded = logical.expandedWorkId == row.workId and (mode ~= "leaf" or nav.leaf.conversation.preferred)
-		local disclosure = node("el", { key = "details", role = "attention.triage", tag = "button",
-			title = if expanded then "Collapse recorded facts" else "Inspect recorded facts · does not acknowledge or navigate",
-			actions = { click = rowAction("details") } },
-			{ node("icon", { key = "icon", role = "attention.triage-icon", name = if expanded then "chev" else "chev-r" }) })
-		local menu = node("el", { key = "menu", role = "attention.triage", tag = "button",
-			title = "Later, priority and explicit tracking disposition", actions = { click = rowAction("menu") } },
-			{ node("icon", { key = "icon", role = "attention.triage-icon", name = "more" }) })
+		local tooltip = (if navigationTitle then navigationTitle .. " · " elseif mode ~= "attention" and canOpen then "Go to · "
+			elseif row.navigable then "Open · "
+			elseif canOpen then "Verify header, then open · " else unavailable .. " · ")
+			.. title .. " · " .. session .. " · " .. host .. " · " .. reason .. " · " .. label(row.context, "Context unknown", 256)
+		local function openButton(tip, content)
+			return node("el", {
+				key = "open", role = if navigationTitle then "attention.open-pending" elseif canOpen or saved then "attention.open" else "attention.unavailable", tag = "button",
+				title = tip,
+				actions = if navigationTitle then nil
+					elseif canOpen then { click = rowAction(if mode == "attention" then "open" else "route-open") }
+					elseif saved then { click = bind(slotPrefix .. item.key .. ":workspace-open",
+						{ op = "workspace-open", key = saved.key, signature = saved.signature }) }
+					else nil,
+			}, content)
+		end
 		local mainRole = if queue then "attention.row-main"
 			elseif nav.leaf and nav.leaf.current then "workspace.main-current" else "workspace.main"
-		local mainChildren = { open, disclosure, menu }
+		local model = if nav then leafModel(nav) else modelOfPane(row.hostKey, row.pane)
+		local mainChildren
+		if wide then
+			-- Bottom strip: the session is a bold column spanning both lines, the title above the metadata beside it.
+			local summary = { titleNode }
+			if pendingNode then table.insert(summary, pendingNode) end
+			local summaryRow = node("row", { key = "summary", role = "attention.summary", gap = "xs", wrap = false }, summary)
+			local metadata = {}
+			if reason ~= "" then
+				local reasonNode = text("reason", "attention.reason", "(" .. reason .. ")")
+				reasonNode.p.title = reason
+				table.insert(metadata, reasonNode)
+			end
+			if nav and nav.context then
+				local context = text("context", "workspace.context", label(nav.context, "", 160))
+				context.p.title, context.p.truncate, context.p.wrap = context.p.text, nil, nil
+				table.insert(metadata, context)
+			end
+			if model ~= "" then
+				local modelNode = text("model", "workspace.model", model)
+				modelNode.p.title, modelNode.p.truncate, modelNode.p.wrap = model, nil, nil
+				table.insert(metadata, modelNode)
+			end
+			if #qualifiers > 0 then
+				local qualifier = text("qualifiers", "attention.qualifiers", table.concat(qualifiers, " · "))
+				qualifier.p.title = qualifier.p.text
+				table.insert(metadata, qualifier)
+			end
+			if priority then table.insert(metadata, text("priority", "attention.priority", "P" .. priority)) end
+			if ageNode then table.insert(metadata, ageNode) end
+			local runtimeNode = text("runtime", "attention.runtime", runtime)
+			runtimeNode.p.title, runtimeNode.p.truncate, runtimeNode.p.wrap = runtimeTitle, nil, nil
+			table.insert(metadata, runtimeNode)
+			local metadataRow = node("row", { key = "metadata", role = "attention.metadata", gap = "xs", wrap = true }, metadata)
+			local sessionName = text("name", "attention.session-name", session)
+			sessionName.p.truncate, sessionName.p.title = "end", session
+			local open = openButton(tooltip, { node("row", { key = "cells", role = "attention.cells", gap = "sm", wrap = false }, {
+				node("row", { key = "session-cell", role = "attention.session-cell", gap = "none", wrap = false }, { sessionName }),
+				node("col", { key = "body", role = "attention.body", gap = "none" }, { summaryRow, metadataRow }),
+			}) })
+			local disclosure = node("el", { key = "details", role = "attention.triage", tag = "button",
+				title = if expanded then "Collapse recorded facts" else "Inspect recorded facts · does not acknowledge or navigate",
+				actions = { click = rowAction("details") } },
+				{ node("icon", { key = "icon", role = "attention.triage-icon", name = if expanded then "chev" else "chev-r" }) })
+			local menu = node("el", { key = "menu", role = "attention.triage", tag = "button",
+				title = "Priority and explicit tracking disposition", actions = { click = rowAction("menu") } },
+				{ node("icon", { key = "icon", role = "attention.triage-icon", name = "more" }) })
+			mainChildren = { open, disclosure, menu }
+		else
+			-- Rail rows: the owning session in a fixed-width ALL-CAPS column, then two lines: [title … | priority] over
+			-- [model · need · age]. More opens the recorded facts. Host, reason, context and the full runtime and clock
+			-- sentences live in the tooltip. A Workspace leaf has no session column (its tree shows the session): line
+			-- one carries its abnormal-state marker, line two its model.
+			local runtimeFull = if runtimeTitle then runtime .. ". " .. runtimeTitle else runtime
+			local priorityName = if priority then priorityNames[priority + 1] else nil
+			local line = { titleNode }
+			if pendingNode then table.insert(line, pendingNode) end
+			local lines = { node("row", { key = "line", role = "attention.line", gap = "xs", wrap = false }, line) }
+			local content = lines
+			if queue then
+				if priority then
+					local chip = text("priority", "attention.priority", "P" .. priority)
+					chip.p.title, chip.p.truncate, chip.p.wrap = priorityName, nil, nil
+					table.insert(line, chip)
+				end
+				table.insert(lines, railDetail(row, model, ageNode, options.nowUtc))
+				local sessionName = text("name", "attention.rail-session", string.upper(session))
+				sessionName.p.truncate, sessionName.p.title = "end", session
+				content = { node("row", { key = "cells", role = "attention.cells", gap = "sm", wrap = false }, {
+					node("row", { key = "session-cell", role = "attention.rail-session-cell", gap = "none", wrap = false }, { sessionName }),
+					node("col", { key = "body", role = "attention.body", gap = "none" }, lines),
+				}) }
+			else
+				local marker, markerTitle = stateMarker(row), runtimeFull
+				if marker == nil and nav.leaf.availability == "offline" then marker, markerTitle = "Offline", unavailable end
+				if marker then
+					local state = text("state", "attention.state", marker)
+					state.p.title, state.p.truncate, state.p.wrap = markerTitle, nil, nil
+					table.insert(line, node("row", { key = "chips", role = "attention.chips", gap = "xs", wrap = false }, { state }))
+				end
+				if model ~= "" then
+					local modelNode = text("model", "workspace.model", model)
+					modelNode.p.title, modelNode.p.truncate, modelNode.p.wrap = model, nil, nil
+					table.insert(lines, modelNode)
+				end
+			end
+			if nav and nav.context then tooltip ..= " · " .. label(nav.context, "", 160) end
+			if priorityName then tooltip ..= " · " .. priorityName end
+			tooltip ..= " · " .. runtimeFull
+			if clock then tooltip ..= " · " .. (clockTitle or clock) end
+			local menu = node("el", { key = "menu", role = "attention.more", tag = "button",
+				title = "Priority and explicit tracking disposition", actions = { click = rowAction("menu") } },
+				{ node("icon", { key = "icon", role = "attention.more-icon", name = "more" }) })
+			mainChildren = { openButton(tooltip, content), menu }
+		end
 		if navigationTitle and type(pending.token) == "string" and pending.token ~= "" then
 			table.insert(mainChildren, 2, node("el", {
 				key = "cancel-navigation", role = "attention.cancel-navigation", tag = "button", text = "Cancel",
 				title = "Cancel this request without acknowledging attention; an active helper may still finish",
-				actions = { click = bind(item.key .. ":cancel-navigation", {
+				actions = { click = bind(slotPrefix .. item.key .. ":cancel-navigation", {
 					op = "cancel-navigation", token = pending.token, workId = row.workId,
 					serial = row.serial, pane = routePane, identityKey = row.identityKey,
 				}) },
 			}))
 		end
+		if not queue and nav.depth >= 1 then table.insert(mainChildren, 1, toggleSpacer()) end
 		local children = { node("row", { key = "main", role = mainRole, gap = "none", wrap = false }, mainChildren) }
-		if expanded then table.insert(children, details(row, options.nowUtc)) end
+		if expanded then
+			-- A rail row has no chevron; the opened facts carry their own way to close.
+			if not wide then
+				table.insert(children, node("el", { key = "collapse", role = "attention.collapse", tag = "button",
+					text = "Hide recorded facts", title = "Collapse recorded facts · does not acknowledge or navigate",
+					actions = { click = rowAction("details") } }))
+			end
+			table.insert(children, details(row, options.nowUtc))
+		end
 		return node("col", { key = nodeKey(item.key), role = if queue then "attention.row" else "workspace.row-" .. nav.depth,
 			gap = "none" }, children)
 	end
@@ -967,129 +1206,341 @@ function view.render(renderer, logical, presentation, options)
 		context.p.title, context.p.truncate, context.p.wrap = context.p.text, nil, nil
 		local binding = { op = "workspace-open", key = navRow.ref.key, signature = navRow.signature,
 			placement = leaf.placement }
+		local content
+		if wide then
+			content = { node("row", { key = "summary", role = "attention.summary", gap = "xs", wrap = false }, { titleNode }),
+				node("row", { key = "metadata", role = "attention.metadata", gap = "xs", wrap = true }, { context }) }
+		else
+			-- Rail: the title on one line, the pane kind on the reserved muted sub-line.
+			content = { node("row", { key = "line", role = "attention.line", gap = "xs", wrap = false }, { titleNode }) }
+			if context.p.text ~= "" then
+				context.p.role = "workspace.model"
+				table.insert(content, context)
+			end
+		end
 		local open = node("el", {
 			key = "open", role = if canOpen then "attention.open" else "attention.unavailable", tag = "button",
 			title = (if canOpen then "Go to · " else "Host offline · ") .. title .. " · " .. label(navRow.context, "", 160),
 			actions = if canOpen then { click = bind(navRow.key .. ":open", binding) } else nil,
-		}, { node("row", { key = "summary", role = "attention.summary", gap = "xs", wrap = false }, { titleNode }),
-			node("row", { key = "metadata", role = "attention.metadata", gap = "xs", wrap = true }, { context }) })
-		return node("col", { key = nodeKey(navRow.key), role = "workspace.row-" .. navRow.depth, gap = "none" }, {
+		}, content)
+		local main = { open }
+		if navRow.depth >= 1 then table.insert(main, 1, toggleSpacer()) end
+		return node("col", { key = nodeKey(navRow.key), role = "workspace.row", gap = "none" }, {
 			node("row", { key = "main", role = if leaf.current then "workspace.main-current" else "workspace.main",
-				gap = "none", wrap = false }, { open }),
+				gap = "none", wrap = false }, main),
 		})
 	end
 
-	-- Host, session, tab, section and `Set aside N` rows: a disclosure chevron, an activation target, and for
-	-- tabs and sessions the native More menu. Counts are typed; an offline host shows none.
-	local function groupNode(navRow)
-		local kind = navRow.kind
-		local key = nodeKey(navRow.key)
-		local role = "workspace.row-" .. navRow.depth
-		local title = label(navRow.title, "Untitled", 160)
-		local chevron = node("icon", { key = "icon", role = "attention.triage-icon", name = if navRow.expanded then "chev" else "chev-r" })
-		if kind == "aside" then
-			return node("col", { key = key, role = role, gap = "none" }, {
-				node("el", { key = "aside", role = "workspace.aside", tag = "button",
-					title = (if navRow.expanded then "Hide set aside conversations" else "Show set aside conversations") .. " · " .. title,
-					actions = { click = bind(navRow.key .. ":aside", { op = "workspace-aside", key = navRow.ref.key,
-						logicalRevision = logical.revision }) },
-				}, { chevron, text("label", "workspace.count", title) }),
-			})
-		end
-		local count = nil
-		if navRow.empty then count = "Empty"
-		elseif navRow.count ~= nil then
-			count = if kind == "section" and navRow.ref.hostKey == nil then navRow.count .. " saved" else placesLabel(navRow.count)
-		end
-		if kind == "section" then
-			local children = { chevron, text("title", "workspace.title", title) }
-			if count then table.insert(children, text("count", "workspace.count", count)) end
-			return node("col", { key = key, role = role, gap = "none" }, {
-				node("el", { key = "toggle", role = "workspace.section", tag = "button",
-					title = (if navRow.expanded then "Collapse · " else "Expand · ") .. title,
-					actions = { click = bind(navRow.key .. ":toggle", { op = "workspace-toggle", key = navRow.key,
-						logicalRevision = logical.revision }) },
-				}, children),
-			})
-		end
-		local toggle
-		if navRow.expandable then
-			toggle = node("el", { key = "toggle", role = "workspace.toggle", tag = "button",
-				title = (if navRow.expanded then "Collapse · " else "Expand · ") .. title,
-				actions = { click = bind(navRow.key .. ":toggle", { op = "workspace-toggle", key = navRow.key,
-					logicalRevision = logical.revision }) },
-			}, { chevron })
-		else
-			toggle = node("el", { key = "toggle", role = "workspace.toggle-none", tag = "span" })
-		end
-		local summary = { text("title", "workspace.title", title) }
-		if count then table.insert(summary, text("count", "workspace.count", count)) end
-		if navRow.context then table.insert(summary, text("context", "workspace.context", label(navRow.context, "", 100))) end
-		local open = node("el", { key = "open", role = "attention.open", tag = "button",
-			title = "Go to · " .. title .. (if count then " · " .. count else ""),
+-- Hosts, sessions and tabs are three species, not one indented list. A host is a full-width disclosure row —
+-- the queue sections' group language — whose chevron and count say a world opens. A session or section opens
+-- a ledger block: its name in a fixed label column is the toggle, and its rows stand to the right of a
+-- hairline. Collapsed, a block is its name and an "N tabs ▾" chip; the accent marks only the current
+-- session's dot, the current tab's row, and the place card. A session label carries no menu: renaming and
+-- new tabs live on the tab rows and in the command palette. A tab row is the target and its ⋯ the menu.
+local function hostRowNode(navRow)
+	local title = label(navRow.title, "Host", 160)
+	local suffix = if navRow.count ~= nil then " (" .. tostring(navRow.count) .. ")"
+		elseif navRow.context then " · " .. label(navRow.context, "", 60)
+		else ""
+	local name = text("title", "workspace.host-title", title)
+	name.p.truncate, name.p.title = "end", title
+	local children = {
+		node("icon", { key = "chev", role = "attention.triage-icon", name = if navRow.expanded then "chev" else "chev-r" }),
+		name,
+	}
+	if suffix ~= "" then
+		local tail = text("suffix", "workspace.host-suffix", suffix)
+		tail.p.title = suffix
+		table.insert(children, tail)
+	end
+	return node("el", { key = nodeKey(navRow.key), role = "workspace.host-row", tag = "button",
+		title = (if navRow.expanded then "Collapse · " else "Expand · ") .. title .. suffix,
+		actions = { click = bind(navRow.key .. ":toggle", { op = "workspace-toggle", key = navRow.key,
+			expanded = if stacked then navRow.expanded else nil }) },
+	}, children)
+end
+
+-- A session's label: its name jumps to the session (native restores its last tab there); an empty one is plain text.
+-- Parked/Unattached sections keep the name as their own disclosure with a count chip.
+local function ledgerLabel(navRow)
+	local title = label(navRow.title, "Untitled", 160)
+	local nameChildren = {}
+	if navRow.current then table.insert(nameChildren, text("dot", "workspace.ledger-dot", "\u{25CF}")) end
+	local nameText = text("name", "workspace.title", title)
+	nameText.p.truncate, nameText.p.title = "end", title
+	table.insert(nameChildren, nameText)
+	local nameNode
+	if navRow.kind == "section" then
+		nameNode = node("el", { key = "toggle", role = "workspace.ledger-name", tag = "button",
+			title = (if navRow.expanded then "Collapse · " else "Expand · ") .. title,
+			actions = { click = bind(navRow.key .. ":toggle", { op = "workspace-toggle", key = navRow.key,
+				expanded = if stacked then navRow.expanded else nil }) },
+		}, nameChildren)
+	elseif navRow.empty then
+		nameNode = node("el", { key = "name", role = "workspace.ledger-name", title = title }, nameChildren)
+	else
+		nameNode = node("el", { key = "name", role = "workspace.ledger-name", tag = "button", title = "Jump to · " .. title,
 			actions = { click = bind(navRow.key .. ":open", { op = "workspace-open", key = navRow.ref.key,
 				signature = navRow.signature }) },
-		}, { node("row", { key = "summary", role = "attention.summary", gap = "xs", wrap = false }, summary) })
-		local parts = { toggle, open }
-		if kind == "tab" or kind == "session" then
-			table.insert(parts, node("el", { key = "menu", role = "attention.triage", tag = "button",
-				title = "Rename or add a tab · " .. title,
-				actions = { click = bind(navRow.key .. ":menu", { op = "native-menu", key = navRow.ref.key,
-					signature = navRow.signature }) },
-			}, { node("icon", { key = "icon", role = "attention.triage-icon", name = "more" }) }))
-		end
-		return node("col", { key = key, role = role, gap = "none" }, {
-			node("row", { key = "main", role = "workspace.main", gap = "none", wrap = false }, parts),
-		})
+		}, nameChildren)
+	end
+	local labelChildren = { nameNode }
+	if navRow.kind == "section" and navRow.count ~= nil then
+		local chip = text("chip", "workspace.ledger-chip", tostring(navRow.count) .. " \u{25BE}")
+		chip.p.title = "Expand · " .. title
+		table.insert(labelChildren, chip)
+	end
+	return node("col", { key = "label", role = "workspace.ledger-label" }, labelChildren)
+end
+
+-- The full-height strip at a session box's left edge: − minimizes the session into its host's Minimized group, +
+-- restores it to its place (both lists keep native session order). Empty sessions and sections have none.
+local function ledgerEdge(navRow)
+	if navRow.kind ~= "session" or navRow.empty then return nil end
+	local title = label(navRow.title, "Untitled", 160)
+	return node("el", { key = "edge", role = "workspace.ledger-edge", tag = "button",
+		text = if navRow.expanded then "\u{2212}" else "+",
+		title = (if navRow.expanded then "Minimize · " else "Restore · ") .. title,
+		actions = { click = bind(navRow.key .. ":toggle", { op = "workspace-toggle", key = navRow.key,
+			expanded = navRow.expanded }) },
+	})
+end
+
+-- One host's empty sessions under a centred "No tabs (N)" disclosure (folded under `empties:<host>` in the Workspace
+-- disclosure map): each name a small box of its own, the button that opens a tab there, in one row that scrolls
+-- sideways when it outgrows the pane.
+local function emptyNameNode(navRow)
+	local title = label(navRow.title, "Session", 160)
+	return node("el", { key = nodeKey(navRow.key), role = "workspace.empty-name", tag = "button", text = title,
+		title = "New tab in · " .. title,
+		actions = { click = bind(navRow.key .. ":open", { op = "workspace-open", key = navRow.ref.key,
+			signature = navRow.signature }) },
+	})
+end
+
+-- The one row of an empty session's block: native's "No tabs", as the button that opens a tab there.
+local function emptySessionNode(navRow)
+	local title = label(navRow.title, "Session", 160)
+	local open = node("el", { key = "open", role = "attention.open", tag = "button", title = "New tab in · " .. title,
+		actions = { click = bind(navRow.key .. ":open", { op = "workspace-open", key = navRow.ref.key,
+			signature = navRow.signature }) },
+	}, { node("row", { key = "summary", role = "attention.summary", gap = "xs", wrap = false }, {
+		text("title", "workspace.empty-session", "No tabs · New tab"),
+	}) })
+	return node("col", { key = nodeKey(navRow.key .. ":empty"), role = "workspace.row" }, {
+		node("row", { key = "main", role = "workspace.main", gap = "none", wrap = false }, { open }),
+	})
+end
+
+local function tabRowNode(navRow)
+	local title = label(navRow.title, "Untitled", 160)
+	local summary = { text("title", "workspace.title-tab", title) }
+	-- The native sidebar's tile: Tern's icon for the tab's focused program. A title glyph takes the program icon's
+	-- place on a plain plate, as native draws a session's own icon instead of omp's.
+	if navRow.glyph then
+		local glyph = text("glyph", "workspace.tile-glyph", navRow.glyph)
+		glyph.p.truncate = nil
+		table.insert(summary, 1, node("el", { key = "tile", role = "workspace.tile-plate", tag = "span" }, { glyph }))
+	elseif navRow.icon then
+		table.insert(summary, 1, node("el", { key = "tile", role = "workspace.tile", tag = "span" },
+			{ node("icon", { key = "icon", role = "workspace.tile-icon", name = navRow.icon }) }))
+	end
+	if navRow.context then table.insert(summary, text("context", "workspace.context", label(navRow.context, "", 100))) end
+	local open = node("el", { key = "open", role = "attention.open", tag = "button",
+		title = "Go to · " .. title,
+		actions = { click = bind(navRow.key .. ":open", { op = "workspace-open", key = navRow.ref.key,
+			signature = navRow.signature }) },
+	}, { node("row", { key = "summary", role = "attention.summary", gap = "xs", wrap = false }, summary) })
+	local parts = { open }
+	if navRow.kind == "tab" then
+		table.insert(parts, node("el", { key = "menu", role = "attention.triage", tag = "button",
+			title = "More · " .. title,
+			actions = { click = bind(navRow.key .. ":menu", { op = "native-menu", key = navRow.ref.key,
+				signature = navRow.signature }) },
+		}, { node("icon", { key = "icon", role = "attention.triage-icon", name = "more" }) }))
+	end
+	return node("col", { key = nodeKey(navRow.key), role = "workspace.row" }, {
+		node("row", { key = "main", role = if navRow.current then "workspace.main-current" else "workspace.main",
+			gap = "none", wrap = false }, parts),
+	})
+end
+
+	-- One canvas-wide budget of rows and nodes: sections draw from it in canvas order, the first row that does not fit
+	-- closes the budget for every later row, and what was not emitted is counted so the footer can say so.
+	local budget = { rows = MAX_CANVAS_ROWS, nodes = MAX_CANVAS_NODES - CHROME_NODES, omitted = 0 }
+	local function countNodes(item)
+		local total = 1
+		for _, child in ipairs(item.c or {}) do total += countNodes(child) end
+		return total
+	end
+	local function moreNode()
+		local more = text("more", "workspace.more", budget.omitted .. " more not shown · Search reaches them")
+		more.p.truncate, more.p.title = "end", more.p.text
+		return more
 	end
 
-	local rowNodes = {}
-	if not logical.settings then
-		for index = first, last do
-			local item = rows[index]
+	local function rowNodeOf(name, item)
+		local navRow = item.navRow
+		if name ~= "workspace" then return conversationNode(item, item.row, name) end
+		if navRow.kind == "leaf" then
+			local link = navRow.leaf.conversation
+			local row = if link then byWorkId[link.workId] else nil
+			return if row then conversationNode(item, row, "leaf") else paneNode(navRow)
+		end
+	if navRow.kind == "host" then return hostRowNode(navRow) end
+	return tabRowNode(navRow)
+	end
+
+	-- The row nodes of one section, within what is left of the canvas budget.
+	local function rowNodesOf(name)
+		local nodes, list, emitted = {}, listOf(name), 0
+		-- The workspace list is a ledger: hosts are full-width disclosure rows, and a session (or section) opens
+		-- a block whose rows collect until the next boundary. Retained records are not tree rows: Search and the
+		-- queues reach them. Other sections stay flat.
+	local block -- { key, edge, label, rows, current }
+	local currentKey -- the key of the direct child of `nodes` that holds the current session's box (or its Minimized group)
+	local minimized -- this host's minimized session boxes so far, emitted under one disclosure at the host's end
+	local empties -- this host's empty-session buttons so far, emitted as one line at the host's end
+	-- A half-width labelled divider that folds what follows it under `foldKey` in the Workspace disclosure map.
+	local function subToggle(foldKey, label, open)
+		return node("el", { key = "toggle", role = "workspace.sub-toggle", tag = "button",
+			title = (if open then "Collapse · " else "Expand · ") .. label,
+			actions = { click = bind(foldKey .. ":toggle", { op = "workspace-toggle", key = foldKey, expanded = open }) },
+		}, { node("icon", { key = "chev", role = "attention.triage-icon", name = if open then "chev" else "chev-r" }),
+			text("label", "workspace.sub-label", label) })
+	end
+	local function flushMinimized()
+		if minimized == nil then return end
+		local key = "min:" .. nodeKey(minimized.host)
+		local foldKey = "minimized:" .. minimized.host
+		local open = logical.workspace.collapsed[foldKey] ~= true
+		local children = { subToggle(foldKey, "Minimized (" .. #minimized.boxes .. ")", open) }
+		if open then
+			table.insert(children, node("col", { key = "boxes", role = "workspace.minimized-boxes", gap = "none" }, minimized.boxes))
+		end
+		table.insert(nodes, node("col", { key = key, role = "workspace.minimized-line", gap = "none" }, children))
+		minimized = nil
+	end
+	local function flushEmpties()
+		if empties == nil then return end
+		local foldKey = "empties:" .. empties.host
+		local open = logical.workspace.collapsed[foldKey] ~= true
+		local children = { subToggle(foldKey, "No tabs (" .. #empties.names .. ")", open) }
+		if open then
+			table.insert(children, node("row", { key = "names", role = "workspace.empty-names", gap = "xs", wrap = false }, empties.names))
+		end
+		table.insert(nodes, node("col", { key = "empty:" .. empties.key, role = "workspace.empty-line", gap = "none" }, children))
+		empties = nil
+	end
+	-- A host ends: its Minimized group, then its No tabs line.
+	local function flushHostTail()
+		flushMinimized()
+		flushEmpties()
+	end
+	local function ledgerNode(key, edge, labelNode, rows, current)
+		local children = {}
+		if edge then table.insert(children, edge) end
+		table.insert(children, labelNode)
+		table.insert(children, node("col", { key = "rows", role = "workspace.ledger-rows" }, rows))
+		return node("row", { key = key, role = if current then "workspace.ledger-current" else "workspace.ledger" }, children)
+	end
+	local function closeBlock()
+		if block == nil then return end
+		table.insert(nodes, ledgerNode(block.key, block.edge, block.label, block.rows, block.current))
+		block = nil
+	end
+	local function startBlock(key, edge, label, current)
+		closeBlock()
+		block = { key = key, edge = edge, label = label, rows = {}, current = current }
+	end
+		while emitted < #list and budget.rows > 0 do
+			local item = list[emitted + 1]
 			local navRow = item.navRow
-			if section ~= "workspace" then
-				table.insert(rowNodes, conversationNode(item, item.row, section))
-			elseif navRow.kind == "leaf" then
-				local link = navRow.leaf.conversation
-				local row = if link then byWorkId[link.workId] else nil
-				table.insert(rowNodes, if row then conversationNode(item, row, "leaf") else paneNode(navRow))
-			elseif navRow.kind == "retained" then
-				local row = byWorkId[navRow.ref.workId]
-				if row then
-					table.insert(rowNodes, conversationNode(item, row, "retained"))
-				else
-					table.insert(rowNodes, node("col", { key = nodeKey(navRow.key), role = "workspace.row-" .. navRow.depth, gap = "none" }, {
-						node("row", { key = "main", role = "workspace.main", gap = "none", wrap = false }, {
-							node("el", { key = "open", role = "attention.unavailable", tag = "button" }, {
-								text("title", "attention.title", label(navRow.title, "Saved conversation")),
-								text("context", "workspace.context", label(navRow.context, "", 160)),
-							}),
-						}),
-					}))
-				end
-			else
-				table.insert(rowNodes, groupNode(navRow))
+			local cost
+			if name == "workspace" and navRow.kind == "session" and not navRow.empty and not navRow.expanded
+				and minimized == nil then
+				minimized = { host = navRow.ref.hostKey or "local", boxes = {} }
 			end
+			if name == "workspace" and navRow.kind == "host" then
+				local hostRow = hostRowNode(navRow)
+				cost = countNodes(hostRow)
+				if cost > budget.nodes then budget.rows = 0 break end
+				closeBlock()
+				flushHostTail()
+				budget.rows, budget.nodes = budget.rows - 1, budget.nodes - cost
+				table.insert(nodes, hostRow)
+			elseif name == "workspace" and navRow.kind == "session" and navRow.empty and not navRow.current then
+				-- The current session keeps its box even when empty: the accent ring is where you are.
+				local nameNode = emptyNameNode(navRow)
+				cost = 1 + (if empties then 0 else 5)
+				if cost > budget.nodes then budget.rows = 0 break end
+				closeBlock()
+				if empties == nil then
+					empties = { key = nodeKey(navRow.key), host = navRow.ref.hostKey or "local", names = {} }
+				end
+				table.insert(empties.names, nameNode)
+				budget.rows, budget.nodes = budget.rows - 1, budget.nodes - cost
+			elseif name == "workspace" and navRow.kind == "session" and not navRow.empty and not navRow.expanded then
+				-- A minimized session: one short box ("N tabs") in its host's Minimized group, + at its edge.
+				local count = text("count", "workspace.ledger-count",
+					tostring(navRow.count or 0) .. (if navRow.count == 1 then " tab" else " tabs"))
+				local box = ledgerNode(nodeKey(navRow.key), ledgerEdge(navRow), ledgerLabel(navRow), { count }, navRow.current)
+				cost = countNodes(box) + (if #minimized.boxes > 0 then 0 else 5)
+				if cost > budget.nodes then budget.rows = 0 break end
+				closeBlock()
+				table.insert(minimized.boxes, box)
+				budget.rows, budget.nodes = budget.rows - 1, budget.nodes - cost
+				if navRow.current then currentKey = "min:" .. nodeKey(minimized.host) end
+			elseif name == "workspace" and (navRow.kind == "session" or navRow.kind == "section") then
+				local edgeNode, labelNode = ledgerEdge(navRow), ledgerLabel(navRow)
+				local emptyNode = if navRow.empty then emptySessionNode(navRow) else nil
+				cost = countNodes(labelNode) + (if edgeNode then 1 else 0) + (if emptyNode then countNodes(emptyNode) else 0)
+				if cost > budget.nodes then budget.rows = 0 break end
+				-- A section ends its host's sessions: close the last session's box before the host's tail.
+				if navRow.kind == "section" then closeBlock(); flushHostTail() end
+				startBlock(nodeKey(navRow.key), edgeNode, labelNode, navRow.current)
+				budget.rows, budget.nodes = budget.rows - 1, budget.nodes - cost
+				if navRow.current then currentKey = nodeKey(navRow.key) end
+				if emptyNode then table.insert(block.rows, emptyNode) end
+			else
+				local built = rowNodeOf(name, item)
+				cost = countNodes(built)
+				if cost > budget.nodes then budget.rows = 0 break end
+				budget.rows, budget.nodes = budget.rows - 1, budget.nodes - cost
+				if block then table.insert(block.rows, built) else table.insert(nodes, built) end
+			end
+			emitted += 1
 		end
+		closeBlock()
+		flushHostTail()
+		budget.omitted += #list - emitted
+		return nodes, emitted, currentKey
 	end
+	local rowNodes, rowNodesShown = {}, 0
+	if not (logical.settings or stacked) then rowNodes, rowNodesShown = rowNodesOf(section) end
 
-	local queueLabels = { attention = "Attention", later = "Later", working = "Currently working", workspace = "Workspace" }
+	local queueLabels = { attention = "Attention", working = if wide then "Currently working" else "Working", workspace = "Workspace" }
 	local queueTitles = {
 		attention = "Attention · " .. attentionCount .. " tracked conversations need attention",
-		later = "Later · " .. laterCount .. " set-aside conversations",
 		working = "Currently working · " .. workingCount .. " live conversations",
-		workspace = "Workspace · every place in this window",
+		workspace = "Workspace · every tab in this window",
 	}
-	local counts = { attention = attentionCount, later = laterCount, working = workingCount }
+	local counts = { attention = attentionCount, working = workingCount }
 	local queues = {}
-	for _, name in ipairs(SECTIONS) do
+	-- The stack shows every section at once, so it has no section tabs. The strip's tabs follow the stored
+	-- queue order (Workspace stays last).
+	local tabs = if options.workspace and options.workspace.counts then options.workspace.counts.tabs else nil
+	local sectionOrder = table.clone(queueOrder)
+	table.insert(sectionOrder, "workspace")
+	for _, name in ipairs(sectionOrder) do
 		local caption = { text("label", "attention.queue-label", queueLabels[name]) }
 		if counts[name] then table.insert(caption, text("count", "attention.queue-count", tostring(counts[name]))) end
+		-- The strip's Workspace mode carries the tree's count, the same as the stacked Workspace header.
+		if name == "workspace" and tabs ~= nil then table.insert(caption, text("count", "attention.queue-count", "· " .. tabsLabel(tabs))) end
 		table.insert(queues, node("el", {
 			key = name, role = if logical.section == name then "attention.queue-selected" else "attention.queue",
 			tag = "button", title = queueTitles[name],
-			actions = { click = bind("section:" .. name, { op = "section", section = name, logicalRevision = logical.revision }) },
+			actions = { click = bind("section:" .. name, { op = "section", section = name }) },
 		}, caption))
 	end
 	local settingsOptions, previous = options.settings or {}, options.previous or {}
@@ -1100,71 +1551,65 @@ function view.render(renderer, logical, presentation, options)
 		tag = "button", title = "Next attention · " .. shortcutLabel(settingsOptions.shortcut) .. " · " .. reachable
 			.. " reachable conversations · " .. awaitingHeader .. " awaiting header verification",
 		actions = if reachable + awaitingHeader > 0 then { click = bind("next", { op = "next" }) } else nil,
-	}, { node("icon", { key = "icon", role = "attention.next-icon", name = "fast-forward", size = 12 }), text("label", "attention.next-label", "Next") }))
+	}, if wide then { node("icon", { key = "icon", role = "attention.next-icon", name = "fast-forward", size = 12 }), text("label", "attention.next-label", "Next") }
+		else { node("icon", { key = "icon", role = "attention.next-icon", name = "fast-forward", size = 16 }) }))
 	table.insert(tools, node("el", {
 		key = "previous", role = if previous.available then "attention.previous" else "attention.previous-unavailable", tag = "button",
 		title = if previous.available then "Previous · Return to " .. label(previous.title, "previous pane", 160) else "Previous · No previous pane yet",
 		actions = if previous.available then { click = bind("previous", { op = "previous" }) } else nil,
-	}, { node("icon", { key = "icon", role = "attention.previous-icon", name = "rewind", size = 12 }), text("label", "attention.previous-label", "Prev") }))
+	}, if wide then { node("icon", { key = "icon", role = "attention.previous-icon", name = "rewind", size = 12 }), text("label", "attention.previous-label", "Prev") }
+		else { node("icon", { key = "icon", role = "attention.previous-icon", name = "rewind", size = 16 }) }))
 	table.insert(utility, node("el", { key = "search", role = if searchAvailable then "attention.search" else "attention.search-unavailable",
 		tag = "button", title = if searchAvailable then "Search workspace" else "Search unavailable",
-		actions = if searchAvailable then { click = bind("search", { op = "search", logicalRevision = logical.revision }) } else nil,
+		actions = if searchAvailable then { click = bind("search", { op = "search" }) } else nil,
 	}, { node("icon", { key = "icon", role = "attention.search-icon", name = "search", size = 16 }) }))
 	table.insert(utility, node("el", { key = "settings", role = if logical.settings then "attention.gear-selected" else "attention.gear", tag = "button",
-		title = if logical.settings then "Return to " .. queueLabels[logical.section] else "More · Settings",
-		actions = { click = bind("settings", { op = "settings", logicalRevision = logical.revision }) },
+		title = if logical.settings then "Back to " .. queueLabels[logical.section] else "More · Settings",
+		actions = { click = bind("settings", { op = "settings" }) },
 	}, { node("icon", { key = "icon", role = "attention.gear-icon", name = "gear", size = 16 }) }))
-	-- The current-location line belongs to Workspace alone; every other section keeps the keyed node but empty and hidden.
+	-- The current-location line belongs to the bottom strip alone; on a rail the Workspace header is the place
+	-- line itself, so no second line is built.
 	local current = options.current
 	local location
-	if section ~= "workspace" or logical.settings then
-		location = node("row", { key = "location", role = "attention.location-none", gap = "xs", wrap = false, hidden = true }, {})
-	elseif current then
-		local currentTitle = label(current.title, "Untitled", 160)
-		local currentContext = label(current.context, "", 160)
-		location = node("el", { key = "location", role = "attention.location", tag = "button",
-			title = "Reveal in Workspace · " .. currentTitle .. (if currentContext ~= "" then " · " .. currentContext else ""),
-			actions = { click = bind("reveal", { op = "reveal" }) },
-		}, { text("title", "attention.location-title", currentTitle), text("context", "attention.location-context", currentContext) })
-	else
-		location = node("row", { key = "location", role = "attention.location-none", gap = "xs", wrap = false },
-			{ text("title", "attention.location-title", "No current location") })
+	if not stacked then
+		if section ~= "workspace" or logical.settings then
+			location = node("row", { key = "location", role = "attention.location-none", gap = "xs", wrap = false, hidden = true }, {})
+		elseif current then
+			local currentTitle = label(current.title, "Untitled", 160)
+			local currentContext = label(current.context, "", 160)
+			-- The model is display-only: it is named when the place is a conversation with a known model, and it never enters a key.
+			local currentModel = label(current.model, "", 48)
+			local details = { text("title", "attention.location-title", currentTitle),
+				text("context", "attention.location-context", currentContext) }
+			if currentModel ~= "" then table.insert(details, text("model", "attention.location-model", currentModel)) end
+			location = node("el", { key = "location", role = "attention.location", tag = "button",
+				title = "Reveal in Workspace · " .. currentTitle .. (if currentContext ~= "" then " · " .. currentContext else "") .. (if currentModel ~= "" then " · " .. currentModel else ""),
+				actions = { click = bind("reveal", { op = "reveal" }) },
+			}, details)
+		else
+			location = node("row", { key = "location", role = "attention.location-none", gap = "xs", wrap = false },
+				{ text("title", "attention.location-title", "No current location") })
+		end
 	end
-	local function pageControl(key, caption, title, delta)
-		return node("el", { key = key, role = "attention.page-control", tag = "button", text = caption, title = title,
-			actions = { click = bind(key, { op = "page", delta = delta, section = section, logicalRevision = logical.revision }) } })
+	-- Bottom strip: one fixed group above the scrolled list: the toolbar and the location line. styles.css bounds
+	-- the root and scrolls only the list, so none of it is sticky content (native sticky painting is culled once
+	-- the scroll offset passes about a screen).
+	local header = nil
+	if not stacked then
+		header = node("col", { key = "header", role = "attention.header", gap = "none" }, {
+			node("row", { key = "queues", role = "attention.queues", gap = "sm", wrap = true }, queues),
+			node("row", { key = "tools", role = "attention.tools", gap = "sm", wrap = true }, tools),
+			location,
+			node("row", { key = "utility", role = "attention.utility", gap = "xs", wrap = false }, utility),
+		})
 	end
-	-- One fixed group above the scrolled list: the toolbar, the location line and, when more than one page exists,
-	-- the pager. styles.css bounds the root and scrolls only the list, so none of it is sticky content (native sticky
-	-- painting is culled once the scroll offset passes about a screen). The first row keeps its right edge free for
-	-- the native pane grip.
-	local footer = {}
-	if (first > 1 or last < #rows) and not logical.settings then
-		table.insert(footer, text("range", "attention.pager-range", first .. "–" .. last .. " of " .. #rows))
-		if first > 1 then table.insert(footer, pageControl("page-prev", "‹ Prev", "Previous page · " .. PAGE_SIZE .. " per page", -1)) end
-		if last < #rows then table.insert(footer, pageControl("page-next", "Next ›", "Next page · " .. PAGE_SIZE .. " per page", 1)) end
-	end
-	local pagination = node("row", { key = "pagination", role = "attention.pagination", gap = "sm", wrap = false, hidden = #footer == 0 }, footer)
-	local header = node("col", { key = "header", role = "attention.header", gap = "none" }, {
-		node("row", { key = "queues", role = "attention.queues", gap = "sm", wrap = true }, queues),
-		node("row", { key = "tools", role = "attention.tools", gap = "sm", wrap = true }, tools),
-		location,
-		pagination,
-		node("row", { key = "utility", role = "attention.utility", gap = "xs", wrap = false }, utility),
-	})
 	local settingsNodes = {}
 	if logical.settings then
-		local afterSeconds = settingsOptions.backlogAfterSeconds or 0
-		local ageControls = { control("age-never", "Never", { op = "age", seconds = 0 }, afterSeconds == 0) }
-		for _, hours in ipairs({ 3, 6, 12, 24 }) do
-			table.insert(ageControls, control("age-" .. hours, hours .. "h", { op = "age", seconds = hours * 3600 }, afterSeconds == hours * 3600))
-		end
-		table.insert(settingsNodes, text("heading", "attention.settings-title", "Settings"))
-		table.insert(settingsNodes, node("row", { key = "aging", role = "attention.setting", gap = "md", wrap = true }, {
-			node("col", { key = "info", role = "attention.setting-info", gap = "xs" }, {
-				text("label", "attention.setting-label", "Automatic age-to-Later"),
-				text("description", "attention.explanation", "Legacy observation age · not source age or a deadline. Applies globally."),
-			}), node("row", { key = "options", role = "attention.setting-options", gap = "none", wrap = false }, ageControls),
+		table.insert(settingsNodes, node("row", { key = "heading", role = "attention.settings-head", gap = "sm", wrap = false }, {
+			text("title", "attention.settings-title", "Settings"),
+			node("el", { key = "back", role = "attention.settings-back", tag = "button", text = "Back to " .. queueLabels[logical.section],
+				title = "Back to " .. queueLabels[logical.section] .. " · closes Settings",
+				actions = { click = bind("settings-back", { op = "settings" }) } }),
 		}))
 		local defaultPosition = settingsOptions.defaultPosition or "bottom"
 		local defaultLabel = defaultPosition:sub(1, 1):upper() .. defaultPosition:sub(2)
@@ -1173,16 +1618,16 @@ function view.render(renderer, logical, presentation, options)
 				text("label", "attention.setting-label", "Rail placement"),
 				text("state", "attention.explanation", "Default for new tabs: " .. defaultLabel .. "."),
 				text("description", "attention.explanation",
-					"One tab elsewhere? The palette's Use … in this tab relayouts just that tab. Nothing moves on its own."),
+					"Pressing a position moves every rail there — this tab now, the rest on their next visit — and sets the default. One tab elsewhere? The palette's Use … in this tab relayouts just that tab."),
 			}), node("row", { key = "options", role = "attention.placement-controls", gap = "sm", wrap = true }, {
 				control("default-bottom", "Bottom", { op = "default", position = "bottom" }, defaultPosition == "bottom"),
 				control("default-right", "Right", { op = "default", position = "right" }, defaultPosition == "right"),
 				control("default-left", "Left", { op = "default", position = "left" }, defaultPosition == "left"),
 			}),
 		}))
-		table.insert(settingsNodes, text("tracking-note", "attention.explanation", "More offers Later/date, priority, reference and Finished for now. Reference and Finished stay until Resume tracking."))
+		table.insert(settingsNodes, text("tracking-note", "attention.explanation", "More offers priority, reference and Finished for now. Reference and Finished leave the queues until Resume tracking; Search still finds them."))
 		table.insert(settingsNodes, text("open-note", "attention.explanation", "Open clears only the displayed new-update revision after navigation. It does not answer a request or prove reading or completion."))
-		table.insert(settingsNodes, text("shortcut", "attention.explanation", "Next attention · " .. shortcutLabel(settingsOptions.shortcut) .. " · skips Later; leaves this view unchanged"))
+		table.insert(settingsNodes, text("shortcut", "attention.explanation", "Next attention · " .. shortcutLabel(settingsOptions.shortcut) .. " · leaves this view unchanged"))
 	end
 	local settings = node("col", { key = "settings", role = "attention.settings", gap = "none", hidden = not logical.settings }, settingsNodes)
 	local coverageLines = {}
@@ -1196,22 +1641,161 @@ function view.render(renderer, logical, presentation, options)
 	coverageLine("message", presentation.message)
 	coverageLine("notice", options.notice)
 	local coverage = node("col", { key = "coverage", role = "attention.coverage", gap = "xs", hidden = #coverageLines == 0 }, coverageLines)
-	local rowsNode = node("col", { key = "rows", role = if renderer.arrival then renderer.arrival.role
-		elseif section == "attention" and #rowNodes > 0 then "attention.rows-occupied" else "attention.rows", gap = "none", hidden = logical.settings }, rowNodes)
-	-- Only Workspace explains an empty list (missing inventory); empty conversation queues show nothing at all.
-	local empty = text("empty", "attention.empty", if section == "workspace" then "No workspace places" else "")
-	empty.p.hidden = section ~= "workspace" or #rows > 0 or logical.settings or status == "unavailable" or status == "loading"
-	local root = node("col", { role = "attention.root", gap = "none" }, { header, coverage, rowsNode, empty, settings })
+	local root, shown, rowsNode
+	if stacked then
+		-- Left and right rails: one native split, the attention stack over Workspace. The root is the canvas root
+		-- (a nested split collapses). Native keeps a dragged divider by key until `sizes` differs, so the sizes
+		-- are re-derived from view state on every render: equal while the share is unchanged, different on each change.
+		local top = logical.divider.share + (if logical.divider.nonce % 2 == 1 then SHARE_NUDGE else 0)
+		shown = 0
+		local toolsLine = node("row", { key = "tools", role = "attention.tools-line", gap = "xs", wrap = false }, {
+			node("row", { key = "buttons", role = "attention.tools", gap = "xs", wrap = false }, tools),
+			node("row", { key = "utility", role = "attention.utility", gap = "xs", wrap = false }, utility),
+		})
+		-- A queue section: the workspace-group header (chevron, title, count beside it, More menu) over its
+		-- rows. Collapse state rides the Workspace disclosure map under `queue:<name>`, and the sections follow
+		-- the stored queue order.
+		local function queueSection(name)
+			local open = logical.workspace.collapsed["queue:" .. name] ~= true
+			local rowNodesOfSection, sectionShown = {}, 0
+			if open and not logical.settings then rowNodesOfSection, sectionShown = rowNodesOf(name) end
+			shown += sectionShown
+			local toggle = node("el", { key = "toggle", role = "workspace.section", tag = "button",
+				title = (if open then "Hide · " else "Show · ") .. queueTitles[name],
+				actions = { click = bind("toggle:" .. name, { op = "workspace-toggle", key = "queue:" .. name, expanded = open }) },
+			}, { node("icon", { key = "icon", role = "attention.triage-icon", name = if open then "chev" else "chev-r" }),
+				text("title", "workspace.title", queueLabels[name]), text("count", "workspace.count", tostring(counts[name])) })
+			local headParts = { toggle }
+			if not logical.settings then
+				table.insert(headParts, node("el", { key = "menu", role = "attention.triage", tag = "button",
+					title = "More · " .. queueLabels[name],
+					actions = { click = bind("queue-menu:" .. name, { op = "queue-menu", name = name }) },
+				}, { node("icon", { key = "icon", role = "attention.triage-icon", name = "more" }) }))
+			end
+			local rowsRole = if name == "attention" and renderer.arrival then renderer.arrival.role
+				elseif name == "attention" and #rowNodesOfSection > 0 then "attention.rows-occupied" else "attention.rows"
+			-- A section is as tall as its rows: an empty one is just its header with the count.
+			local rowLines = rowNodesOfSection
+			return node("col", { key = name, role = "attention.section", gap = "none" }, {
+				node("row", { key = "head", role = "attention.section-head", gap = "xs", wrap = false }, headParts),
+				node("col", { key = "rows", role = rowsRole, gap = "none", hidden = not open or logical.settings }, rowLines),
+			})
+		end
+		local sections = {}
+		for _, name in ipairs(queueOrder) do table.insert(sections, queueSection(name)) end
+		local topRegion = node("col", { key = "top", role = "attention.region", gap = "none", min = REGION_MIN }, {
+			toolsLine, coverage, settings,
+			node("col", { key = "stack", role = "attention.stack", gap = "none", hidden = logical.settings }, sections),
+		})
+		-- Workspace region: its head is the place line itself — the current tab · its session, revealing the
+		-- focused place on click, with the fold icon at the end. The head renders last, so it hugs the region's
+		-- bottom edge in both states: minimized it is the whole region; expanded, the tree fills above it and the
+		-- fold icon flips +/− in place. Without a current place the header falls back to the region's name and
+		-- nothing reveals.
+		local workspaceRows, workspaceShown, workspaceCurrentKey = rowNodesOf("workspace")
+		shown += workspaceShown
+		if budget.omitted > 0 then table.insert(workspaceRows, moreNode()) end
+		local headLine
+		local minimized = logical.divider.minimized == true
+		local foldTitle = if minimized then "Show the Workspace tree" else "Minimize the Workspace tree"
+		if current then
+			local placeTitle = label(current.tab or current.title, "Untitled", 160)
+			local currentTitle = label(current.title, "Untitled", 160)
+			local currentContext = label(current.context, "", 160)
+			-- The model is display-only, so it is named in the tooltip and never enters a key.
+			local currentModel = label(current.model, "", 48)
+			local titleText = text("title", "workspace.title", placeTitle)
+			titleText.p.truncate, titleText.p.title = "end", placeTitle
+			-- The place card reads like a rail queue row: the session in the shared caps column on the left, then the
+			-- accent dot ("you are here") and the tab's name, on one line. The whole card folds the tree, like the
+			-- icon beside it: one affordance for one region.
+			local placeLine = {}
+			local sessionName = label(current.session, "", 96)
+			if sessionName ~= "" then
+				local sessionText = text("session", "attention.rail-session", string.upper(sessionName))
+				sessionText.p.title = sessionName
+				table.insert(placeLine, node("row", { key = "session-cell", role = "attention.rail-session-cell", gap = "none",
+					wrap = false }, { sessionText }))
+			end
+			table.insert(placeLine, text("dot", "workspace.place-dot", "\u{25CF}"))
+			table.insert(placeLine, titleText)
+			local placeParts = { node("row", { key = "line", role = "attention.line", gap = "xs", wrap = false }, placeLine) }
+			headLine = node("el", { key = "location", role = "attention.location", tag = "button",
+				title = foldTitle .. " · " .. currentTitle
+					.. (if currentContext ~= "" then " · " .. currentContext else "")
+					.. (if currentModel ~= "" then " · " .. currentModel else ""),
+				actions = { click = bind("minimize-place", { op = "workspace-minimize" }) },
+			}, placeParts)
+		else
+			-- No current place: the region's name itself folds the tree, keeping one affordance either way.
+			local plain = text("title", "workspace.title", queueLabels.workspace)
+			plain.p.truncate, plain.p.title = "end", queueLabels.workspace
+			headLine = node("el", { key = "title", role = "attention.location", tag = "button",
+				title = foldTitle,
+				actions = { click = bind("minimize-title", { op = "workspace-minimize" }) },
+			}, { node("row", { key = "line", role = "attention.line", gap = "xs", wrap = false }, { plain }) })
+		end
+		-- The fold control is an icon: its tooltip carries the state, so the header's width stays with the place name.
+		local minimizeControl = node("el", { key = "minimize", role = "attention.region-toggle", tag = "button",
+			title = if minimized then "Show the Workspace tree" else "Minimize the Workspace tree",
+			actions = { click = bind("minimize", { op = "workspace-minimize" }) },
+		}, { node("icon", { key = "icon", role = "attention.region-toggle-icon",
+			name = if minimized then "plus" else "minus", size = 16 }) })
+		local workspaceHead = node("col", { key = "head", role = "attention.region-head", gap = "none" }, {
+			node("row", { key = "line", role = "attention.section-head", gap = "xs", wrap = false }, {
+				headLine,
+				minimizeControl,
+			}),
+		})
+		local workspaceEmpty = text("empty", "attention.empty", "No workspace tabs")
+		workspaceEmpty.p.hidden = minimized or #listOf("workspace") > 0 or status == "unavailable" or status == "loading"
+		-- The rows are a native list so the current place's box stays scrolled into view: the host keeps one scroll
+		-- offset per tab's canvas, so `selected` is what lands a freshly shown rail on where you are. The id is the
+		-- full rendered node id: the region name "main", then every key from the canvas root down to the child.
+		-- Only the keys below may name the path, so the nodes and the id cannot drift.
+		local regionsKey, bottomKey, rowsKey = "regions", "bottom", "rows"
+		local rowsIdPrefix = "main." .. regionsKey .. "." .. bottomKey .. "." .. rowsKey .. "."
+		-- The head renders last: the tree grows above a footer pinned to the bottom edge, so expanding never
+		-- moves the fold control out from under the pointer.
+		local bottomRegion = node("col", { key = bottomKey,
+			role = if minimized then "attention.region-docked" else "attention.workspace-region", gap = "none",
+			min = if minimized then nil else REGION_MIN }, {
+			node("list", { key = rowsKey, role = "attention.workspace-rows", hidden = minimized, max = { lines = 400 },
+				selected = if workspaceCurrentKey then rowsIdPrefix .. workspaceCurrentKey else nil }, workspaceRows),
+			workspaceEmpty,
+			workspaceHead,
+		})
+		root = node("split", { key = regionsKey, role = "attention.regions", dir = "col", grow = 1, sizes = { top, 1 - top } },
+			{ topRegion, bottomRegion })
+	else
+		shown = rowNodesShown
+		if budget.omitted > 0 then table.insert(rowNodes, moreNode()) end
+		rowsNode = node("col", { key = "rows", role = if renderer.arrival then renderer.arrival.role
+			elseif section == "attention" and #rowNodes > 0 then "attention.rows-occupied" else "attention.rows", gap = "none", hidden = logical.settings }, rowNodes)
+		-- Only Workspace explains an empty list (missing inventory); empty conversation queues show nothing at all.
+		local empty = text("empty", "attention.empty", if section == "workspace" then "No workspace tabs" else "")
+		empty.p.hidden = section ~= "workspace" or #rows > 0 or logical.settings or status == "unavailable" or status == "loading"
+		root = node("col", { role = "attention.root", gap = "none" }, { header, coverage, rowsNode, empty, settings })
+	end
 	local nextScreen = { view = root }
 	local previousScreen = renderer.previous
 	renderer.previous, renderer.bindings, renderer.targets = nextScreen, bindings, targets
-	renderer.initialized, renderer.logicalRevision, renderer.selection = true, logical.revision, selection
+	renderer.initialized, renderer.selection = true, selection
 	if options.arrival or not previousScreen then renderer.arrivalRevision = presentation.revision end
-	local info = { page = page, pages = pages, shown = #rowNodes, total = presentation.count,
+	local info = { shown = shown, total = presentation.count, omitted = budget.omitted,
 		section = section, settings = logical.settings, sectionCount = #rows,
-		attentionCount = attentionCount, laterCount = laterCount, workingCount = workingCount, reachableCount = reachable,
+		attentionCount = attentionCount, workingCount = workingCount, reachableCount = reachable,
 		awaitingHeaderCount = awaitingHeader }
 	if not previousScreen then return nextScreen, bindings, info end
+	-- Switching between the strip and the stack (a rail moved) shares no node paths: send the whole view.
+	if (previousScreen.view.k == "split") ~= stacked then return nextScreen, bindings, info end
+	if stacked then
+		-- A changed split (sizes after a snap) can only be sent whole; otherwise patch the keyed regions.
+		if not equal(previousScreen.view.p, root.p) then return nextScreen, bindings, info end
+		local patches = {}
+		for index, region in ipairs(root.c) do diffNodes(patches, region.p.key, previousScreen.view.c[index], region) end
+		return if next(patches) then { set = patches } else nil, bindings, info
+	end
 	local patches = {}
 	for _, index in ipairs({ 1, 2, 4, 5 }) do
 		if not equal(previousScreen.view.c[index], root.c[index]) then patches[root.c[index].p.key] = root.c[index] end
@@ -1245,5 +1829,7 @@ function view.render(renderer, logical, presentation, options)
 	end
 	return if next(patches) then { set = patches } else nil, bindings, info
 end
+
+view.MAX_CANVAS_ROWS, view.MAX_CANVAS_NODES = MAX_CANVAS_ROWS, MAX_CANVAS_NODES
 
 return view

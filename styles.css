@@ -3,8 +3,15 @@
 	display: none;
 }
 
+/* Tern's own `button:where(.sf-el)` chrome draws every canvas button as a chip with a 1 px inset ring
+   (`box-shadow`), which `border: 0` does not clear. This (0,1,0) reset beats it and sits first, so a
+   role below that wants a ring or fill still sets its own. */
+:where(button)[data-role] {
+	box-shadow: none;
+}
+
 /* The root fills the native main region and scrolls only the list (or Settings) inside it, so the toolbar,
-   location line and pager are never scrolled content: native sticky painting is culled once its flow position
+   and location line are never scrolled content: native sticky painting is culled once its flow position
    is far from the viewport, which blanked the header after about a screen of scrolling. */
 [data-role='attention.root'] {
 	position: absolute;
@@ -25,22 +32,57 @@
 	border-bottom: 1px solid var(--l1);
 }
 
-[data-role='attention.rows'],
-[data-role='attention.rows-occupied'],
-[data-role='attention.rows-arrival'],
-[data-role='attention.rows-arrival-again'],
 [data-role='attention.settings'] {
 	flex: 1 1 0;
 	min-height: 0;
 	overflow-y: auto;
 }
 
-[data-role='attention.rows-occupied'],
-[data-role='attention.rows-arrival'],
-[data-role='attention.rows-arrival-again'] {
-	background-color: rgb(from var(--accent) r g b / 6%);
+/* The Workspace rows are a native list (it keeps the current place's box scrolled into view). Its scroll box
+   fills the region above the docked head instead of the list's line cap; the cap's inline max-height yields. */
+[data-role='attention.workspace-rows'] {
+	flex: 1 1 0;
+	min-height: 0;
+	overflow: hidden;
 }
 
+[data-role='attention.workspace-rows'] > .sf-list-scroll {
+	flex: 1 1 0;
+	min-height: 0;
+	height: 100%;
+	max-height: none !important;
+}
+
+/* The list marks its selected child and gives rows a hover wash; our boxes carry neither, so the native chrome
+   is cancelled and each box's own background restated above it. */
+[data-role='attention.workspace-rows'] .sf-list-slot > .sel {
+	box-shadow: none !important;
+}
+
+[data-role='attention.workspace-rows'] .sf-list-slot > .sel::after {
+	display: none !important;
+}
+
+[data-role='attention.workspace-rows'] .sf-list-slot > [data-role='workspace.ledger'] {
+	background: rgb(from var(--t1) r g b / 4%) !important;
+}
+
+[data-role='attention.workspace-rows'] .sf-list-slot > [data-role='workspace.ledger-current'] {
+	background: rgb(from var(--t1) r g b / 10%) !important;
+}
+
+[data-role='attention.workspace-rows'] .sf-list-slot > :is([data-role='workspace.minimized-line'], [data-role='workspace.empty-line'],
+		[data-role='workspace.host-row']) {
+	background: transparent !important;
+}
+
+[data-role='attention.workspace-rows'] .sf-list-slot > [data-role='workspace.host-row']:hover {
+	background: var(--l1) !important;
+}
+
+/* A queue list is as tall as its rows; an empty one collapses under its header. */
+[data-role='attention.rows'],
+/* Occupied Attention rows look like Working's: no wash. An arrival pulses the list once, from no tint and back. */
 [data-role='attention.rows-arrival'] {
 	animation: attention-arrival 850ms ease-out 1;
 }
@@ -50,16 +92,18 @@
 }
 
 @keyframes attention-arrival {
-	0%, 100% { background-color: rgb(from var(--accent) r g b / 6%); }
-	25% { background-color: rgb(from var(--accent) r g b / 10%); }
+	0%, 100% { background-color: transparent; }
+	25% { background-color: rgb(from var(--t1) r g b / 10%); }
 }
 
 @keyframes attention-arrival-again {
-	0%, 100% { background-color: rgb(from var(--accent) r g b / 6%); }
-	25% { background-color: rgb(from var(--accent) r g b / 10%); }
+	0%, 100% { background-color: transparent; }
+	25% { background-color: rgb(from var(--t1) r g b / 10%); }
 }
 
+/* The row's ⋯ lines up with the section header's ⋯ above it: the same right inset. */
 [data-role='attention.row-main'] {
+	padding-right: calc(6px / var(--sf-zoom, 1));
 	align-items: stretch;
 	min-width: 0;
 	gap: 0;
@@ -135,6 +179,130 @@
 	font-size: inherit;
 	font-weight: 700;
 	line-height: calc(20px / var(--sf-zoom, 1));
+	color: var(--t1);
+}
+
+/* Left and right rails: the owning session in ALL CAPS, in one fixed-width column that every queue row shares, so each
+   row's title starts at the same x. The name truncates with an ellipsis; the row's tooltip keeps the full name. */
+[data-role='attention.rail-session-cell'] {
+	display: flex;
+	flex: 0 0 calc(88px / var(--sf-zoom, 1));
+	width: calc(88px / var(--sf-zoom, 1));
+	align-items: center;
+	box-sizing: border-box;
+	min-width: 0;
+	padding-right: calc(8px / var(--sf-zoom, 1));
+	border-right: 1px solid var(--l3);
+}
+
+[data-role='attention.rail-session'] {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: calc(11px / var(--sf-zoom, 1));
+	font-weight: 700;
+	line-height: calc(16px / var(--sf-zoom, 1));
+	letter-spacing: 0.04em;
+	color: var(--t2);
+}
+
+/* Line two of a rail queue row: model · need · age, muted, on one line. It reserves its line when empty, so rows
+   align. The need gives way first, then the model; the age and the separators never shrink. */
+[data-role='attention.detail-line'] {
+	display: flex;
+	flex-direction: row;
+	flex-wrap: nowrap;
+	align-items: center;
+	min-width: 0;
+	min-height: calc(16px / var(--sf-zoom, 1));
+	overflow: hidden;
+	font-size: calc(12px / var(--sf-zoom, 1));
+	line-height: calc(16px / var(--sf-zoom, 1));
+	color: var(--t2);
+}
+
+[data-role='attention.model-line'],
+[data-role='attention.need'] {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+[data-role='attention.model-line'] {
+	flex: 0 1 auto;
+}
+
+[data-role='attention.need'] {
+	flex: 0 1000 auto;
+}
+
+[data-role='attention.detail-sep'] {
+	flex: 0 0 auto;
+	padding: 0 calc(4px / var(--sf-zoom, 1));
+	color: var(--t3);
+}
+
+[data-role='attention.detail-line'] > [data-role='attention.age'],
+[data-role='attention.detail-line'] > [data-role='attention.age-recorded'] {
+	flex: 0 0 auto;
+	max-width: none;
+	overflow: visible;
+	font-size: inherit;
+}
+
+[data-role='attention.settings-head'] {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	justify-content: space-between;
+	gap: calc(8px / var(--sf-zoom, 1));
+	min-width: 0;
+}
+
+/* The Settings Back control: a quiet text button until hovered. */
+[data-role='attention.settings-back'] {
+	flex: none;
+	box-sizing: border-box;
+	padding: calc(2px / var(--sf-zoom, 1)) calc(6px / var(--sf-zoom, 1));
+	border: 0;
+	border-radius: calc(2px / var(--sf-zoom, 1));
+	background: transparent;
+	color: var(--t2);
+	font: inherit;
+	font-size: calc(11px / var(--sf-zoom, 1));
+	font-weight: 600;
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+/* The Workspace fold control: a quiet icon button until hovered, sized with the tools-line buttons. */
+[data-role='attention.region-toggle'] {
+	flex: none;
+	box-sizing: border-box;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: calc(24px / var(--sf-zoom, 1));
+	height: calc(24px / var(--sf-zoom, 1));
+	padding: 0;
+	border: 0;
+	border-radius: calc(2px / var(--sf-zoom, 1));
+	background: transparent;
+	color: var(--t2);
+	cursor: pointer;
+}
+
+[data-role='attention.region-toggle-icon'] {
+	width: calc(16px / var(--sf-zoom, 1));
+	height: calc(16px / var(--sf-zoom, 1));
+	transform: none;
+}
+
+[data-role='attention.region-toggle']:hover,
+[data-role='attention.settings-back']:hover {
+	background: var(--l1);
 	color: var(--t1);
 }
 
@@ -274,58 +442,9 @@
 	color: var(--t2);
 }
 
-/* The pager is the header group's second-to-last row: compact, one line, always on screen. It takes the free space
-   and right-aligns its content, so in a wide strip it sits just left of the search and gear buttons; otherwise it
-   wraps below the toolbar. */
-[data-role='attention.pagination'] {
-	flex: 1 1 auto;
-	justify-content: flex-end;
-	max-width: 100%;
-	align-items: center;
-	flex-wrap: nowrap;
-	white-space: nowrap;
-	min-width: 0;
-	gap: calc(4px / var(--sf-zoom, 1));
-	padding: calc(2px / var(--sf-zoom, 1)) calc(4px / var(--sf-zoom, 1)) 0;
-}
-
-[data-role='attention.pager-range'] {
-	flex: 0 1 auto;
-	min-width: 0;
-	color: var(--t2);
-	font-size: calc(11px / var(--sf-zoom, 1));
-	font-variant-numeric: tabular-nums;
-	overflow: hidden;
-	text-overflow: ellipsis;
-}
-
-[data-role='attention.page-control'] {
-	flex: 0 0 auto;
-	box-sizing: border-box;
-	height: calc(20px / var(--sf-zoom, 1));
-	padding: 0 calc(6px / var(--sf-zoom, 1));
-	border: calc(1px / var(--sf-zoom, 1)) solid var(--l2);
-	border-radius: calc(4px / var(--sf-zoom, 1));
-	background: transparent;
-	color: var(--t1);
-	font: inherit;
-	font-size: calc(11px / var(--sf-zoom, 1));
-	font-weight: 600;
-	white-space: nowrap;
-	cursor: pointer;
-}
-
-[data-role='attention.page-control']:hover {
-	background: var(--l1);
-	border-color: var(--l3);
-}
-
-[data-role='attention.page-control']:active {
-	background: var(--l2);
-}
-
 [data-role='attention.control'],
 [data-role='attention.selected'],
+[data-role='attention.more'],
 [data-role='attention.triage'],
 [data-role='attention.gear'],
 [data-role='attention.gear-selected'],
@@ -347,6 +466,7 @@
 
 [data-role='attention.control']:hover,
 [data-role='attention.selected']:hover,
+[data-role='attention.more']:hover,
 [data-role='attention.triage']:hover,
 [data-role='attention.gear']:hover,
 [data-role='attention.gear-selected']:hover,
@@ -356,6 +476,7 @@
 
 [data-role='attention.control']:active,
 [data-role='attention.selected']:active,
+[data-role='attention.more']:active,
 [data-role='attention.triage']:active,
 [data-role='attention.gear']:active,
 [data-role='attention.gear-selected']:active,
@@ -370,7 +491,7 @@
 	box-shadow: inset 0 -1px var(--t2);
 }
 
-/* Toolbar, current-location line (Workspace only) and pager are one fixed group above the scrolled list. The group
+/* Toolbar and current-location line (Workspace only) are one fixed group above the scrolled list. The group
    wraps: a wide strip (a rail at the bottom or right of a tab) keeps modes, Next/Prev and the search and gear buttons
    on one line, a narrow rail stacks them. The group's right padding keeps the buttons clear of the native pane grip. */
 [data-role='attention.header'] {
@@ -431,7 +552,7 @@
 }
 
 [data-role='attention.location-title'] {
-	flex: 0 1 auto;
+	flex: 0 100 auto;
 	min-width: 0;
 	font-weight: 600;
 	color: var(--t1);
@@ -446,9 +567,19 @@
 }
 
 [data-role='attention.location-context'] {
-	flex: 1 1 0;
+	flex: 0 1 auto;
 	min-width: 0;
-	color: var(--t2);
+	color: var(--t3);
+	font-size: calc(11px / var(--sf-zoom, 1));
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+[data-role='attention.location-model'] {
+	flex: 0 1 auto;
+	min-width: 0;
+	color: var(--t3);
 	font-size: calc(11px / var(--sf-zoom, 1));
 	white-space: nowrap;
 	overflow: hidden;
@@ -466,7 +597,7 @@
 	padding: calc(2px / var(--sf-zoom, 1)) calc(4px / var(--sf-zoom, 1));
 	gap: calc(4px / var(--sf-zoom, 1));
 	border: 0;
-	border-radius: calc(4px / var(--sf-zoom, 1));
+	border-radius: calc(2px / var(--sf-zoom, 1));
 	background: transparent;
 	color: var(--t2);
 	font: inherit;
@@ -515,9 +646,7 @@
 	height: calc(22px / var(--sf-zoom, 1));
 	padding: 0 calc(5px / var(--sf-zoom, 1));
 	gap: calc(4px / var(--sf-zoom, 1));
-	border: calc(1px / var(--sf-zoom, 1)) solid var(--l2);
-	border-radius: calc(4px / var(--sf-zoom, 1));
-	background: transparent;
+	border-radius: calc(2px / var(--sf-zoom, 1));
 	color: var(--t2);
 	font-size: calc(12px / var(--sf-zoom, 1));
 	font-weight: 600;
@@ -527,8 +656,6 @@
 
 [data-role='attention.next']:hover,
 [data-role='attention.previous']:hover {
-	background: var(--l1);
-	border-color: var(--l3);
 	color: var(--t1);
 }
 
@@ -585,6 +712,7 @@
 	cursor: default;
 }
 
+[data-role='attention.more'],
 [data-role='attention.triage'],
 [data-role='attention.cancel-navigation'] {
 	display: flex;
@@ -603,6 +731,8 @@
 	white-space: nowrap;
 }
 
+[data-role='attention.more-icon'],
+[data-role='attention.more-icon'] .ico,
 [data-role='attention.triage-icon'],
 [data-role='attention.triage-icon'] .ico {
 	width: calc(12px / var(--sf-zoom, 1));
@@ -641,37 +771,6 @@
 	font-weight: 600;
 }
 
-[data-role='attention.setting-options'] {
-	flex: none;
-	align-items: stretch;
-	gap: calc(2px / var(--sf-zoom, 1));
-	padding: calc(3px / var(--sf-zoom, 1));
-	border: 1px solid var(--l2);
-	border-radius: calc(6px / var(--sf-zoom, 1));
-	background: var(--l1);
-}
-
-[data-role='attention.setting-options'] > [data-role] {
-	box-sizing: border-box;
-	min-width: calc(38px / var(--sf-zoom, 1));
-	padding: calc(4px / var(--sf-zoom, 1)) calc(8px / var(--sf-zoom, 1));
-	border-radius: calc(3px / var(--sf-zoom, 1));
-	color: var(--t2);
-	text-align: center;
-	white-space: nowrap;
-}
-
-[data-role='attention.setting-options'] > [data-role='attention.control']:hover {
-	background: var(--l3);
-	color: var(--t1);
-}
-
-[data-role='attention.setting-options'] > [data-role='attention.selected'] {
-	background: rgb(from var(--accent) r g b / 14%);
-	color: var(--accent);
-	box-shadow: inset 0 0 0 1px rgb(from var(--accent) r g b / 25%);
-}
-
 [data-role='attention.placement-controls'] {
 	flex: 0 1 auto;
 	flex-wrap: wrap;
@@ -699,19 +798,154 @@
 	white-space: normal;
 }
 
-/* Workspace tree: one flat keyed list, indented by depth. */
-[data-role='workspace.row-0'],
-[data-role='workspace.row-1'],
-[data-role='workspace.row-2'],
-[data-role='workspace.row-3'] {
-	align-items: stretch;
+/* Workspace is a ledger: hosts as full-width disclosure rows, session blocks with a fixed label column and
+   their rows to the right of a hairline, and plain tab rows. Nothing indents; a session and its rows share
+   one rounded box — the physical group, tinted from the foreground — and the current session's box and tab are
+   the brighter steps of that same monochrome tint. */
+[data-role='workspace.host-row'],
+[data-role='workspace.ledger'],
+[data-role='workspace.ledger-current'],
+[data-role='workspace.row'] {
+	box-sizing: border-box;
 	min-width: 0;
-	border-bottom: 1px solid var(--l1);
 }
 
-[data-role='workspace.row-1'] { padding-left: calc(12px / var(--sf-zoom, 1)); }
-[data-role='workspace.row-2'] { padding-left: calc(24px / var(--sf-zoom, 1)); }
-[data-role='workspace.row-3'] { padding-left: calc(36px / var(--sf-zoom, 1)); }
+/* Host row: the whole rail-width line is the disclosure — a chevron that turns with the host's state, the
+   name, and a muted count or offline note — so a world reads as openable the way a section head does. */
+[data-role='workspace.host-row'] {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	justify-content: center;
+	gap: calc(6px / var(--sf-zoom, 1));
+	box-sizing: border-box;
+	align-self: stretch;
+	min-width: 0;
+	padding: calc(5px / var(--sf-zoom, 1)) calc(8px / var(--sf-zoom, 1));
+	border: none;
+	border-radius: calc(2px / var(--sf-zoom, 1));
+	background: transparent;
+	color: var(--t2);
+	font: inherit;
+	font-size: calc(12px / var(--sf-zoom, 1));
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+[data-role='workspace.host-row']:hover {
+	background: var(--l1);
+	color: var(--t1);
+}
+
+[data-role='workspace.host-title'] {
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	text-align: left;
+}
+
+[data-role='workspace.host-suffix'] {
+	flex: none;
+	color: var(--t3);
+	white-space: nowrap;
+}
+
+/* Session block: one rounded, filled box is the group; the label column inside it centers the session's name
+   against its rows, its right hairline the spine of the ledger. */
+[data-role='workspace.ledger'],
+[data-role='workspace.ledger-current'] {
+	display: flex;
+	flex-direction: row;
+	align-items: stretch;
+	box-sizing: border-box;
+	border: 1px solid rgb(from var(--t1) r g b / 24%);
+	border-radius: 0;
+	background: rgb(from var(--t1) r g b / 4%);
+	margin-bottom: calc(4px / var(--sf-zoom, 1));
+}
+
+[data-role='workspace.ledger-label'] {
+	display: flex;
+	flex: 0 0 calc(78px / var(--sf-zoom, 1));
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	min-width: 0;
+	padding: calc(2px / var(--sf-zoom, 1)) calc(3px / var(--sf-zoom, 1));
+	border-right: 1px solid rgb(from var(--t1) r g b / 18%);
+	gap: calc(2px / var(--sf-zoom, 1));
+}
+
+[data-role='workspace.ledger-name'] {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	align-self: stretch;
+	justify-content: center;
+	box-sizing: border-box;
+	min-width: 0;
+	padding: calc(2px / var(--sf-zoom, 1)) calc(2px / var(--sf-zoom, 1));
+	border: 0;
+	border-radius: calc(2px / var(--sf-zoom, 1));
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	font-size: calc(12px / var(--sf-zoom, 1));
+	text-align: center;
+	cursor: pointer;
+	gap: calc(4px / var(--sf-zoom, 1));
+}
+
+[data-role='workspace.ledger-name']:hover {
+	background: var(--l1);
+}
+
+[data-role='workspace.ledger-dot'] {
+	flex: 0 0 auto;
+	color: var(--t1);
+	font-size: calc(8px / var(--sf-zoom, 1));
+}
+
+[data-role='workspace.ledger-chip'] {
+	text-align: center;
+	padding: 0 calc(4px / var(--sf-zoom, 1));
+	font-size: calc(10.5px / var(--sf-zoom, 1));
+	line-height: calc(15px / var(--sf-zoom, 1));
+	color: var(--t3);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+[data-role='workspace.ledger-saved'] {
+	text-align: center;
+	padding: calc(2px / var(--sf-zoom, 1)) calc(4px / var(--sf-zoom, 1));
+	font-size: calc(12px / var(--sf-zoom, 1));
+	font-weight: 600;
+	color: var(--t1);
+}
+
+[data-role='workspace.ledger-rows'] {
+	display: flex;
+	flex: 1 1 auto;
+	flex-direction: column;
+	align-items: stretch;
+	box-sizing: border-box;
+	min-width: 0;
+}
+
+/* The current session, in monochrome: the brightest box, ringed in the foreground, with its dot. */
+[data-role='workspace.ledger-current'] {
+	border-color: rgb(from var(--t1) r g b / 55%);
+	background: rgb(from var(--t1) r g b / 10%);
+}
+
+[data-role='workspace.ledger-current'] > [data-role='workspace.ledger-label'] {
+	border-right-color: rgb(from var(--t1) r g b / 25%);
+}
 
 [data-role='workspace.main'],
 [data-role='workspace.main-current'] {
@@ -720,10 +954,10 @@
 	gap: 0;
 }
 
-/* The current destination, wherever it sits in the tree. */
+/* The current tab: one more step of the same foreground tint, the ledger's one highlighted row. */
 [data-role='workspace.main-current'] {
-	background: rgb(from var(--accent) r g b / 10%);
-	box-shadow: inset calc(2px / var(--sf-zoom, 1)) 0 var(--accent);
+	border-radius: 0;
+	background: rgb(from var(--t1) r g b / 10%);
 }
 
 [data-role='workspace.main'] > [data-role='attention.unavailable'],
@@ -745,9 +979,16 @@
 	cursor: default;
 }
 
+/* Rows run edge to edge inside their square box (the current tab's tint and the rules between tabs touch the box's
+   inner edges); the text keeps its inset here instead. */
+[data-role='workspace.main'],
+[data-role='workspace.main-current'] {
+	padding-right: calc(4px / var(--sf-zoom, 1));
+}
+
 [data-role='workspace.main'] > [data-role='attention.open'],
 [data-role='workspace.main-current'] > [data-role='attention.open'] {
-	padding: 0.3em 0.5em;
+	padding: 0.3em 0.5em 0.3em calc(12px / var(--sf-zoom, 1));
 }
 
 [data-role='workspace.toggle'],
@@ -762,7 +1003,7 @@
 	padding: calc(4px / var(--sf-zoom, 1));
 	border: 0;
 	background: transparent;
-	color: var(--t2);
+	color: var(--t3);
 	font: inherit;
 	cursor: pointer;
 }
@@ -776,46 +1017,97 @@
 	cursor: default;
 }
 
-[data-role='workspace.section'],
-[data-role='workspace.aside'] {
+[data-role='workspace.section'] {
 	display: flex;
 	box-sizing: border-box;
 	width: 100%;
 	align-items: center;
+	justify-content: center;
 	gap: calc(6px / var(--sf-zoom, 1));
 	padding: 0.25em 0.5em;
 	border: 0;
 	background: transparent;
-	color: var(--t2);
+	color: var(--t3);
 	font: inherit;
 	font-size: calc(12px / var(--sf-zoom, 1));
 	text-align: left;
 	cursor: pointer;
 }
 
-[data-role='workspace.section']:hover,
-[data-role='workspace.aside']:hover {
+[data-role='workspace.section']:hover {
 	background: var(--l1);
 	color: var(--t1);
 }
 
 [data-role='workspace.title'],
-[data-role='workspace.title-dim'] {
+[data-role='workspace.title-tab'],
+[data-role='workspace.title-dim'],
+[data-role='workspace.empty-session'] {
 	flex: 0 1 auto;
 	min-width: 0;
 	font: inherit;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 
+/* Host and session titles carry the weight; tab titles are plain. */
 [data-role='workspace.title'] {
 	font-weight: 600;
 	color: var(--t1);
 }
 
-/* Reference, Finished for now and set-aside conversations stay visible but quiet. */
+[data-role='workspace.title-tab'] {
+	font-weight: 400;
+	color: var(--t1);
+}
+
+/* A tab row's tile, as in the native sidebar: Tern's program icon in a 16px square, centred on the title, adding no
+   row height. A title glyph replaces the icon: dark ink on a light plate, like native's session icons. */
+[data-role='workspace.tile'],
+[data-role='workspace.tile-plate'] {
+	position: relative;
+	flex: 0 0 auto;
+	align-self: center;
+	width: calc(16px / var(--sf-zoom, 1));
+	height: calc(16px / var(--sf-zoom, 1));
+	margin: calc(-2px / var(--sf-zoom, 1)) 0;
+}
+
+[data-role='workspace.tile-icon'],
+[data-role='workspace.tile-icon'] svg {
+	display: block;
+	width: 100%;
+	height: 100%;
+}
+
+[data-role='workspace.tile-plate'] {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	border-radius: calc(4px / var(--sf-zoom, 1));
+	background: rgb(235 235 235);
+}
+
+[data-role='workspace.tile-glyph'] {
+	font-size: calc(11px / var(--sf-zoom, 1));
+	line-height: 1;
+	color: rgb(0 0 0 / 85%);
+	pointer-events: none;
+}
+
+/* Reference and Finished for now conversations stay visible but quiet. */
 [data-role='workspace.title-dim'] {
 	flex: 0 2 auto;
 	font-weight: 400;
-	color: var(--t2);
+	color: var(--t3);
+}
+
+/* An empty session's only row, quiet like native's "No tabs". */
+[data-role='workspace.empty-session'] {
+	font-weight: 400;
+	color: var(--t3);
 }
 
 [data-role='workspace.count'] {
@@ -823,8 +1115,16 @@
 	white-space: nowrap;
 	font-size: calc(11px / var(--sf-zoom, 1));
 	line-height: calc(16px / var(--sf-zoom, 1));
-	color: var(--t2);
+	color: var(--t3);
 	font-variant-numeric: tabular-nums;
+}
+
+[data-role='workspace.session'] {
+	flex: 0 0 auto;
+	white-space: nowrap;
+	font-size: calc(11px / var(--sf-zoom, 1));
+	line-height: calc(16px / var(--sf-zoom, 1));
+	color: var(--t3);
 }
 
 [data-role='workspace.context'] {
@@ -836,13 +1136,330 @@
 	white-space: nowrap;
 	font-size: calc(11px / var(--sf-zoom, 1));
 	line-height: calc(16px / var(--sf-zoom, 1));
-	color: var(--t2);
+	color: var(--t3);
 	font-variant-numeric: tabular-nums;
+}
+
+/* Footer of a canvas that hit its row cap: the count of rows left out. */
+[data-role='workspace.more'] {
+	padding: 0.4em 0.75em;
+	font-size: calc(11px / var(--sf-zoom, 1));
+	color: var(--t3);
 }
 
 /* Beside a title (group rows) the short context keeps its width and the title ellipsizes instead. */
 [data-role='attention.summary'] > [data-role='workspace.context'] {
 	flex: 0 0 auto;
+}
+
+/* ---- Rail rows and header (left and right rails). The bottom strip keeps the two-line rows and the one-line
+   toolbar above untouched. Every flex child that must truncate carries min-width: 0. ---- */
+
+/* Rail-width rules cannot use @container (the canvas engine ignores it) or @media (it measures the window); see
+   the location line below for the width-percentage idiom. */
+
+/* Line one of a rail row: the title ellipsizes; a queue row's priority chip (a Workspace leaf's state marker) stays
+   right-aligned. Fixed height, so a row is the same height at any rail width (a queue row is line one plus line two,
+   about 36px; a leaf row is 25.8px, 40.8px with a sub-line). */
+[data-role='attention.line'] {
+	display: flex;
+	flex-direction: row;
+	flex-wrap: nowrap;
+	align-items: center;
+	box-sizing: border-box;
+	min-width: 0;
+	height: calc(18px / var(--sf-zoom, 1));
+	gap: calc(4px / var(--sf-zoom, 1));
+	overflow: hidden;
+}
+
+[data-role='attention.line'] > [data-role='attention.title'],
+[data-role='attention.line'] > [data-role='workspace.title-dim'] {
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+[data-role='attention.chips'] {
+	display: flex;
+	flex: 0 1 auto;
+	flex-direction: row;
+	flex-wrap: nowrap;
+	align-items: center;
+	min-width: 0;
+	margin-left: auto;
+	gap: calc(4px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.chips'] > * {
+	box-sizing: border-box;
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+[data-role='attention.line'] > [data-role='attention.priority'] {
+	flex: 0 0 auto;
+	margin-left: auto;
+	line-height: calc(18px / var(--sf-zoom, 1));
+}
+
+/* A Workspace leaf's state marker appears only when something is abnormal: Waiting, Offline, Exited, Undelivered. */
+[data-role='attention.state'] {
+	font-size: calc(11px / var(--sf-zoom, 1));
+	line-height: calc(16px / var(--sf-zoom, 1));
+	font-weight: 600;
+	color: var(--t1);
+}
+
+[data-role='attention.chips'] > [data-role='attention.state'] {
+	max-width: calc(48px / var(--sf-zoom, 1));
+}
+
+/* A rail row's opened facts close from here, since the row has no chevron. */
+[data-role='attention.collapse'] {
+	align-self: flex-start;
+	height: calc(20px / var(--sf-zoom, 1));
+	padding: 0 calc(8px / var(--sf-zoom, 1));
+	border: 0;
+	border-radius: calc(2px / var(--sf-zoom, 1));
+	background: transparent;
+	color: var(--t2);
+	font: inherit;
+	font-size: calc(11px / var(--sf-zoom, 1));
+	cursor: pointer;
+}
+
+[data-role='attention.collapse']:hover {
+	background: var(--l1);
+	color: var(--t1);
+}
+
+/* Sub-line of a Workspace leaf: the model of a conversation, the kind of any other pane. */
+[data-role='workspace.model'] {
+	flex: none;
+	min-width: 0;
+	max-width: 100%;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: calc(10px / var(--sf-zoom, 1));
+	line-height: calc(13px / var(--sf-zoom, 1));
+	color: var(--t3);
+}
+
+/* ---- Left and right rails: two regions in one native split (the attention stack over Workspace). The split is the
+   canvas root and native sizes its panes, so only typography is set on it. Each region is a flex column that fills
+   its pane and scrolls only its list; if a pane gives the region no definite height it grows to its content and
+   the pane scrolls natively instead. ---- */
+[data-role='attention.regions'] {
+	font-family: var(--sans);
+	font-size: calc(13px / var(--sf-zoom, 1));
+	line-height: calc(18px / var(--sf-zoom, 1));
+	color: var(--t1);
+}
+
+[data-role='attention.region'],
+[data-role='attention.workspace-region'],
+[data-role='attention.region-docked'] {
+	display: flex;
+	flex-direction: column;
+	box-sizing: border-box;
+	height: 100%;
+	min-height: 0;
+	overflow: hidden;
+}
+
+/* The Workspace head is the region's last child, so it hugs the bottom edge in both states: expanded, the tree
+   fills the space above it and the fold icon flips +/− in place; minimized to a sliver, flex-end keeps the lone
+   header on the bottom edge rather than the divider's. */
+[data-role='attention.region-docked'] {
+	justify-content: flex-end;
+}
+
+/* The Workspace well: one step below panel with a hairline lip under the divider, so the
+   queues above read as the raised stratum and the split as a change of depth. */
+[data-role='attention.workspace-region'] {
+	background: light-dark(
+		color-mix(in srgb, var(--panel) 96%, var(--ink)),
+		color-mix(in srgb, var(--panel) 72%, #000)
+	);
+	border-top: 1px solid var(--l3);
+}
+
+/* Top region, pinned line: Next / Previous, then Search and More at the right. The buttons are outlined boxes, so
+   their outer edges sit flush with the session boxes' edges below (no side inset). Buttons are 24px: one row. */
+[data-role='attention.tools-line'] {
+	flex: none;
+	display: flex;
+	flex-direction: row;
+	flex-wrap: nowrap;
+	align-items: center;
+	box-sizing: border-box;
+	min-height: calc(28px / var(--sf-zoom, 1));
+	gap: calc(2px / var(--sf-zoom, 1));
+	padding: calc(2px / var(--sf-zoom, 1)) 0;
+	background: rgb(from var(--panel) r g b / 100%);
+	border-bottom: 1px solid var(--l2);
+}
+
+[data-role='attention.tools-line'] > [data-role='attention.tools'] {
+	flex: 0 0 auto;
+	flex-wrap: nowrap;
+	gap: calc(2px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.tools-line'] > [data-role='attention.utility'] {
+	flex: 0 0 auto;
+	flex-wrap: nowrap;
+	margin-left: auto;
+}
+
+[data-role='attention.tools-line'] [data-role='attention.next'],
+[data-role='attention.tools-line'] [data-role='attention.next-unavailable'],
+[data-role='attention.tools-line'] [data-role='attention.previous'],
+[data-role='attention.tools-line'] [data-role='attention.previous-unavailable'] {
+	box-sizing: border-box;
+	flex: 0 0 auto;
+	width: calc(24px / var(--sf-zoom, 1));
+	height: calc(24px / var(--sf-zoom, 1));
+	padding: calc(4px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.tools-line'] [data-role='attention.next-icon'],
+[data-role='attention.tools-line'] [data-role='attention.previous-icon'] {
+	width: calc(16px / var(--sf-zoom, 1));
+	height: calc(16px / var(--sf-zoom, 1));
+	transform: none;
+}
+
+/* The stack scrolls as one list under the pinned tools line; its sections flow at their natural height. */
+[data-role='attention.stack'] {
+	flex: 1 1 0;
+	min-height: 0;
+	overflow-y: auto;
+}
+
+[data-role='attention.section'] {
+	display: flex;
+	flex-direction: column;
+	flex: none;
+}
+
+[data-role='attention.stack'] [data-role='attention.rows'],
+[data-role='attention.stack'] [data-role='attention.rows-occupied'],
+[data-role='attention.stack'] [data-role='attention.rows-arrival'],
+[data-role='attention.stack'] [data-role='attention.rows-arrival-again'] {
+	flex: none;
+	overflow: visible;
+}
+
+/* Section header (28px): chevron, title and its count in the toggle. */
+[data-role='attention.section-head'] {
+	display: flex;
+	flex-direction: row;
+	flex-wrap: nowrap;
+	align-items: center;
+	box-sizing: border-box;
+	min-width: 0;
+	min-height: calc(28px / var(--sf-zoom, 1));
+	padding-right: 0.5em;
+	background: rgb(from var(--panel) r g b / 100%);
+	border-bottom: 1px solid var(--l1);
+}
+
+[data-role='attention.section-head'] > [data-role='workspace.section'] {
+	flex: 1 1 auto;
+	width: auto;
+	min-width: 0;
+	min-height: calc(28px / var(--sf-zoom, 1));
+}
+
+/* Workspace region header: pinned above the scrolled tree, never scrolled content. */
+[data-role='attention.region-head'] {
+	flex: none;
+	display: flex;
+	flex-direction: column;
+	box-sizing: border-box;
+	padding: 0 calc(8px / var(--sf-zoom, 1));
+	background: rgb(from var(--panel) r g b / 100%);
+	border-top: 1px solid var(--l2);
+	border-bottom: 1px solid var(--l2);
+}
+
+
+[data-role='attention.section-title'] {
+	display: flex;
+	flex: 1 1 auto;
+	flex-direction: row;
+	flex-wrap: nowrap;
+	align-items: center;
+	min-width: 0;
+	gap: calc(6px / var(--sf-zoom, 1));
+	padding: 0.25em 0;
+	font-size: calc(12px / var(--sf-zoom, 1));
+	color: var(--t3);
+}
+
+/* The Workspace head line is the place card: an elevated object, not a section header. Like the current session's
+   box, its monochrome ring, tint and dot say "you are here"; the fold icon sits outside it. */
+[data-role='attention.region-head'] > [data-role='attention.section-head'] > [data-role='attention.location'] {
+	flex: 1 1 auto;
+	min-width: 0;
+	align-items: center;
+	justify-content: flex-start;
+	flex-direction: row;
+	padding: calc(5px / var(--sf-zoom, 1)) calc(8px / var(--sf-zoom, 1));
+	border: 1px solid rgb(from var(--t1) r g b / 55%);
+	border-radius: calc(6px / var(--sf-zoom, 1));
+	background: rgb(from var(--t1) r g b / 10%);
+	font-size: calc(12px / var(--sf-zoom, 1));
+	color: var(--t3);
+}
+
+[data-role='attention.region-head'] > [data-role='attention.section-head'] > [data-role='attention.location']:hover {
+	background: rgb(from var(--t1) r g b / 16%);
+}
+
+/* The place card is one line, like a rail queue row: the session column, then the dot and the tab's name. */
+[data-role='attention.region-head'] > [data-role='attention.section-head'] > [data-role='attention.location'] > [data-role='attention.line'] {
+	flex: 1 1 auto;
+	min-width: 0;
+	align-items: center;
+	gap: calc(6px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.region-head'] > [data-role='attention.section-head'] > [data-role='attention.location'] > [data-role='attention.line'] > [data-role='workspace.title'] {
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--t1);
+}
+
+[data-role='attention.region-head'] > [data-role='attention.section-head'] > [data-role='attention.location'] > [data-role='attention.line'] > [data-role='workspace.place-dot'] {
+	flex: 0 0 auto;
+	color: var(--t1);
+	font-size: calc(9px / var(--sf-zoom, 1));
+}
+
+[data-role='attention.region-head'] > [data-role='attention.section-head'] > [data-role='attention.section-title'] > [data-role='workspace.title'],
+[data-role='attention.region-head'] > [data-role='attention.section-head'] > [data-role='attention.location'] > [data-role='workspace.title'] {
+	flex: 0 1 auto;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+[data-role='attention.region-head'] > [data-role='attention.section-head'] > [data-role='attention.section-title'] > [data-role='workspace.session'] {
+	flex: 0 0 auto;
+	white-space: nowrap;
 }
 
 /* Block `attention.queue` is read on a phone: rows, the section control and the dock button are touch sized. */
@@ -914,3 +1531,288 @@
 	height: 44px;
 	font-size: 15px;
 }
+
+/* Between tabs inside a session box, a thin rule in the same foreground family as the box edge (one step softer, so
+   the box still reads as the group); boxes sit further apart (their margin) than the rows inside. */
+[data-role='workspace.ledger-rows'] > * + * {
+	border-top: 1px solid rgb(from var(--t1) r g b / 18%);
+}
+
+/* One host's empty sessions: a quiet "No tabs" label above one row of names, each a small box like a session's, the
+   button that opens a tab there. The row never wraps; past the pane's width it scrolls sideways (trackpad or
+   shift-wheel), with a thin scrollbar. */
+[data-role='workspace.empty-line'] {
+	display: flex;
+	flex-direction: column;
+	align-items: stretch;
+	box-sizing: border-box;
+	min-width: 0;
+	gap: calc(4px / var(--sf-zoom, 1));
+	padding: calc(2px / var(--sf-zoom, 1)) 0 calc(6px / var(--sf-zoom, 1));
+	font-size: calc(12px / var(--sf-zoom, 1));
+}
+
+[data-role='workspace.sub-toggle'] {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	justify-content: center;
+	gap: calc(6px / var(--sf-zoom, 1));
+	align-self: stretch;
+	padding: calc(3px / var(--sf-zoom, 1)) calc(8px / var(--sf-zoom, 1));
+	border: 0;
+	border-radius: calc(2px / var(--sf-zoom, 1));
+	background: transparent;
+	color: var(--t3);
+	font: inherit;
+	cursor: pointer;
+}
+
+[data-role='workspace.sub-toggle']:hover {
+	background: var(--l1);
+	color: var(--t1);
+}
+
+[data-role='workspace.sub-label'] {
+	flex: 0 0 auto;
+	color: inherit;
+}
+
+[data-role='workspace.empty-names'] {
+	display: flex;
+	flex-direction: row;
+	flex-wrap: nowrap;
+	gap: calc(4px / var(--sf-zoom, 1));
+	min-width: 0;
+	overflow-x: auto;
+	overflow-y: hidden;
+	padding-bottom: calc(4px / var(--sf-zoom, 1));
+	scrollbar-width: thin;
+}
+
+/* Centred while the names fit; auto margins (unlike justify-content: center) fall to zero once the row overflows, so
+   scrolling still reaches the first name. */
+[data-role='workspace.empty-names'] > :first-child {
+	margin-left: auto;
+}
+
+[data-role='workspace.empty-names'] > :last-child {
+	margin-right: auto;
+}
+
+[data-role='workspace.empty-name'] {
+	flex: 0 0 auto;
+	padding: calc(3px / var(--sf-zoom, 1)) calc(10px / var(--sf-zoom, 1));
+	border: 1px solid rgb(from var(--t1) r g b / 24%);
+	border-radius: calc(2px / var(--sf-zoom, 1));
+	background: rgb(from var(--t1) r g b / 4%);
+	color: var(--t1);
+	font: inherit;
+	font-weight: 600;
+	white-space: nowrap;
+	cursor: pointer;
+}
+
+[data-role='workspace.empty-name']:hover {
+	background: rgb(from var(--t1) r g b / 10%);
+}
+
+/* Toolbar buttons (Next, Previous, Search, Settings) read as buttons: the session box's edge and tint, a brighter step
+   on hover, the current-session ring while Settings is open. Unavailable keeps the edge (still a button) without the
+   fill; its dimmed icon says it is disabled. */
+[data-role='attention.next'],
+[data-role='attention.previous'],
+[data-role='attention.search'],
+[data-role='attention.gear'],
+[data-role='attention.gear-selected'],
+[data-role='attention.next-unavailable'],
+[data-role='attention.previous-unavailable'],
+[data-role='attention.search-unavailable'] {
+	border: 1px solid rgb(from var(--t1) r g b / 24%);
+	background: rgb(from var(--t1) r g b / 4%);
+}
+
+[data-role='attention.next']:hover,
+[data-role='attention.previous']:hover,
+[data-role='attention.search']:hover,
+[data-role='attention.gear']:hover {
+	background: rgb(from var(--t1) r g b / 10%);
+}
+
+[data-role='attention.gear-selected'] {
+	border-color: rgb(from var(--t1) r g b / 55%);
+	background: rgb(from var(--t1) r g b / 10%);
+}
+
+[data-role='attention.next-unavailable'],
+[data-role='attention.previous-unavailable'],
+[data-role='attention.search-unavailable'] {
+	background: transparent;
+}
+
+/* Top-level headers: Working, Attention, and each host. A labelled divider, not a band: the ALL-CAPS label, letter-
+   spaced, centred between thin rules that run out to the edges (stopping short of a header's ⋯), with its count in
+   parentheses. Hover brightens the label only; a band would be one more filled rectangle. */
+[data-role='attention.stack'] [data-role='attention.section-head'] {
+	background: transparent;
+	border-bottom: 0;
+}
+
+[data-role='attention.stack'] [data-role='workspace.section'],
+[data-role='workspace.host-row'] {
+	gap: calc(8px / var(--sf-zoom, 1));
+	color: var(--t2);
+}
+
+[data-role='attention.stack'] [data-role='workspace.section']::before,
+[data-role='attention.stack'] [data-role='workspace.section']::after,
+[data-role='workspace.host-row']::before,
+[data-role='workspace.host-row']::after {
+	content: "";
+	flex: 1 1 0;
+	min-width: calc(12px / var(--sf-zoom, 1));
+	height: 1px;
+	background: rgb(from var(--t1) r g b / 24%);
+}
+
+[data-role='attention.stack'] [data-role='workspace.section'] [data-role='workspace.title'],
+[data-role='workspace.host-title'] {
+	font-size: calc(11px / var(--sf-zoom, 1));
+	font-weight: 600;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: inherit;
+}
+
+[data-role='attention.stack'] [data-role='workspace.section'] [data-role='workspace.count']::before { content: "("; }
+[data-role='attention.stack'] [data-role='workspace.section'] [data-role='workspace.count']::after { content: ")"; }
+
+[data-role='attention.stack'] [data-role='workspace.section'] [data-role='workspace.count'],
+[data-role='workspace.host-suffix'] {
+	font-size: calc(11px / var(--sf-zoom, 1));
+	color: var(--t3);
+}
+
+[data-role='attention.stack'] [data-role='workspace.section']:hover,
+[data-role='workspace.host-row']:hover {
+	background: transparent;
+	color: var(--t1);
+}
+
+/* Minimized and No tabs sit inside a host: the same labelled divider at half the pane's width, centred, so each reads as
+   a part of that host rather than a new one. */
+[data-role='workspace.sub-toggle'] {
+	align-self: center;
+	width: 50%;
+	min-width: calc(160px / var(--sf-zoom, 1));
+	gap: calc(8px / var(--sf-zoom, 1));
+	color: var(--t2);
+}
+
+[data-role='workspace.sub-toggle']::before,
+[data-role='workspace.sub-toggle']::after {
+	content: "";
+	flex: 1 1 0;
+	min-width: calc(12px / var(--sf-zoom, 1));
+	height: 1px;
+	background: rgb(from var(--t1) r g b / 24%);
+}
+
+[data-role='workspace.sub-toggle'] [data-role='workspace.sub-label'] {
+	font-size: calc(11px / var(--sf-zoom, 1));
+	font-weight: 600;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	white-space: nowrap;
+}
+
+[data-role='workspace.sub-toggle']:hover {
+	background: transparent;
+	color: var(--t1);
+}
+
+/* A session box's left edge: a full-height − (minimize) or + (restore) strip, its own column before the name. Its hit
+   area reaches down across the gap to the next box, so repeated clicks without moving the pointer never land in dead
+   space as boxes slide up. */
+[data-role='workspace.ledger-edge'] {
+	position: relative;
+	display: flex;
+	flex: 0 0 calc(14px / var(--sf-zoom, 1));
+	align-self: stretch;
+	height: auto;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	padding: 0;
+	border: 0;
+	border-right: 1px solid rgb(from var(--t1) r g b / 18%);
+	border-radius: 0;
+	background: transparent;
+	color: var(--t3);
+	font: inherit;
+	font-size: calc(12px / var(--sf-zoom, 1));
+	line-height: 1;
+	cursor: pointer;
+}
+
+[data-role='workspace.ledger-edge']::after {
+	content: "";
+	position: absolute;
+	left: -1px;
+	right: 0;
+	top: 100%;
+	height: calc(6px / var(--sf-zoom, 1));
+}
+
+[data-role='workspace.ledger-edge']:hover {
+	background: rgb(from var(--t1) r g b / 10%);
+	color: var(--t1);
+}
+
+/* A minimized box: one short line, its tab count where the rows would be. */
+[data-role='workspace.ledger-count'] {
+	display: flex;
+	align-items: center;
+	min-height: calc(26px / var(--sf-zoom, 1));
+	padding-left: calc(12px / var(--sf-zoom, 1));
+	font-size: calc(12px / var(--sf-zoom, 1));
+	color: var(--t3);
+}
+
+[data-role='workspace.minimized-boxes'] > [data-role='workspace.ledger'],
+[data-role='workspace.minimized-boxes'] > [data-role='workspace.ledger-current'] {
+	min-height: 0;
+}
+
+[data-role='workspace.minimized-boxes'] [data-role='workspace.ledger-label'] {
+	padding-top: 0;
+	padding-bottom: 0;
+}
+
+[data-role='workspace.minimized-line'] {
+	display: flex;
+	flex-direction: column;
+	align-items: stretch;
+	gap: calc(4px / var(--sf-zoom, 1));
+	padding-top: calc(2px / var(--sf-zoom, 1));
+	font-size: calc(12px / var(--sf-zoom, 1));
+}
+
+/* A rail queue title wraps to at most two lines; Workspace titles stay on one. Its line grows with it, so the
+   model line sits below rather than under it. */
+[data-role='attention.rail-session-cell'] + [data-role='attention.body'] > [data-role='attention.line'] {
+	height: auto;
+	min-height: calc(18px / var(--sf-zoom, 1));
+	align-items: flex-start;
+}
+
+[data-role='attention.rail-session-cell'] + [data-role='attention.body'] > [data-role='attention.line'] > [data-role='attention.title'] {
+	line-height: calc(18px / var(--sf-zoom, 1));
+	display: -webkit-box;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	overflow: hidden;
+	white-space: normal;
+	overflow-wrap: anywhere;
+}
+

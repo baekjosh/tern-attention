@@ -25,26 +25,26 @@ class NativeStartup(unittest.TestCase):
                          timeout=10, pump=True, what="rendered Attention controls")
             previous = None
 
-            def stationary_later():
+            def stationary_working():
                 nonlocal previous
                 current = next(node for node in app.tree("button")["nodes"]
-                               if str(node.get("title", "")).startswith("Later"))
+                               if str(node.get("title", "")).startswith(("Currently working", "Working")))
                 stable = previous is not None and current["rect"] == previous["rect"]
                 previous = current
                 return current if stable else None
 
-            later = app.wait_for(stationary_later, timeout=5, interval=0.25, pump=True,
-                                 what="settled Later button")
-            x, y, width, height = later["rect"]
+            working = app.wait_for(stationary_working, timeout=5, interval=0.25, pump=True,
+                                   what="settled Working button")
+            x, y, width, height = working["rect"]
             app.ctl("click", f"{x + width / 2:.1f}", f"{y + height / 2:.1f}")
 
-            def showing_later():
+            def showing_working():
                 prefs = (app.kv("attention") or {}).get("preferences") or {}
-                return any(state.get("section") == "later"
+                return any(state.get("section") == "working"
                            for state in prefs.get("uiByWindow", {}).values())
 
-            app.wait_for(showing_later, timeout=5, pump=True,
-                         what="Later selection persisted after the native click")
+            app.wait_for(showing_working, timeout=5, pump=True,
+                         what="Working selection persisted after the native click")
 
 
 if __name__ == "__main__":

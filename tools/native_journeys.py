@@ -4,20 +4,22 @@
 Subcommands (each prints one JSON report on stdout; `--log FILE` also appends a Markdown log):
 
     j1   geometry   content-tree classes -> canonical outer rail on --edge (bottom default; right/left on request)
-    j2   workspace  ~6 sessions / ~35 tabs / notes / browser / parked / floating; Workspace list in the rail
+    j2   workspace  ~6 sessions / ~35 tabs / notes / browser / parked / floating; the Workspace list read by scrolling: one row per session, one per tab (panes inside a tab are not rows), one per parked pane; header `Workspace · N tabs`; no paging controls, no "places" wording
     j3   search     palette "Search workspace" picker: completeness, narrowing, Enter focuses, Escape inert
     j4   recovery   settings.json untouched by Attention; disable leaves native actions working
     j5   window     what window-ownership facts are observable headless
-    j6   pager      Workspace pager lives in the non-sticky header: visible at scroll top and after scrolling
+    j6   list       Workspace header reads `Workspace · N tabs`; no paging controls at scroll top, after scrolling, or at the list bottom; the pinned header does not move; the last tab row is reached by scrolling; no "N more not shown" footer while the list is under its cap (200 rows or 1500 canvas nodes, whichever comes first)
+    j7   wide rail  1839x1135 left rail, always on the left edge: Reveal location line, two-region structure, model sub-line absent in a shell-only world, best-effort agent presence, then the Settings "Rail placement" press as the all-tabs move to Left (selected tab at once, another tab on its visit, toast counts, default recorded)
+    j8   reorder    manual reorder through the ⋯ menus: on the left rail a queue section (to the top, then to the bottom), a session (display order stored per host, native session order untouched) and a tab (native order_tab, read back); on the bottom strip the queue tabs in order with Workspace last and no reorder chrome
     all  every journey above
     migration  read-only copy of the real kv.json -> schema 4, `relocate` stripped, triage deep diff 0, no tmp files, idempotent reload (not in `all`)
     adoption   synthetic pre-position store over rails at bottom/right/left, plugin reload: positions adopted, nothing moves, second load writes nothing (not in `all`)
-    shots      screenshots of the bottom strip (Attention, Workspace, Later, Settings) at 1280x800 and 1839x1135 with a read-only copy of the real store (not in `all`)
+    shots      screenshots of the bottom strip (Attention, Currently working, Workspace as one row per session and tab, Settings) at 1280x800 and 1839x1135 with a read-only copy of the real store (not in `all`)
     phone      `--package <pkg> [--phone-package dist/attention-phone]`: real window half publishes phone.json (contract, counts = rail badges, heartbeat-only rewrites), the
-               host block `attention.queue` at 390x844 (rows, Later, disable/enable, ping), tap-to-jump in the phone package (pane found by title even when its cwd/program differ, a
+               host block `attention.queue` at 390x844 (rows, disable/enable, ping), tap-to-jump in the phone package (pane found by title even when its cwd/program differ, a
                conversation in another session found after switching to it, parked never moved) (not in `all`)
 
-Journeys j2-j6 and `all` run once per rail edge (`--edge`, default bottom; `all` runs bottom then left). The bottom pass uses 1839x1135 because a bottom strip is
+Journeys j2-j6 and `all` run once per rail edge (`--edge`, default bottom; `all` runs bottom then left); j7 runs once, on the left edge; j8 runs once and drives the left rail and the bottom strip itself. The bottom pass uses 1839x1135 because a bottom strip is
 only ~20 % of the tab height; the left pass keeps the compact viewport its geometry was calibrated on.
 
 The package comes from `python3 tools/install.py --prepare-only` (run automatically unless --package is given;
@@ -202,10 +204,13 @@ CLASSES = {
 # Tabs with more than layout.MAX_CONTENT_LEAVES (16) leaves keep the rail beside the first pane by design.
 DEGRADED_BY_DESIGN = {"seventeen-leaves": "Too many panes to place Attention full-height"}
 
-# When the native minimum pane size (~93 px wide, ~55 px high) prevents the content ratios or the requested rail size,
-# the engine still places the rail, reports this status, and keeps the rail at or above MIN_RAIL_SHARE when native allows.
+# The rail's requested share (INITIAL_SHARE in window.luau) and how far a placed rail may land from it. The tolerance is
+# 1.5 native cells of a 700 px wide left edge (about 100 cells, from the fit traces), the coarsest viewport this journey
+# runs. When the native minimum pane size (~93 px wide, ~55 px high) limits the content or the rail, the engine reports
+# MINIMUM_REASON: that names the cause and never excuses a rail away from the requested share.
+REQUESTED_SHARE = 0.25
+RAIL_SHARE_TOLERANCE = 0.015
 MINIMUM_REASON = "Pane sizes limited by the native minimum"
-MIN_RAIL_SHARE = 0.2
 
 DEFAULT_EDGE = "bottom"
 EDGES = ("bottom", "right", "left")
@@ -222,10 +227,9 @@ def rail_content(root, rail, edge):
 
 
 def seeded_position(edge):
-    """kv.json seed that makes `edge` the default position for new rails (bottom is the built-in default)."""
-    if edge == DEFAULT_EDGE:
-        return None
-    preferences = {"schema": 4, "enabled": False, "backlogAfterSeconds": 0,
+    """kv.json seed that makes `edge` the stored default position for new rails. Every edge seeds, including
+    bottom: the plugin's built-in default is left, and a journey must never depend on which way it points."""
+    preferences = {"schema": 4, "enabled": False,
                    "defaults": {"position": edge, "shares": {"left": {}, "bottom": {}, "right": {}}, "hidden": {}},
                    "instances": {}, "uiByWindow": {}}
     return {f"plugin-data/{PLUGIN}/kv.json": json.dumps({"preferences": preferences}).encode()}
@@ -337,6 +341,7 @@ def j1_class(package, name, ops, width, height, log, edge=DEFAULT_EDGE):
         content_after = rail_content(lay_after["root"], facts_after["rails"][0], edge) if len(facts_after["rails"]) == 1 else None
         result = {
             "edge": edge, "class": name, "viewport": f"{width}x{height}", "panes": len(panes),
+            "launches": T.launches,
             "placedAtSeconds": placed_at, "firstNudgeAtSeconds": first_nudge, "nudges": nudges,
             "stableAfter3s": ok_after, "railsInTab": facts_after["rails"], "railsInWindow": rail_count_all,
             "rootSplit": facts_after["rootSplit"], "rootRatio": facts_after["rootRatio"],
@@ -361,12 +366,13 @@ def j1_class(package, name, ops, width, height, log, edge=DEFAULT_EDGE):
                                   and result["focusUnchanged"] and rail_count_all == 1)
             result["expected"] = "degraded: " + DEGRADED_BY_DESIGN[name]
         else:
-            # Placed (canonical outer rail, content identity/axes/order and floats intact, stable for 3 s), either
-            # clean or degraded by the native minimum with that exact status; never a sliver.
+            # Placed (canonical outer rail, content identity/axes/order and floats intact, stable for 3 s) at the
+            # requested share, either clean or with the native-minimum status; the status never excuses the share.
             result["pass"] = bool(placed_at is not None and ok_after and len(facts_after["rails"]) == 1
                                   and result["focusUnchanged"] and rail_count_all == 1
                                   and (result["status"] == "Ready in this tab" or result["limitedByMinimum"])
-                                  and result["railShare"] is not None and result["railShare"] >= MIN_RAIL_SHARE)
+                                  and result["railShare"] is not None
+                                  and abs(result["railShare"] - REQUESTED_SHARE) <= RAIL_SHARE_TOLERANCE)
         result["outcome"] = "pass" if result["pass"] else "fail"
         log(f"- **{name}** [{edge}] {width}x{height}: {result['outcome'].upper()} placed@{placed_at}s "
             f"(nudges {nudges}, first at {first_nudge}s) phase={result['phase']} status={result['status']!r} "
@@ -380,8 +386,6 @@ def j1(package, log, viewports=((1280, 800), (700, 400)), classes=None, edges=(D
     for edge in edges:
         for width, height in viewports:
             names = classes or list(CLASSES)
-            if (width, height) == (700, 400) and classes is None:
-                names = ["single", "two-side-by-side", "grid-2x2", "single-plus-float", "four-in-a-row", "five-in-a-row"]
             for name in names:
                 for attempt in range(3):
                     try:
@@ -392,6 +396,14 @@ def j1(package, log, viewports=((1280, 800), (700, 400)), classes=None, edges=(D
                         if "slice budget" not in str(error) or attempt == 2:
                             raise
                         log(f"- NOTE J1 {name} [{edge}] {width}x{height}: harness build hit the 50 ms slice budget; retrying on a fresh instance")
+                    except nh.HarnessError as error:
+                        # Tern never loaded the plugin in this class's instance (paused past its load budget on every launch):
+                        # the class is a FAIL row with its error, and the matrix goes on so the denominator stays complete.
+                        message = f"{type(error).__name__}: {str(error).splitlines()[0]}"
+                        results.append({"edge": edge, "class": name, "viewport": f"{width}x{height}", "outcome": "fail",
+                                        "pass": False, "error": message})
+                        log(f"- FAIL **{name}** [{edge}] {width}x{height}: {message}")
+                        break
     outcomes = [item["outcome"] for item in results]
     return {"journey": "J1", "pass": "fail" not in outcomes, "outcomes": {key: outcomes.count(key) for key in sorted(set(outcomes))},
             "results": results}
@@ -403,8 +415,15 @@ def j1(package, log, viewports=((1280, 800), (700, 400)), classes=None, edges=(D
 # ---------------------------------------------------------------------------------------------
 
 SESSIONS = ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot")
-PAGER = re.compile(r"(\d+)\u2013(\d+) of (\d+)")
-GROUP = re.compile(r"^Go to \u00b7 (.+) \u00b7 (\d+) places?$")
+# The Workspace header (`Workspace · N tabs`), the "N more not shown" footer, and the wording/controls that must not exist any more.
+HEADER = re.compile(r"Workspace\s*(?:\u00b7\s*)?(\d+) tabs?\b")
+MORE_NOT_SHOWN = re.compile(r"(\d+) more not shown \u00b7 Search reaches them")
+PLACES = re.compile(r"\bplaces?\b", re.IGNORECASE)
+PAGE_RANGE = re.compile(r"\d+\u2013\d+ of \d+")
+PAGING_ROLES = ("attention.pagination", "attention.page-control")
+ROW_LIMIT = 200  # the "N more not shown" footer appears at 200 rows or 1500 canvas nodes, whichever comes first (view.luau MAX_CANVAS_ROWS / MAX_CANVAS_NODES); this journey's world stays far under both
+MAX_SCROLL_STEPS = 200  # wheel steps down one Workspace list before the scroll-and-read gives up
+MAX_OPEN_PASSES = 4  # read-and-open rounds that must leave no closed session in a rail
 
 
 class Checks:
@@ -508,32 +527,133 @@ def nodes(T, selector):
     return T.tree(selector).get("nodes") or []
 
 
+def stacked_edge():
+    """Left and right rails are one two-region stack (attention sections over Workspace); the bottom strip is one list."""
+    return RUN["edge"] != DEFAULT_EDGE
+
+
+def workspace_head(T):
+    """Rectangle of the Workspace region's pinned header (current place, fold control, location line) on a rail, else None."""
+    found = nodes(T, "[data-role='attention.region-head']") if stacked_edge() else []
+    return found[0]["rect"] if found else None
+
+
+def in_rect(node, rect):
+    x, y = node["rect"][0], node["rect"][1]
+    return rect[0] - 0.5 <= x <= rect[0] + rect[2] and rect[1] - 0.5 <= y <= rect[1] + rect[3]
+
+
+def hover_list(T):
+    """Park the pointer over the scrolling Workspace list so wheel events scroll it (a rail's centre is its divider)."""
+    T.ctl("hover", "[data-role='attention.workspace-rows']" if stacked_edge() else "[data-surface]")
+
+
+ROW_PREFIXES = ("Go to \u00b7 ", "Minimize \u00b7 ", "Restore \u00b7 ", "Collapse \u00b7 ", "Expand \u00b7 ")
+CLOSED_PREFIXES = ("Restore \u00b7 ", "Expand \u00b7 ")
+
+
 def ws_buttons(T):
-    """Workspace row buttons in document order (the DOM holds the whole page, visible or scrolled out)."""
-    return [n for n in nodes(T, "button") if str(n.get("title", "")).startswith(("Go to \u00b7 ", "Collapse \u00b7 ", "Expand \u00b7 "))]
+    """Workspace row buttons in document order (the tree lists only rows near the visible window, so read the list while scrolling):
+    tab rows (Go to), a session box's edge strip (Minimize/Restore), and Parked/Unattached sections (Collapse/Expand)."""
+    return [n for n in nodes(T, "button") if str(n.get("title", "")).startswith(ROW_PREFIXES)]
 
 
 def row_titles(T):
     return [n["title"] for n in ws_buttons(T)]
 
 
-def page_button(T, label):
-    found = [n for n in nodes(T, "button") if str(n.get("title", "")).startswith(label)]
-    return found[0] if found else None
+def header_rect(T):
+    """Rectangle of the pinned Workspace header: the region header on a left/right rail, the bounded header group on the strip."""
+    role = "attention.region-head" if stacked_edge() else "attention.header"
+    found = nodes(T, f"[data-role='{role}']")
+    return found[0]["rect"] if found else None
 
 
-def find_page_button(T, label):
-    """The Next/Previous page button. The pager is the last row of the bounded header group, so it is on screen at every
-    scroll offset; None when the list really has no such button."""
-    return page_button(T, label)
+def header_strings(T):
+    """Every text and tooltip inside the pinned Workspace header."""
+    rect = header_rect(T)
+    found = []
+    if rect is None:
+        return found
+    for node in nodes(T, "[data-role]") + nodes(T, "button"):
+        if in_rect(node, rect):
+            for value in (node.get("text"), node.get("title")):
+                if value and value not in found:
+                    found.append(value)
+    return found
 
 
-def pager_text(T):
+def header_tab_count(T):
+    """(N, strings): N from the header's `Workspace · N tabs` (None when no header string matches) and the header's strings."""
+    strings = header_strings(T)
+    for value in strings:
+        match = HEADER.search(value)
+        if match:
+            return int(match.group(1)), strings
+    return None, strings
+
+def workspace_head_names(T):
+    """(title, session): the stacked Workspace header's current tab title and `· session` strings (None when absent)."""
+    rect = header_rect(T)
+    if rect is None:
+        return None, None
+    title, session = None, None
+    for node in nodes(T, "[data-role='workspace.title']"):
+        if in_rect(node, rect) and node.get("text"):
+            title = str(node["text"])
+    for node in nodes(T, "[data-role='workspace.session']"):
+        if in_rect(node, rect) and node.get("text"):
+            session = str(node["text"])
+    return title, session
+
+
+def check_workspace_header(check, T):
+    """The stacked Workspace header names the current tab and its session, and never retells the tree's size."""
+    title, session = workspace_head_names(T)
+    strings = header_strings(T)
+    reveal = button_by_title(T, "Reveal in Workspace")
+    session_name = session.lstrip("\u00b7 ") if session else None
+    check("header-reads-current-tab-and-session",
+          title is not None and title != "Workspace" and session is not None
+          and not any(HEADER.search(value) for value in strings)
+          and (reveal is None or session_name in reveal["title"]),
+          {"title": title, "session": session, "reveal": reveal and reveal["title"], "header": strings[:6]})
+
+
+def removed_paging_nodes(T):
+    """Leftovers of the removed paging controls anywhere in the rail: their role nodes, Next/Previous page buttons, or the
+    `N–M of K` range text. Empty when the rail has none. The tools line's "Next attention" is a different control and never matches."""
+    found = []
+    for role in PAGING_ROLES:
+        found += [role for _ in nodes(T, f"[data-role='{role}']")]
+    found += [str(n.get("title")) for n in nodes(T, "button") if str(n.get("title", "")).startswith(("Next page", "Previous page"))]
     for node in nodes(T, "[data-role]"):
-        match = PAGER.search(node.get("text", "") or "")
+        match = PAGE_RANGE.search(node.get("text", "") or "")
+        if match:
+            found.append(match.group(0))
+    return found
+
+
+def more_footer(T):
+    """The list footer `N more not shown · Search reaches them`, or None when the list shows none."""
+    for node in nodes(T, "[data-role]"):
+        match = MORE_NOT_SHOWN.search(node.get("text", "") or "")
         if match:
             return match.group(0)
     return None
+
+
+def places_wording(T):
+    """Texts and tooltips in the Workspace that still say "place(s)": below the region header on a rail, anywhere on the strip."""
+    floor = ((workspace_head(T) or [0, 0])[1] - 0.5) if stacked_edge() else None
+    found = []
+    for node in nodes(T, "[data-role]") + nodes(T, "button"):
+        if floor is not None and node["rect"][1] < floor:
+            continue
+        for value in (node.get("text"), node.get("title")):
+            if value and PLACES.search(value) and value not in found:
+                found.append(value)
+    return found
 
 
 def pump_until(T, predicate, timeout=8.0, what="UI"):
@@ -585,12 +705,17 @@ def click_until(T, finder, effect, what, tries=3, timeout=4.0):
 
 
 def region(T):
-    """(top, bottom) of the scrolling list area: below the bounded header, above the pager."""
+    """(top, bottom) of the scrolling list area: below the bounded header."""
     surface = nodes(T, "[data-surface]")[0]["rect"]
-    sticky = [n for n in nodes(T, "[data-role]") if re.match(r"Attention\d+Later\d+Currently working\d+Workspace", str(n.get("text", "")))
+    bottom = surface[1] + surface[3]
+    if stacked_edge():
+        # The list is Workspace's: it starts under that region's pinned header, wherever the divider sits.
+        head = workspace_head(T)
+        return (head[1] + head[3] if head else surface[1]), bottom
+    # Rail headers (left/right) read "Working"; the bottom strip reads "Currently working".
+    sticky = [n for n in nodes(T, "[data-role]") if re.match(r"Attention\d+(?:Currently working|Working)\d+Workspace", str(n.get("text", "")))
               and abs(n["rect"][1] - surface[1]) < 3 and n["rect"][3] < 400]
     top = min(n["rect"][1] + n["rect"][3] for n in sticky) if sticky else surface[1]
-    bottom = surface[1] + surface[3]
     return top, bottom
 
 
@@ -600,7 +725,7 @@ def is_visible(T, node):
 
 def at_top(T):
     """Scroll the rail's list back to its first row (rows scrolled above the list area are not in the tree)."""
-    T.ctl("hover", "[data-surface]")
+    hover_list(T)
     T.wheel(0, -6000)
     T.pump()
     time.sleep(0.2)
@@ -627,10 +752,42 @@ def scroll_to(T, finder, limit=14):
     raise nh.WaitTimeout("row never scrolled into view")
 
 
+def settings_box(T):
+    """The Settings page's scrolling box (the page clips its rows to it), or None when Settings is closed."""
+    return next((n["rect"] for n in nodes(T, "[data-role='attention.settings']")), None)
+
+
+def reveal_placement(T, label, limit=8):
+    """The Rail placement button `label`, wheeled into the Settings box so a click lands on it. A short bottom strip clips
+    the placement row at its edge (the Back heading sits above it), and `click_node` aims at the button's centre, which a clip
+    would swallow. Returns None when the row is absent."""
+    T.ctl("hover", "[data-role='attention.settings']")
+    for _ in range(limit):
+        control, box = placement_controls(T).get(label), settings_box(T)
+        if control is None or box is None:
+            return control
+        if box[1] <= control["rect"][1] and control["rect"][1] + control["rect"][3] <= box[1] + box[3]:
+            return control
+        T.wheel(0, 60)
+        T.pump()
+        time.sleep(0.15)
+    return placement_controls(T).get(label)
+
+
+def settings_to_top(T):
+    """Scroll the Settings page back to its heading: the placement reveal leaves the page scrolled in a short strip."""
+    if settings_box(T) is None:
+        return
+    T.ctl("hover", "[data-role='attention.settings']")
+    T.wheel(0, -6000)
+    T.pump()
+    time.sleep(0.2)
+
+
 def overflowing_rows(T):
     """Leaf rows whose wrapped context line lies below the row box (it paints over the next row). Every context line is
     owned by the nearest row button at or above it; on a healthy row it sits on the title's line (~1 px below the row top)."""
-    buttons = [n for n in ws_buttons(T) if n["title"].startswith("Go to \u00b7 ") and not GROUP.match(n["title"])]
+    buttons = [n for n in ws_buttons(T) if n["title"].startswith("Go to \u00b7 ")]
     lines = [n for n in nodes(T, "[data-role]") if "gap-xs wrap" in str(n.get("class", "")) and n.get("text")]
     bad = []
     for line in lines:
@@ -648,8 +805,10 @@ def overflowing_rows(T):
 def rail_ready(T, rail_tab):
     """Wait until the rail has rendered its mode buttons and utility row (actions are bound only after that)."""
     def ready():
-        return (button_by_title(T, "Attention \u00b7") is not None and button_by_title(T, "Search") is not None
-                and (button_by_title(T, "More \u00b7") is not None or button_by_title(T, "Return to") is not None))
+        modes = (button_by_title(T, "Hide \u00b7 Attention") or button_by_title(T, "Show \u00b7 Attention")) if stacked_edge() \
+            else button_by_title(T, "Attention \u00b7")
+        return (modes is not None and button_by_title(T, "Search") is not None
+                and (button_by_title(T, "More \u00b7") is not None or button_by_title(T, "Back to") is not None or button_by_title(T, "Return to") is not None))
     pump_until(T, ready, 10, "rail rendered")
 
 
@@ -664,46 +823,89 @@ def enable_and_place(T, world):
 
 
 def show_workspace(T):
-    click_until(T, lambda: page_button_text(T, "Workspace"),
-                lambda: any(t.startswith("Collapse \u00b7 ") for t in row_titles(T)), "Workspace section")
+    if stacked_edge():
+        # Workspace is always on screen in a rail; its sessions may start closed, so open each one to list the same tree as
+        # the strip. The tree holds only rows near the window, so closed sessions are found by reading the list top to
+        # bottom, and the pointer must hover the Workspace list (a rail's centre is the divider) before wheel-scrolling to a row.
+        pump_until(T, lambda: ws_buttons(T), 10, "workspace rows")
+        for _ in range(MAX_OPEN_PASSES):
+            closed = closed_rows(T)
+            if not closed:
+                at_top(T)
+                return
+            for title in closed:
+                hover_list(T)
+                click_until(T, lambda: scroll_find(T, title),
+                            lambda: all(n["title"] != title for n in ws_buttons(T)), f"open {title}")
+        raise nh.WaitTimeout("rail sessions never finished opening")
+    click_until(T, lambda: button_by_title(T, "Workspace \u00b7"),
+                lambda: any(t.startswith(ROW_PREFIXES[1:]) for t in row_titles(T)), "Workspace section")
 
 
-def page_button_text(T, text):
-    found = [n for n in nodes(T, "button") if n.get("text") == text]
-    return found[0] if found else None
+def list_signature(T):
+    """The listed Workspace rows with their rectangles: it changes whenever a wheel step moves the list."""
+    return tuple((n["title"], tuple(n["rect"])) for n in ws_buttons(T))
 
 
-def goto_page(T, label):
-    """Click Next/Previous page and wait for the page indicator (`41–50 of 50 rows`) to change."""
-    before = pager_text(T)
-    click_until(T, lambda: find_page_button(T, label), lambda: pager_text(T) not in (None, before), f"{label} page indicator")
+def scroll_read(T, read):
+    """Read the Workspace list top to bottom: `read()` at the top, then after every wheel step (never more than 60 % of the
+    list area, so a short strip cannot skip a row), until a step moves nothing: the last row is then on screen and has been
+    read. Leaves the list at its bottom. Raises when MAX_SCROLL_STEPS steps never reach the end."""
+    at_top(T)
+    read()
+    hover_list(T)
+    top, bottom = region(T)
+    delta = max(60, min(300, int((bottom - top) * 0.6)))
+    last = list_signature(T)
+    for _ in range(MAX_SCROLL_STEPS):
+        T.wheel(0, delta)
+        T.pump()
+        time.sleep(0.15)
+        read()
+        now = list_signature(T)
+        if now == last:
+            return
+        last = now
+    raise nh.WaitTimeout(f"the Workspace list never reached its last row in {MAX_SCROLL_STEPS} wheel steps")
 
 
-def collect_pages(T):
-    """Every Workspace row across all pages, starting from page 1; returns (rows, pages)."""
-    while find_page_button(T, "Previous page") is not None:
-        goto_page(T, "Previous page")
-    rows, pages = [], 0
-    while True:
-        pages += 1
-        # the tree only lists rows near the visible window: read at the top, then while scrolling to the bottom, and
-        # merge (titles are unique within one page; the pager is pinned in the header, so it needs no scrolling)
-        seen = {}
-        at_top(T)
-        for node in ws_buttons(T):
-            seen.setdefault(node["title"], {"title": node["title"], "text": node.get("text"), "page": pages})
-        T.ctl("hover", "[data-surface]")
-        for _ in range(8):
-            T.wheel(0, 600)
-            T.pump()
-            time.sleep(0.15)
-            for node in ws_buttons(T):
-                seen.setdefault(node["title"], {"title": node["title"], "text": node.get("text"), "page": pages})
-        nxt = find_page_button(T, "Next page")
-        rows.extend(seen.values())
-        if nxt is None:
-            return rows, pages
-        goto_page(T, "Next page")
+def closed_rows(T):
+    """Titles of every minimized session (`Restore · …`) and collapsed section (`Expand · …`) in the whole list."""
+    closed = []
+
+    def read():
+        for title in row_titles(T):
+            if title.startswith(CLOSED_PREFIXES) and title not in closed:
+                closed.append(title)
+
+    scroll_read(T, read)
+    return closed
+
+
+def merge_read(seen, buttons):
+    """Fold one read of the visible Workspace rows into `seen`, keyed by row title in order of first appearance (document
+    order, since the list is read going down). Titles can repeat, so keep the most copies any single read showed. Copies
+    that never share a read undercount, and the count checks then fail rather than pass."""
+    in_read = {}
+    for node in buttons:
+        title = node["title"]
+        in_read[title] = in_read.get(title, 0) + 1
+        entry = seen.setdefault(title, {"copies": 0, "row": {"title": title, "text": node.get("text")}})
+        entry["copies"] = max(entry["copies"], in_read[title])
+
+
+def collect_rows(T, each_read=None):
+    """Every Workspace row button across the whole list, read while scrolling top to bottom (leaves the list at its bottom).
+    `each_read()`, when given, also runs after every read so a check can watch every scroll offset."""
+    seen = {}
+
+    def read():
+        merge_read(seen, ws_buttons(T))
+        if each_read is not None:
+            each_read()
+
+    scroll_read(T, read)
+    return [dict(entry["row"]) for entry in seen.values() for _ in range(entry["copies"])]
 
 
 def park_hand(T):
@@ -719,6 +921,20 @@ def row_title(button_title):
     return button_title.split(" \u00b7 ")[1]
 
 
+def row_kind(title, session_names):
+    """What a `Go to · …` row is: a `session`, a `pane` outside any tab (a Parked or Unattached row), or else a `tab`."""
+    if row_title(title) in session_names:
+        return "session"
+    if title.endswith((" \u00b7 Parked", " \u00b7 Unattached")):
+        return "pane"
+    return "tab"
+
+
+def focused_tab(T):
+    pane = focused(T)
+    return lua_retry(T, f"return {{ t = cx.session:tab_of({pane}) }}")["t"] if pane is not None else None
+
+
 def sorted_tabs(T):
     return sorted((tab["id"], tab["session"]) for tab in T.tabs())
 
@@ -727,6 +943,11 @@ def world_state(T):
     """Everything an inert action must not change."""
     return {"focused": focused(T), "session": current_session(T), "tabs": sorted_tabs(T),
             "panes": sorted((p["pane"], p["tab"], p["parked"], p["floating"]) for p in pane_rows(T))}
+
+
+def changed_state(before, after):
+    """The world_state fields that differ, as {field: [before, after]}."""
+    return {key: [before[key], after[key]] for key in before if before[key] != after[key]}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -758,89 +979,116 @@ def j2(package, log):
         rail = placed["rail"]
         destinations = [p for p in pane_rows(T) if p["pane"] != rail]
         rail_title = [p["title"] for p in panes if p["pane"] == world["railPane"]][0]
-        # The location line belongs to Workspace alone: Attention (the first-ever mode) shows none, and an empty list shows no text.
+        # The location line belongs to Workspace alone. On the strip Attention (the first-ever mode) shows none; a rail's
+        # Workspace region header always carries it, so there it is the Workspace header that must hold it.
         attention_text = surface_text(T) or ""
-        check("no-location-line-outside-workspace",
-              button_by_title(T, "Reveal in Workspace") is None and "No current" not in attention_text,
-              {"revealButton": (button_by_title(T, "Reveal in Workspace") or {}).get("title"), "surfaceText": attention_text[:200]})
+        if not stacked_edge():
+            check("no-location-line-outside-workspace",
+                  button_by_title(T, "Reveal in Workspace") is None and "No current" not in attention_text,
+                  {"revealButton": (button_by_title(T, "Reveal in Workspace") or {}).get("title"), "surfaceText": attention_text[:200]})
         keep_shot(T, "j2-attention")
         show_workspace(T)
-        pump_until(T, lambda: button_by_title(T, "Reveal in Workspace") is not None or "No current location" in (surface_text(T) or ""), 8, "location line")
-        keep_shot(T, "j2-workspace-p1")
-        blank = "No current location" in (surface_text(T) or "")
-        reveal = button_by_title(T, "Reveal in Workspace")
-        check("location-workspace-mode", reveal is not None and reveal["title"] == f"Reveal in Workspace \u00b7 {rail_title} \u00b7 alpha",
-              {"title": reveal and reveal["title"], "expected": f"{rail_title} \u00b7 alpha"})
-        check("location-line-survives-rail-click", not blank,
-              {"focusedPaneIsRail": focused(T) == rail, "lineReadsNoCurrentLocation": blank,
-               "note": "clicking inside the rail focuses the rail pane; the location line then goes blank until a content pane is focused"})
-        focus_pane(T, world["railPane"])
-        pump_until(T, lambda: button_by_title(T, "Reveal in Workspace") is not None, 8, "location line")
-        reveal = button_by_title(T, "Reveal in Workspace")
-        check("location-after-refocus", reveal is not None and rail_title in reveal["title"] and reveal["title"].endswith("alpha"),
-              {"title": reveal and reveal["title"]})
+        rail_width = (nodes(T, "[data-surface]")[0]["rect"])[2]
+        if rail_width < 360:
+            # The location line stays at every width: below 360px it truncates inside the rail instead of hiding.
+            rail_rect = nodes(T, "[data-surface]")[0]["rect"]
+            location = button_by_title(T, "Reveal in Workspace")
+            check("location-line-shown-at-narrow-rail", location is not None
+                  and location["rect"][0] + location["rect"][2] <= rail_rect[0] + rail_rect[2] + 0.5,
+                  {"railWidth": rail_width, "location": location and location.get("rect")})
+            keep_shot(T, "j2-workspace-p1")
+            focus_pane(T, world["railPane"])
+        else:
+            pump_until(T, lambda: button_by_title(T, "Reveal in Workspace") is not None or "No current location" in (surface_text(T) or ""), 8, "location line")
+            keep_shot(T, "j2-workspace-p1")
+            blank = "No current location" in (surface_text(T) or "")
+            reveal = button_by_title(T, "Reveal in Workspace")
+            check("location-workspace-mode", reveal is not None and reveal["title"] == f"Reveal in Workspace \u00b7 {rail_title} \u00b7 alpha",
+                  {"title": reveal and reveal["title"], "expected": f"{rail_title} \u00b7 alpha"})
+            check("location-line-survives-rail-click", not blank,
+                  {"focusedPaneIsRail": focused(T) == rail, "lineReadsNoCurrentLocation": blank,
+                   "note": "clicking inside the rail focuses the rail pane; the location line then goes blank until a content pane is focused"})
+            focus_pane(T, world["railPane"])
+            pump_until(T, lambda: button_by_title(T, "Reveal in Workspace") is not None, 8, "location line")
+            reveal = button_by_title(T, "Reveal in Workspace")
+            check("location-after-refocus", reveal is not None and rail_title in reveal["title"] and reveal["title"].endswith("alpha"),
+                  {"title": reveal and reveal["title"]})
 
-        rows, pages = collect_pages(T)
-        titles = [r["title"] for r in rows]
-        groups = {}
-        for title in titles:
-            match = GROUP.match(title)
-            if match:
-                groups[match.group(1)] = int(match.group(2))
-        leaves = [t for t in titles if t.startswith("Go to \u00b7 ") and not GROUP.match(t)]
+        ws_names = {s["name"] for s in sessions}
         tab_session = {tab["id"]: tab["session"] for tab in tabs}
-        session_name = {s["id"]: s["name"] for s in sessions}
-        expected, per_tab = {}, {}
-        for pane in destinations:
-            if pane["tab"] is None:
-                continue
-            name = session_name[tab_session[pane["tab"]]]
-            expected[name] = expected.get(name, 0) + 1
-            per_tab[pane["tab"]] = per_tab.get(pane["tab"], 0) + 1
-        tab_title = {tab["id"]: tab["title"] for tab in tabs}
-        for tab_id, count in per_tab.items():
-            # a named tab is always a group; an unnamed tab is a group only when it holds more than one place
-            label = world["named"].get(tab_id) or (tab_title[tab_id] if count > 1 else None)
-            if label:
-                expected[label] = expected.get(label, 0) + count
-        check("group-rows-typed-counts", groups == expected,
-              {"rendered": groups, "expectedFromNative": expected, "pages": pages, "rows": len(rows)})
-        parked_row = [r for r in rows if r["title"] in ("Collapse \u00b7 Parked", "Expand \u00b7 Parked")]
-        check("parked-section-count", len(parked_row) == 1 and "1 place" in str(parked_row[0]["text"]), parked_row)
-        floating_rows = [t for t in leaves if t.endswith("\u00b7 Floating")]
-        parked_rows = [t for t in leaves if t.endswith("\u00b7 Parked")]
-        note_rows = [t for t in leaves if t.endswith("\u00b7 Note")]
-        check("every-destination-listed-once", len(leaves) == len(destinations),
-              {"leafRows": len(leaves), "nativeDestinations": len(destinations)})
-        check("markers", len(floating_rows) == 2 and len(parked_rows) == 1 and len(note_rows) == 3,
-              {"floating": floating_rows, "parked": parked_rows, "notes": len(note_rows)})
+        tab_ids = {p["tab"] for p in destinations if p["tab"] is not None}
+        outside = [p for p in destinations if p["tab"] is None]
+        bravo_id = [s["id"] for s in sessions if s["name"] == "bravo"][0]
+        bravo_tabs = len([t for t in tab_ids if tab_session[t] == bravo_id])
+        at_top(T)
+        if stacked_edge():
+            check_workspace_header(check, T)
+        else:
+            count, header = header_tab_count(T)
+            check("header-reads-workspace-n-tabs", count == len(tab_ids), {"header": header[:6], "expectedTabs": len(tab_ids)})
 
-        while find_page_button(T, "Previous page") is not None:
-            goto_page(T, "Previous page")
+        # Every row, read while scrolling the list top to bottom. The same reads watch each scroll offset for leftovers of
+        # the removed paging controls, the "more not shown" footer, and "places" wording.
+        watch = {"paging": [], "footer": [], "places": []}
+
+        def watch_read():
+            watch["paging"] += removed_paging_nodes(T)
+            footer = more_footer(T)
+            if footer:
+                watch["footer"].append(footer)
+            watch["places"] += places_wording(T)
+
+        rows = collect_rows(T, watch_read)
+        titles = [r["title"] for r in rows]
+        go_titles = [t for t in titles if t.startswith("Go to \u00b7 ")]
+        kinds = {"session": 0, "tab": 0, "pane": 0}
+        for title in go_titles:
+            kinds[row_kind(title, ws_names)] += 1
+        toggled = {row_title(t) for t in titles if t.startswith(ROW_PREFIXES[1:])}
+        check("session-rows", ws_names <= toggled, {"sessionsToggled": sorted(toggled & ws_names), "sessions": sorted(ws_names)})
+        check("one-row-per-tab", kinds["tab"] == len(tab_ids),
+              {"tabRows": kinds["tab"], "tabsWithContent": len(tab_ids), "kinds": kinds, "rows": len(rows)})
+        parked_rows = [t for t in go_titles if t.endswith(" \u00b7 Parked")]
+        check("outside-tab-panes-keep-one-row-each",
+              kinds["pane"] == len(outside) == 1 and len(parked_rows) == 1 and "Parked" in toggled,
+              {"paneRows": kinds["pane"], "panesOutsideTabs": len(outside), "parkedRows": parked_rows, "sectionToggled": "Parked" in toggled})
+        floating_rows = [t for t in go_titles if t.endswith(" \u00b7 Floating")]
+        note_rows = [t for t in go_titles if t.endswith(" \u00b7 Note")]
+        browser_rows = [t for t in go_titles if t.startswith("Go to \u00b7 example.com")]
+        check("panes-inside-tabs-are-not-rows",
+              not floating_rows and not note_rows and not browser_rows and len(go_titles) - kinds["session"] < len(destinations),
+              {"floating": floating_rows, "notes": note_rows, "browser": browser_rows,
+               "rowsBesideSessions": len(go_titles) - kinds["session"], "nativeDestinations": len(destinations)})
+        check("no-paging-controls-while-scrolling", not watch["paging"], watch["paging"][:4])
+        check("no-places-wording", not watch["places"], watch["places"][:4])
+        check("no-more-not-shown-footer-under-200-rows", not watch["footer"] and len(rows) < ROW_LIMIT,
+              {"footers": watch["footer"][:2], "rows": len(rows), "limit": ROW_LIMIT})
+
+        at_top(T)
         bad = overflowing_rows(T)
         check("row-text-stays-inside-row", not bad, {"overflowingLeafRows": bad,
               "note": "context line wraps below the row box and paints over the next row" if bad else None})
 
-        # wheel to the last row of page 1, click it
-        at_top(T)
-        wheels, node, hidden_before = scroll_to(T, lambda: last_leaf_row(T))
-        target_title = row_title(node["title"])
-        target = title_to_pane(destinations, target_title)
+        # wheel to the last tab row (the named tab of the last session), click it: Tern focuses a pane of that tab
+        target_tab = next(tab for tab, label in world["named"].items() if label == "Build foxtrot")
+        wheels, node, hidden_before = scroll_to(T, lambda: button_by_title(T, "Go to \u00b7 Build foxtrot"))
         click_node(T, node)
         try:
-            pump_until(T, lambda: focused(T) == target, 6, "focus last page-1 row")
+            pump_until(T, lambda: focused_tab(T) == target_tab, 6, "focus last tab row")
         except nh.WaitTimeout:
             pass
-        check("wheel-reaches-last-row-page-1-and-click-focuses", hidden_before and wheels > 0 and target is not None and focused(T) == target,
-              {"row": node["title"], "wheels": wheels, "hiddenBeforeWheel": hidden_before, "expectedPane": target, "focused": focused(T)})
+        check("wheel-reaches-last-tab-row-and-click-focuses", hidden_before and wheels > 0 and focused_tab(T) == target_tab,
+              {"row": node["title"], "wheels": wheels, "hiddenBeforeWheel": hidden_before, "expectedTab": target_tab, "focusedTab": focused_tab(T)})
         focus_pane(T, world["railPane"])
         rail_ready(T, world["railTab"])
+        # The parked-row click is made from the rail canvas, so the canvas holds focus before the snapshot: a click inside the rail
+        # focuses that pane, and the unchanged-world comparison must not count the focus move the click itself causes.
+        focus_pane(T, rail)
 
-        # page 2: the last row is the parked pane; clicking must open the native chooser and relocate nothing
-        goto_page(T, "Next page")
-        T.ctl("hover", "[data-surface]")
+        # the list's last row is the parked pane: clicking must open the native chooser and relocate nothing
+        hover_list(T)
         wheels2, node2, hidden2 = scroll_to(T, lambda: last_leaf_row(T))
-        keep_shot(T, "j2-workspace-p2")
+        keep_shot(T, "j2-workspace-bottom")
         before = world_state(T)
         click_node(T, node2)
         opened = False
@@ -855,50 +1103,34 @@ def j2(package, log):
         check("last-row-is-parked-and-click-does-not-relocate",
               node2["title"].endswith("\u00b7 Parked") and opened and parked_now["parked"] and parked_now["tab"] is None and after == before,
               {"row": node2["title"], "wheels": wheels2, "hiddenBeforeWheel": hidden2, "chooserOpen": opened,
-               "parkedPane": parked_now, "worldUnchanged": after == before})
+               "parkedPane": parked_now, "worldUnchanged": after == before, "changed": changed_state(before, after)})
         T.key("esc")
         time.sleep(0.5)
         check("parked-chooser-dismissed-pane-still-parked",
               not park_hand(T)["open"] and [p for p in pane_rows(T) if p["pane"] == world["parked"]][0]["parked"], park_hand(T))
-        # last non-parked row: the floating browser; focus it without docking
-        browser_row = button_by_title(T, "Go to \u00b7 example.com")
-        click_node(T, browser_row)
-        try:
-            pump_until(T, lambda: focused(T) == world["browser"], 6, "focus browser row")
-        except nh.WaitTimeout:
-            pass
-        browser_now = [p for p in pane_rows(T) if p["pane"] == world["browser"]][0]
-        check("floating-row-focuses-without-docking", focused(T) == world["browser"] and browser_now["floating"],
-              {"row": browser_row["title"], "focused": focused(T), "browser": browser_now, "session": current_session(T)})
-        focus_pane(T, world["railPane"])
-        rail_ready(T, world["railTab"])
 
-        # collapse a group, persist across a plugin reload
-        while find_page_button(T, "Previous page") is not None:
-            goto_page(T, "Previous page")
+        # minimize a session, persist across a plugin reload
+        rows_before = len(collect_rows(T))
+        click_until(T, lambda: scroll_find(T, "Minimize \u00b7 bravo"), lambda: button_by_title(T, "Restore \u00b7 bravo") is not None, "minimize bravo")
+        rows_after = len(collect_rows(T))
         at_top(T)
-        rows_before = len(ws_buttons(T))
-        click_until(T, lambda: scroll_find(T, "Collapse \u00b7 bravo"), lambda: button_by_title(T, "Expand \u00b7 bravo") is not None, "collapse bravo")
-        at_top(T)
-        rows_after = len(ws_buttons(T))
         keep_shot(T, "j2-collapsed")
         time.sleep(0.5)
         ui = (((T.kv(PLUGIN) or {}).get("preferences") or {}).get("uiByWindow") or {})
-        bravo_id = [s["id"] for s in sessions if s["name"] == "bravo"][0]
-        check("collapse-toggles-and-is-persisted", rows_after < rows_before and any(f"#{bravo_id}" in key for entry in ui.values() for key in (entry.get("collapsed") or {})),
-              {"buttonsBefore": rows_before, "buttonsAfter": rows_after, "uiByWindow": ui})
+        check("collapse-toggles-and-is-persisted", rows_before - rows_after == bravo_tabs and any(f"#{bravo_id}" in key for entry in ui.values() for key in (entry.get("collapsed") or {})),
+              {"rowsBefore": rows_before, "rowsAfter": rows_after, "bravoTabs": bravo_tabs, "uiByWindow": ui})
         T.ctl("plugins", "fixtures")
         T.wait_for(T._plugins_loaded, timeout=30, interval=0.3, what="plugin reload")
         nudged = False
         try:
-            pump_until(T, lambda: button_by_title(T, "Expand \u00b7 bravo") is not None, 8, "collapsed group after reload")
+            pump_until(T, lambda: button_by_title(T, "Restore \u00b7 bravo") is not None, 8, "collapsed group after reload")
         except nh.WaitTimeout:
             T.run_action(OPEN, check=False)
             nudged = True
-            pump_until(T, lambda: button_by_title(T, "Expand \u00b7 bravo") is not None, 12, "collapsed group after reload + open")
+            pump_until(T, lambda: button_by_title(T, "Restore \u00b7 bravo") is not None, 12, "collapsed group after reload + open")
         at_top(T)
         keep_shot(T, "j2-after-reload")
-        check("collapse-survives-plugin-reload", button_by_title(T, "Expand \u00b7 bravo") is not None and button_by_title(T, "Collapse \u00b7 alpha") is not None,
+        check("collapse-survives-plugin-reload", button_by_title(T, "Restore \u00b7 bravo") is not None and button_by_title(T, "Minimize \u00b7 alpha") is not None,
               {"openNeeded": nudged, "titles": row_titles(T)[:12]})
     return {"journey": "J2", "pass": check.passed, "checks": check.items}
 
@@ -947,7 +1179,7 @@ def j3(package, log):
                               "o[#o + 1] = { a.id, a.label } end end return o")
         check("action-id", nh.as_list(listed) == [[SEARCH, "Attention: Search workspace"]], listed)
         panes = [p for p in pane_rows(T) if p["pane"] != rail]
-        sessions, tabs = sessions_of(T), T.tabs()
+        sessions = sessions_of(T)
         expected_items = len(panes) + len(sessions) + len(world["named"])
         options = open_search_via_palette(T)
         picker = T.state()["picker"]
@@ -1062,12 +1294,12 @@ def j4(package, log):
         placed = enable_and_place(T, world)
         check("rail-placed-with-vertical-tabs", placed["placedAt"] is not None, {"seconds": placed["placedAt"]})
         rail = placed["rail"]
-        # the whole journey: workspace, collapse/expand, row click, palette search + Enter, parked chooser, reveal, new
+        # the whole journey: workspace, minimize/restore, row click, palette search + Enter, parked chooser, reveal, new
         show_workspace(T)
-        click_until(T, lambda: scroll_find(T, "Collapse \u00b7 bravo"), lambda: button_by_title(T, "Expand \u00b7 bravo") is not None, "collapse")
+        click_until(T, lambda: scroll_find(T, "Minimize \u00b7 bravo"), lambda: button_by_title(T, "Restore \u00b7 bravo") is not None, "minimize")
         time.sleep(1.0)  # a click right after the toggle's own repaint can be dropped while the rail is still reconciling
         T.pump()
-        click_until(T, lambda: scroll_find(T, "Expand \u00b7 bravo"), lambda: button_by_title(T, "Collapse \u00b7 bravo") is not None, "expand")
+        click_until(T, lambda: scroll_find(T, "Restore \u00b7 bravo"), lambda: button_by_title(T, "Minimize \u00b7 bravo") is not None, "restore")
         panes = [p for p in pane_rows(T) if p["pane"] != rail]
         target = title_to_pane(panes, "charlie-t2")
         click_until(T, lambda: scroll_find(T, "Go to \u00b7 charlie-t2"), lambda: focused(T) == target, "row click")
@@ -1141,9 +1373,9 @@ def j4(package, log):
 
 
 def scroll_find(T, prefix):
-    """The row button whose title starts with `prefix`, after scrolling it fully into the list area (None if absent)."""
-    if button_by_title(T, prefix) is None:
-        return None
+    """The row button whose title starts with `prefix`, after scrolling it fully into the list area (None if absent).
+    The tree lists only rows near the window, so a row missing from it proves nothing until the list is read from the top:
+    scroll_to starts there."""
     try:
         return scroll_to(T, lambda: button_by_title(T, prefix))[1]
     except nh.WaitTimeout:
@@ -1157,10 +1389,9 @@ def scroll_find(T, prefix):
 def j5(package, log):
     log("## J5 ownership / window")
     check = Checks(log, "J5")
-    foreign = {"preferences": {"schema": 4, "enabled": True, "owner": "window-that-is-not-this-one", "backlogAfterSeconds": 0,
-                               "defaults": {"hidden": {}, "share": {}}, "instances": {}, "uiByWindow": {}}}
-    if RUN["edge"] != DEFAULT_EDGE:
-        foreign["preferences"]["defaults"]["position"] = RUN["edge"]
+    foreign = {"preferences": {"schema": 4, "enabled": True, "owner": "window-that-is-not-this-one",
+                               "defaults": {"hidden": {}, "shares": {"left": {}, "bottom": {}, "right": {}}}, "instances": {}, "uiByWindow": {}}}
+    foreign["preferences"]["defaults"]["position"] = RUN["edge"]  # every edge seeds: the plugin default is left, never relied on
     with world_instance(package, 1280, 600, seed_files={f"plugin-data/{PLUGIN}/kv.json": json.dumps(foreign).encode()}) as T:
         key = lua_retry(T, "return { key = cx:window_key() }")["key"]
         check("headless-window-key", key == "", {"window_key": key})
@@ -1187,64 +1418,601 @@ def j5(package, log):
             "notExercised": ["second window", "live GUI ownership hand-off", "per-window tabs_autohide"]}
 
 
-def pager_geometry(T):
-    """Where the pager and the bounded header sit, in window pixels, plus how much of the rail is left for the list."""
+def rail_geometry(T):
+    """Where the pinned header and the tools line sit, in window pixels, plus how much of the rail is left for the list."""
     surface = nodes(T, "[data-surface]")[0]["rect"]
     top, bottom = region(T)
-    inside = lambda n: surface[0] <= n["rect"][0] <= surface[0] + surface[2] and surface[1] <= n["rect"][1] <= top  # noqa: E731
-    toolbar = [n for n in nodes(T, "button") if inside(n) and str(n.get("title", "")).startswith(("Next attention", "Previous \u00b7", "Search", "More \u00b7", "Return to"))]
-    queues = [n for n in nodes(T, "button") if inside(n) and any(str(n.get("title", "")).startswith(q) for q in ("Attention \u00b7", "Later \u00b7", "Currently working \u00b7", "Workspace \u00b7"))]
-    nxt, prev = page_button(T, "Next page"), page_button(T, "Previous page")
-    pager = nxt or prev
+    tool_titles = ("Next attention", "Previous \u00b7", "Search", "More \u00b7", "Return to")
     visible_rows = [n for n in ws_buttons(T) if n["rect"][1] >= top and n["rect"][1] + n["rect"][3] <= bottom]
-    return {"surface": surface, "headerBottom": top, "toolbarLines": sorted({round(n["rect"][1]) for n in toolbar}),
-            "queueLines": sorted({round(n["rect"][1]) for n in queues}), "toolbarButtons": len(toolbar),
-            "pagerRect": pager["rect"] if pager else None, "pagerText": pager_text(T), "next": nxt is not None, "prev": prev is not None,
+    if stacked_edge():
+        # The pinned tools line (Next, Previous, Search, More) is one row; there is no tab row.
+        # A location row (Go to · current tab, Rename) can share the pinned header once the list is scrolled; only tools count.
+        lines = nodes(T, "[data-role='attention.tools-line']")
+        line = lines[0]["rect"] if lines else None
+        toolbar = [n for n in nodes(T, "button") if line is not None
+                   and line[0] <= n["rect"][0] + n["rect"][2] / 2 <= line[0] + line[2]
+                   and line[1] <= n["rect"][1] + n["rect"][3] / 2 <= line[1] + line[3]
+                   and str(n.get("title", "")).startswith(tool_titles)]
+        toolbar_lines = sorted({round(n["rect"][1] + n["rect"][3] / 2) for n in toolbar})
+        queue_lines = []
+    else:
+        inside = lambda n: surface[0] <= n["rect"][0] <= surface[0] + surface[2] and surface[1] <= n["rect"][1] <= top  # noqa: E731
+        toolbar = [n for n in nodes(T, "button") if inside(n) and str(n.get("title", "")).startswith(tool_titles)]
+        queues = [n for n in nodes(T, "button") if inside(n) and any(str(n.get("title", "")).startswith(q) for q in ("Attention \u00b7", "Currently working \u00b7", "Workspace \u00b7"))]
+        toolbar_lines = sorted({round(n["rect"][1]) for n in toolbar})
+        queue_lines = sorted({round(n["rect"][1]) for n in queues})
+    return {"surface": surface, "headerBottom": top, "toolbarLines": toolbar_lines,
+            "queueLines": queue_lines, "toolbarButtons": len(toolbar),
+            "toolbarTitles": sorted(str(n.get("title", ""))[:40] for n in toolbar),
             "listFraction": round((surface[1] + surface[3] - top) / surface[3], 3), "visibleRows": len(visible_rows)}
 
 
 def j6(package, log):
-    log(f"## J6 header-hosted pager ({RUN['edge']} rail)")
+    log(f"## J6 Workspace list: header, no paging, scroll reach ({RUN['edge']} rail)")
     check = Checks(log, "J6")
     with world_instance(package, 1280, 800) as T:
         world = build_world(T)
         placed = enable_and_place(T, world)
         check("rail-placed", placed["placedAt"] is not None, {"seconds": placed["placedAt"], "rail": placed["rail"]})
+        tab_ids = {p["tab"] for p in pane_rows(T) if p["pane"] != placed["rail"] and p["tab"] is not None}
         show_workspace(T)
-        pump_until(T, lambda: pager_text(T) is not None, 10, "pager text")
+        with contextlib.suppress(nh.WaitTimeout):
+            pump_until(T, lambda: (workspace_head_names(T)[0] if stacked_edge() else header_tab_count(T)[0]) is not None,
+                       10, "Workspace header")
         at_top(T)
-        top = pager_geometry(T)
+        top = rail_geometry(T)
+        header_at_top = header_rect(T)
+        count = None
+        if stacked_edge():
+            check_workspace_header(check, T)
+        else:
+            count, header = header_tab_count(T)
+            check("header-reads-workspace-n-tabs", count == len(tab_ids), {"header": header[:6], "expectedTabs": len(tab_ids)})
         keep_shot(T, "j6-top")
         log(f"geometry at scroll top: {top}")
-        pager = top["pagerRect"]
-        check("pager-visible-at-scroll-top", pager is not None and top["next"] and not top["prev"]
-              and pager[1] >= top["surface"][1] and pager[1] + pager[3] <= top["headerBottom"] + 0.5, top)
-        check("toolbar-one-line", max(top["toolbarLines"]) - min(top["toolbarLines"]) <= 2 and len(top["queueLines"]) == 1, top)
-        # A left rail is a tall column; a bottom/right strip is a fraction of the tab, so it only has to keep a few rows usable.
-        tall = RUN["edge"] == "left"
-        check("list-usable", top["listFraction"] >= (0.7 if tall else 0.5) and top["visibleRows"] >= (8 if tall else 3), top)
-        T.ctl("hover", "[data-surface]")
+        check("no-places-wording", not places_wording(T), places_wording(T)[:4])
+        check("no-paging-controls-at-scroll-top", not removed_paging_nodes(T), removed_paging_nodes(T))
+        check("next-attention-control-kept", button_by_title(T, "Next attention") is not None, {"toolbarTitles": top["toolbarTitles"]})
+        if stacked_edge():
+            # A rail is two regions: the tools line (Next, Previous, Search, More) is one row and the sections have no tab row.
+            check("tools-line-is-one-row", len(top["toolbarLines"]) == 1 and top["toolbarButtons"] == 4 and not top["queueLines"], top)
+            # Workspace owns about half the rail under its pinned header; it only has to keep a few rows usable.
+            check("list-usable", top["listFraction"] >= 0.3 and top["visibleRows"] >= 5, top)
+        else:
+            # The rail header is a designed two-line unit (tabs line + tools line); the tabs row itself must never wrap.
+            check("header-within-two-lines", len(set(top["toolbarLines"]) | set(top["queueLines"])) <= 2 and len(top["queueLines"]) == 1, top)
+            # A left rail is a tall column; a bottom/right strip is a fraction of the tab, so it only has to keep a few rows usable.
+            tall = RUN["edge"] == "left"
+            check("list-usable", top["listFraction"] >= (0.7 if tall else 0.5) and top["visibleRows"] >= (8 if tall else 3), top)
+        hover_list(T)
         T.wheel(0, 900)
         T.pump()
         time.sleep(0.3)
-        scrolled = pager_geometry(T)
+        scrolled = rail_geometry(T)
         keep_shot(T, "j6-scrolled")
-        check("pager-pinned-after-scroll", scrolled["pagerRect"] == top["pagerRect"] and scrolled["pagerText"] == top["pagerText"], scrolled)
+        check("no-paging-controls-after-scroll", not removed_paging_nodes(T), removed_paging_nodes(T))
+        check("header-pinned-after-scroll", header_rect(T) == header_at_top and header_tab_count(T)[0] == count
+              and scrolled["headerBottom"] == top["headerBottom"], {"before": header_at_top, "after": header_rect(T), "geometry": scrolled})
         T.wheel(0, 6000)
         T.pump()
         time.sleep(0.3)
-        bottom = pager_geometry(T)
+        bottom = rail_geometry(T)
         keep_shot(T, "j6-bottom")
-        check("header-and-pager-pinned-at-list-bottom", bottom["pagerRect"] == top["pagerRect"] and bottom["toolbarButtons"] == top["toolbarButtons"]
-              and bottom["headerBottom"] == top["headerBottom"], bottom)
-        before = pager_text(T)
-        goto_page(T, "Next page")
-        second = pager_geometry(T)
-        keep_shot(T, "j6-page2")
-        check("next-page-reaches-end", pager_text(T) != before and second["prev"], {"before": before, "after": pager_text(T), "geometry": second})
-        goto_page(T, "Previous page")
-        check("previous-page-returns", pager_text(T) == before, {"text": pager_text(T)})
+        check("no-paging-controls-and-no-footer-at-list-bottom", not removed_paging_nodes(T) and more_footer(T) is None,
+              {"paging": removed_paging_nodes(T), "footer": more_footer(T)})
+        check("header-pinned-at-list-bottom", header_rect(T) == header_at_top and bottom["toolbarButtons"] == top["toolbarButtons"]
+              and bottom["headerBottom"] == top["headerBottom"], {"before": header_at_top, "after": header_rect(T), "geometry": bottom})
+        wheels, last, hidden_before = scroll_to(T, lambda: button_by_title(T, "Go to \u00b7 Build foxtrot"))
+        keep_shot(T, "j6-last-tab-row")
+        check("last-tab-row-reachable-by-scrolling", is_visible(T, last) and header_rect(T) == header_at_top,
+              {"row": last["title"], "wheels": wheels, "hiddenBeforeWheel": hidden_before, "rowRect": last["rect"], "listArea": region(T)})
+    log("- NOT EXERCISED J6.more-not-shown-footer: the footer appears at 200 rows or 1500 canvas nodes, whichever comes first, "
+        "and this world has about 40 rows; only its absence under both caps is checked.")
     return {"journey": "j6", "pass": check.passed}
+
+
+# ---------------------------------------------------------------------------------------------
+# J7 wide left rail end-to-end (1839x1135: the width branch j2/j6 cannot reach at 1280x800)
+# ---------------------------------------------------------------------------------------------
+
+WIDE_RAIL_MIN = 360  # J7's wide-rail precondition: the rail is at least this wide (the location line renders at every width)
+KIND_LINES = {"Terminal", "Agent", "Plugin", "Browser", "File", "Git", "Database", "Notebook", "Board", "Canvas",
+              "Processes", "Screen", "Profile", "Carly", "Note", "Pane"}  # navigation.luau KIND_LABELS (+ Note, Pane)
+HEAD_Y_TOLERANCE_PX = 1.0
+AGENT_CENSUS_TIMEOUT_SECONDS = 15.0
+MODEL_SETTLE_TIMEOUT_SECONDS = 30.0
+
+
+def model_lines(T):
+    """Every `workspace.model` sub-line across the Workspace list (the tree lists only rows near the window, so the list is
+    read while scrolling top to bottom), each with the Workspace row button that contains it: [{text, owner}]."""
+    seen = {}
+
+    def read():
+        buttons = [b for b in ws_buttons(T) if b["title"].startswith("Go to \u00b7 ")]
+        for line in nodes(T, "[data-role='workspace.model']"):
+            owners = [b for b in buttons if in_rect(line, b["rect"])]
+            owner = owners[-1]["title"] if owners else None
+            seen.setdefault((line.get("text", ""), owner), {"text": line.get("text", ""), "owner": owner})
+
+    scroll_read(T, read)
+    at_top(T)
+    return list(seen.values())
+
+
+def agent_census(T):
+    """Every scalar field of every `cx.agents:list()` entry (and of its nested tables), as plain dicts."""
+    code = ("local function scalars(t) local r = {} for k, v in pairs(t) do local kind = type(v) "
+            "if kind == 'string' or kind == 'number' or kind == 'boolean' then r[k] = v "
+            "elseif kind == 'table' then r[k] = scalars(v) end end return r end "
+            "local o = {} for _, a in ipairs(cx.agents:list()) do o[#o + 1] = scalars(a) end return o")
+    return nh.as_list(lua_retry(T, code))
+
+
+def census_model(entry):
+    """The first non-empty `model` string in an agent census entry or its nested tables, else None."""
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("model")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    for nested in entry.values():
+        found = census_model(nested) if isinstance(nested, dict) else None
+        if found:
+            return found
+    return None
+
+
+RAIL_ROW_PREFIXES = ("Go to \u00b7 ", "Open \u00b7 ", "Verify header, then open \u00b7 ")
+MODEL_ROLES = ("attention.model-line", "workspace.model")
+
+
+def rail_scan(T):
+    """Every row of the rail (a queue row `Open ·` or `Go to ·`, a Workspace `Go to ·` row) and every model sub-line with the row
+    that holds it, read while scrolling the Workspace list top to bottom, then back at the top: {rowTitles: [...], lines:
+    [{text, owner}]}. A queue row draws its model on `attention.model-line`, a Workspace leaf on `workspace.model`; a tab row
+    carries none. The tree lists only rows near the window, so the list is read while it scrolls."""
+    titles, lines = {}, {}
+
+    def read():
+        buttons = [b for b in nodes(T, "button") if str(b.get("title", "")).startswith(RAIL_ROW_PREFIXES)]
+        for button in buttons:
+            titles.setdefault(button["title"], True)
+        for role in MODEL_ROLES:
+            for line in nodes(T, f"[data-role='{role}']"):
+                owners = [b for b in buttons if in_rect(line, b["rect"])]
+                owner = owners[-1]["title"] if owners else None
+                lines.setdefault((line.get("text", ""), owner), {"text": line.get("text", ""), "owner": owner})
+
+    scroll_read(T, read)
+    at_top(T)
+    return {"rowTitles": list(titles), "lines": list(lines.values())}
+
+
+def content_pane(T, tab):
+    """A tiled content pane of `tab` (never its rail, a float, or a parked pane); focusing it selects the tab."""
+    return [p["pane"] for p in pane_rows(T) if p["tab"] == tab and p["kind"] != "plugin" and not p["floating"] and not p["parked"]][0]
+
+
+def all_tabs_left_via_settings(T, world, check, log):
+    """The Settings "Rail placement" press is the all-tabs move. Two rails first go to Bottom (default Bottom, so the press changes
+    the default), then Left is pressed in Settings: the selected tab's rail reaches the left edge, another tab's rail waits until
+    it is visited, the toast reports both counts, and `defaults.position` records `left`."""
+    tab1 = world["railTab"]
+    tab2 = next(t["id"] for t in T.tabs() if t["session"] == 1 and t["id"] != tab1)
+
+    def settle(tab, edge):
+        nudged_wait(T, lambda: physical_edge(T, tab) == edge and (placement_record(T, tab) or {}).get("placement") is None,
+                    f"tab {tab} rail at {edge}")
+
+    def reaches(tab, edge, since):
+        """Seconds from `since` until `tab`'s rail is at `edge`, within ALL_TABS_ARRIVAL_S of `since`; None when it is not."""
+        remaining = ALL_TABS_ARRIVAL_S - (time.monotonic() - since)
+        try:
+            T.wait_for(lambda: physical_edge(T, tab) == edge, timeout=max(0.5, remaining), interval=0.3, what=f"tab {tab} rail at {edge}", pump=True)
+        except nh.WaitTimeout:
+            return None
+        seconds = round(time.monotonic() - since, 2)
+        return seconds if seconds <= ALL_TABS_ARRIVAL_S else None
+
+    # Setup: a second rail on alpha's other tab, then both at Bottom through the palette's all-tabs move (it sets the default to Bottom).
+    mounted = len(rail_canvases(T))
+    focus_pane(T, content_pane(T, tab2))
+    T.mount_count(PLUGIN, mounted + 1, timeout=40)
+    settle(tab2, "left")
+    focus_pane(T, content_pane(T, tab1))
+    T.run_action(f"plugin.{PLUGIN}.all-tabs-bottom")
+    settle(tab1, "bottom")
+    focus_pane(T, content_pane(T, tab2))
+    settle(tab2, "bottom")
+    focus_pane(T, content_pane(T, tab1))
+    if default_position(T) != "bottom":
+        raise RuntimeError(f"all-tabs setup left the default at {default_position(T)!r}, not 'bottom'")
+    rail_tabs = [int(str(item["about"]).rsplit(":", 1)[-1]) for item in rail_canvases(T)]
+    queued_expected = len([t for t in rail_tabs if t != tab1 and physical_edge(T, t) != "left"])
+    toasts_clear(T, TOAST_CLEAR_S)
+
+    clicked_at, toasts = press_placement(T, "left")
+    arrived = reaches(tab1, "left", clicked_at)
+    check("all-tabs-left-selected-now", arrived is not None, {"seconds": arrived, "limit": ALL_TABS_ARRIVAL_S, "edge": physical_edge(T, tab1)})
+    log(f"- FACT J7.all-tabs-left-arrival: the selected tab's rail reached the left edge {arrived}s after the click")
+    summary = next((text for text in toasts if "This tab moves now" in text), None)
+    queued = re.search(r"(\d+) tabs? moves? on their next visit", summary or "")
+    check("all-tabs-toast-reports-counts", queued is not None and int(queued.group(1)) == queued_expected,
+          {"toasts": toasts, "expectedQueued": queued_expected})
+
+    pump_for(T, ALL_TABS_HOLD_S)
+    held = physical_edge(T, tab2) == "bottom" and (placement_record(T, tab2) or {}).get("moveTo") == "left"
+    focus_pane(T, content_pane(T, tab2))
+    visited_at = time.monotonic()
+    arrived_other = reaches(tab2, "left", visited_at)
+    check("all-tabs-other-tab-on-visit", held and arrived_other is not None,
+          {"heldAtBottomUntilVisit": held, "secondsAfterVisit": arrived_other, "limit": ALL_TABS_ARRIVAL_S, "record": placement_record(T, tab2)})
+    log(f"- FACT J7.all-tabs-other-tab-arrival: the other tab's rail reached the left edge {arrived_other}s after its visit")
+    check("all-tabs-default-recorded", default_position(T) == "left", {"defaults.position": default_position(T)})
+
+
+def j7(package, log):
+    log("## J7 wide left rail (1839x1135)")
+    check = Checks(log, "J7")
+    previous_edge = RUN["edge"]
+    RUN["edge"] = "left"
+    try:
+        with world_instance(package, 1839, 1135) as T:
+            world = build_world(T)
+            placed = enable_and_place(T, world)
+            check("rail-placed", placed["placedAt"] is not None, {"seconds": placed["placedAt"], "rail": placed["rail"]})
+            rail_title = [p["title"] for p in pane_rows(T) if p["pane"] == world["railPane"]][0]
+
+            # 1. Wide rail (1839px window): the Reveal location line exists after Show Workspace and survives refocusing the rail pane.
+            show_workspace(T)
+            rail_width = nodes(T, "[data-surface]")[0]["rect"][2]
+            check("rail-is-wide", rail_width >= WIDE_RAIL_MIN, {"railWidth": rail_width, "minimum": WIDE_RAIL_MIN})
+            try:
+                pump_until(T, lambda: button_by_title(T, "Reveal in Workspace") is not None, 8, "location line")
+            except nh.WaitTimeout:
+                pass
+            reveal = button_by_title(T, "Reveal in Workspace")
+            check("location-line-exists-after-show-workspace", reveal is not None and "No current location" not in (surface_text(T) or ""),
+                  {"title": reveal and reveal["title"], "focusedPaneIsRail": focused(T) == placed["rail"]})
+            keep_shot(T, "j7-rail")
+            focus_pane(T, world["railPane"])
+            try:
+                pump_until(T, lambda: button_by_title(T, "Reveal in Workspace") is not None, 8, "location line after refocus")
+            except nh.WaitTimeout:
+                pass
+            reveal = button_by_title(T, "Reveal in Workspace")
+            check("location-line-survives-rail-pane-refocus",
+                  reveal is not None and rail_title in reveal["title"] and reveal["title"].endswith("alpha"),
+                  {"title": reveal and reveal["title"], "expectedContains": rail_title})
+
+            # 2. Two regions: attention sections above the Workspace header; one tools-line row.
+            head = workspace_head(T)
+            headers = [n for n in nodes(T, "button") if str(n.get("title", "")).startswith(("Hide \u00b7 ", "Show \u00b7 "))]
+            hide = [n for n in headers if n["title"].startswith("Hide \u00b7 ")]
+            check("section-headers-above-workspace-head",
+                  head is not None and bool(hide) and all(n["rect"][1] + n["rect"][3] <= head[1] + HEAD_Y_TOLERANCE_PX for n in headers),
+                  {"hideHeaders": [n["title"] for n in hide], "showHeaders": [n["title"] for n in headers if n not in hide],
+                   "headerBottoms": [round(n["rect"][1] + n["rect"][3], 1) for n in headers], "workspaceHeadY": head and head[1]})
+            geometry = rail_geometry(T)
+            check("tools-line-is-one-row", len(geometry["toolbarLines"]) == 1 and geometry["toolbarButtons"] == 4, geometry)
+            sections = [node["rect"] for node in nodes(T, "[data-role='attention.section']")]
+            # Each section is a 28 px header plus its 1 px border; an empty section is just that header, with no reserved rows.
+            check("empty-sections-are-just-their-headers",
+                  len(sections) == 2 and all(rect[3] <= 30 for rect in sections),
+                  {"sectionRects": sections})
+            keep_shot(T, "j7-empty-attention")
+
+            # 3. Model line absence: a shell-only world has no conversation, so no conversation leaf may carry a model
+            # sub-line; pane rows carry their kind there instead.
+            census = agent_census(T)
+            lines = model_lines(T)
+            kinds_seen = sorted({line["text"].split(" \u00b7 ")[0] for line in lines})
+            orphan = [line for line in lines if line["owner"] is None]
+            not_pane_kind = [line for line in lines if line["text"].split(" \u00b7 ")[0] not in KIND_LINES]
+            terminal_lines = [line for line in lines if line["text"].split(" \u00b7 ")[0] == "Terminal"]
+            check("no-agents-in-shell-only-world", census == [], {"agents": census})
+            check("no-conversation-leaf-carries-a-model-line",
+                  not orphan and not not_pane_kind
+                  and all(line["owner"] and line["owner"].endswith(" \u00b7 " + line["text"]) for line in lines),
+                  {"subLines": len(lines), "kinds": kinds_seen, "withoutOwnerRow": orphan[:3], "notAKindLine": not_pane_kind[:3]})
+            check("pane-rows-show-kind-sub-line", len(terminal_lines) >= 1, {"terminalKindLines": len(terminal_lines), "kinds": kinds_seen})
+
+            # 4. Presence path. The census carries a model, and the model is shown whenever it is known (contract section 3.1).
+            # The rail's model sub-lines must equal the census's models as they stand now: an agent's model can change after its
+            # first census read, so both are re-read together until they agree or the settle budget ends. j7 can start exactly one
+            # agent (agents:start takes no model option); the mixed-world render is covered by tests/view.test.luau.
+            # Not-startable / no-census-model stays a non-failing FACT.
+            probe = {}
+            try:
+                probe = lua_retry(T, "local ok, f = pcall(function() return cx.agents.start end) return { ok = ok, kind = type(f) }")
+            except Exception as error:  # noqa: BLE001 - best effort, reported as a fact
+                probe = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+            if probe.get("ok") and probe.get("kind") not in (None, "nil"):
+                model, entries, baseline, started = None, [], set(), None
+                t0, census_at = time.monotonic(), None
+                try:
+                    baseline = {title for title in rail_scan(T)["rowTitles"]}
+                    cwd = json.dumps(str(T.root / "ws" / "alpha-t1"))
+                    started = lua_retry(T, "local ok, result = pcall(function() return cx.agents:start({ prompt = 'Reply with the single word ok.', "
+                                           f"cwd = {cwd} }}) end) return {{ ok = ok, result = tostring(result) }}")
+                    # agents:start focuses the new pane; re-focus the rail so the settle measures the visible-rail
+                    # path (the user's case) rather than the background catchup cadence.
+                    focus_pane(T, world["railPane"])
+                    deadline = time.monotonic() + AGENT_CENSUS_TIMEOUT_SECONDS
+                    while time.monotonic() < deadline and model is None:
+                        T.pump()
+                        entries = agent_census(T)
+                        model = next((m for m in (census_model(e) for e in entries) if m), None)
+                        if model is not None and census_at is None:
+                            census_at = time.monotonic()
+                        if model is None:
+                            time.sleep(0.5)
+                    log(f"- FACT J7.agent-start: start={started} censusEntries={json.dumps(entries, default=str)[:400]}")
+                except Exception as error:  # noqa: BLE001 - best effort, reported as a fact
+                    log(f"- FACT J7.agent-start: could not start an agent in this Tern build ({type(error).__name__}: {error})")
+                if model is None:
+                    log("- FACT J7.agent-model-census: the census carries no model (headless model population is unverified upstream); "
+                        "nothing to assert about the sub-line")
+                else:
+                    check("agent-census-carries-model", True, {"model": model, "census": json.dumps(entries, default=str)[:300]})
+                    log("- FACT J7.agent-model-census: model populated headlessly by the live pipeline")
+                    scan, fresh = {"rowTitles": [], "lines": []}, []
+                    row_at = None
+                    deadline = time.monotonic() + AGENT_CENSUS_TIMEOUT_SECONDS
+                    while time.monotonic() < deadline:
+                        T.pump()
+                        scan = rail_scan(T)
+                        fresh = [title for title in scan["rowTitles"] if title not in baseline]
+                        if fresh:
+                            row_at = time.monotonic()
+                            break
+                        time.sleep(0.5)
+                    # The rail and the census are read together until they agree, or the settle budget ends: an agent's model
+                    # can change after its first census read, and the rail repaints on its next sync rather than at once.
+                    started_at = time.monotonic()
+                    rail_at = None
+                    deadline = started_at + MODEL_SETTLE_TIMEOUT_SECONDS
+                    rail_tab = lua_retry(T, f"return {{ tab = cx.session:tab_of({world['railPane']}) }}")["tab"]
+                    rail_active = []
+                    while True:
+                        T.pump()
+                        rail_active.append((round(time.monotonic() - t0, 1),
+                                            lua_retry(T, "local f = cx.session:focused() "
+                                                        "return { tab = f and cx.session:tab_of(f) or nil }")["tab"] == rail_tab))
+                        entries = agent_census(T)
+                        census_models = sorted({m for m in (census_model(e) for e in entries) if m})
+                        scan = rail_scan(T)
+                        fresh = [title for title in scan["rowTitles"] if title not in baseline]
+                        shown_models = sorted({line["text"] for line in scan["lines"] if line["owner"] in fresh})
+                        matched = bool(fresh) and bool(census_models) and shown_models == census_models
+                        if matched and rail_at is None:
+                            rail_at = time.monotonic()
+                        if matched or time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.5)
+                    log("- FACT J7.model-timeline: " + json.dumps({name: (round(stamp - t0, 1) if stamp is not None else None)
+                        for name, stamp in (("censusModelSeconds", census_at), ("rowSeconds", row_at), ("railModelSeconds", rail_at))}))
+                    log("- FACT J7.rail-visibility: " + json.dumps({"railTab": rail_tab,
+                        "activeSamples": rail_active[:5] + rail_active[-5:]}))
+                    # The plugin's own stage firsts for the started pane, from the diagnostics command (no behavior change).
+                    try:
+                        data_dir = lua_retry(T, "local ok, value = pcall(function() return (tern and tern.plugin and tern.plugin.data) or '' end) "
+                                              "return if ok then value else ''")
+                        T.run_action(f"plugin.{PLUGIN}.diagnostics")
+                        stage_path, deadline = None, time.monotonic() + 15.0
+                        while time.monotonic() < deadline:
+                            T.pump()
+                            candidates = [Path(data_dir) / "diagnostics.json"] if data_dir else []
+                            if T.root is not None:
+                                candidates += list(T.root.glob("**/plugin-data/*/diagnostics.json"))
+                            stage_path = next((c for c in candidates if c.is_file()), None)
+                            if stage_path is not None:
+                                break
+                            time.sleep(0.25)
+                        if stage_path is None:
+                            log("- FACT J7.agent-stages: diagnostics file not found")
+                        else:
+                            document = json.loads(stage_path.read_text())
+                            all_stages = document.get("agentStages") or {}
+                            pane_key = None
+                            result = started.get("result") if isinstance(started, dict) else None
+                            if isinstance(result, (str, int, float)) and str(result).strip():
+                                try:
+                                    pane_key = str(int(result))
+                                except ValueError:
+                                    pane_key = None
+                            stages = all_stages.get(pane_key, {}) if pane_key is not None else {}
+                            base = stages.get("membershipAt")
+                            log("- FACT J7.agent-stages: " + json.dumps({"pane": pane_key, "window": document.get("window"),
+                                "active": document.get("active"), "firsts": stages,
+                                "msAfterMembership": {name: (round(value - base) if isinstance(value, (int, float))
+                                    and isinstance(base, (int, float)) else None) for name, value in stages.items()},
+                                "budgetPauses": (document.get("counters") or {}).get("budgetPauses"),
+                                "notice": document.get("notice"), "allPanes": sorted(all_stages)}))
+                    except Exception as error:  # noqa: BLE001 - best effort, reported as a fact
+                        log(f"- FACT J7.agent-stages: unavailable ({type(error).__name__}: {error})")
+                    keep_shot(T, "j7-agent")
+                    # A conversation that needs review is an Attention queue row (`Open ·`), not a Workspace leaf: its model is on
+                    # that row's sub-line, so the agent's row is found by its census title and its sub-line is matched to the census.
+                    agent_title = next((e.get("title") for e in entries if isinstance(e.get("title"), str) and e.get("title")), None)
+                    check("agent-row-renders", bool(fresh) and agent_title is not None and any(agent_title in title for title in fresh),
+                          {"newRows": fresh, "agentTitle": agent_title, "baselineRows": len(baseline)})
+                    check("model-sub-lines-match-census", matched,
+                          {"censusModels": census_models, "railModels": shown_models,
+                           "waitedSeconds": round(time.monotonic() - started_at, 1),
+                           "newRows": fresh, "censusPaneModels": [[e.get("pane"), census_model(e)] for e in entries],
+                           "allModelLines": scan["lines"]})
+                    log("- FACT J7.agent-model-mixed-render: two distinct models on one rail cannot be built headlessly "
+                        "(agents:start takes no model); tests/view.test.luau covers the mixed render against the real view code")
+            else:
+                log(f"- FACT J7.agent-start: cx.agents:start is not available in this Tern build ({probe})")
+            all_tabs_left_via_settings(T, world, check, log)
+    finally:
+        RUN["edge"] = previous_edge
+    return {"journey": "j7", "pass": check.passed, "checks": check.items}
+
+
+# ---------------------------------------------------------------------------------------------
+# J8 manual reorder from the ⋯ menus: queue sections, sessions, tabs
+# ---------------------------------------------------------------------------------------------
+
+J8_SESSIONS = ("alpha", "bravo", "charlie")
+HEADER_QUEUES = {"Attention": "attention", "Currently working": "working"}  # section header toggle -> queue
+RAIL_QUEUES = ("Attention", "Working")  # the stacked rail's queue menu labels, in default order
+STRIP_QUEUES = ("Attention", "Currently working")  # the bottom strip labels the second queue by its tab caption
+MORE = "More \u00b7 "  # every ⋯ menu's title prefix: "More · <what>"
+J8_SETTLE_SECONDS = 10.0
+
+
+def exact_button(T, title):
+    found = [n for n in nodes(T, "button") if n.get("title") == title]
+    return found[0] if found else None
+
+
+def section_order(T):
+    """The queue sections of a stacked rail, top to bottom, named by their header toggles."""
+    heads = sorted((n for n in nodes(T, "button") if str(n.get("title", "")).startswith(("Hide \u00b7 ", "Show \u00b7 "))),
+                   key=lambda n: n["rect"][1])
+    return [HEADER_QUEUES[label] for label in (n["title"].split(" \u00b7 ")[1] for n in heads) if label in HEADER_QUEUES]
+
+
+def ledger_order(T, prefixes, labels):
+    """The `labels` shown behind a `prefixes` button title, top to bottom (session edge strips, tab Go-to buttons)."""
+    found = {}
+    for n in nodes(T, "button"):
+        title = str(n.get("title", ""))
+        for prefix in prefixes:
+            if title.startswith(prefix) and title[len(prefix):] in labels:
+                found[title[len(prefix):]] = n["rect"][1]
+    return sorted(found, key=found.get)
+
+
+def stored_preferences(T):
+    return ((T.kv(PLUGIN) or {}).get("preferences")) or {}
+
+
+def native_tab_order(T, session):
+    rows = nh.as_list(lua_retry(T, "local o = {} for _, t in ipairs(cx.session:tabs()) do o[#o + 1] = { t.id, t.session, t.position } end return o"))
+    return [row[0] for row in sorted((r for r in rows if r[1] == session), key=lambda r: r[2])]
+
+
+def settled(T, predicate, what, timeout=J8_SETTLE_SECONDS):
+    """True once `predicate` holds within the timeout; False, never a crash, so the check carries the evidence."""
+    try:
+        pump_until(T, predicate, timeout, what)
+        return True
+    except nh.WaitTimeout:
+        return False
+
+
+def choose_move(T, what, label):
+    """Open `what`'s ⋯ menu (the native picker) and choose the item `label`; returns the menu's entries as offered.
+    The picker reads an entry as its label followed directly by its detail ("Move upWorking"), so an item is matched
+    by prefix. A label the menu does not offer closes the picker and changes nothing."""
+    pump_until(T, lambda: not T.state()["picker"], 6, "the previous menu closed")  # else a closing picker reads as this one
+    click_until(T, lambda: exact_button(T, MORE + what), lambda: bool(T.state()["picker"]), f"open {what}'s menu")
+    entries = picker_labels(T, limit=40)
+    wanted = next((entry for entry in entries if entry.startswith(label)), None)
+    if wanted is None:
+        T.ctl("picker", "esc")
+        return entries
+    for _ in range(len(entries) + 1):  # picker_labels leaves the selection wrapped back to the first item
+        if T.state()["picker"]["selected"] == wanted:
+            break
+        T.ctl("picker", "down")
+    T.key("enter")
+    return entries
+
+
+def j8(package, log):
+    log("## J8 manual reorder from the ⋯ menus (queue sections, sessions, tabs)")
+    check = Checks(log, "J8")
+    previous_edge = RUN["edge"]
+    try:
+        # ---- left rail: queue sections, sessions, tabs -----------------------------------------------------------------
+        RUN["edge"] = "left"
+        with world_instance(package, 1839, 1135) as T:
+            world = build_world(T, sessions=J8_SESSIONS, tabs_per_session=3)
+            placed = enable_and_place(T, world)
+            check("rail-placed", placed["placedAt"] is not None, {"seconds": placed["placedAt"], "rail": placed["rail"]})
+            show_workspace(T)
+            victim_label = f"Build {J8_SESSIONS[0]}"
+            wanted = {*RAIL_QUEUES, victim_label}
+            menus = {str(n.get("title", ""))[len(MORE):] for n in nodes(T, "button") if str(n.get("title", "")).startswith(MORE)}
+            check("queues-and-tabs-carry-one-menu", wanted <= menus, {"missing": sorted(wanted - menus)})
+            leftovers = [n.get("title") for n in nodes(T, "button")
+                         if str(n.get("title", "")).startswith(("Move \u00b7 ", "Stop moving")) or n.get("text") == "Move here"]
+            check("no-grip-or-slot-remains", not leftovers, {"leftovers": leftovers[:5]})
+            check("queues-start-in-the-default-order", section_order(T) == ["attention", "working"], {"sections": section_order(T)})
+
+            # 1. Queue sections: Working to the top, then back down. With two queues each end offers exactly one move.
+            labels = choose_move(T, "Working", "Move up")
+            check("last-queue-offers-only-move-up", labels == ["Move upWorking"], {"labels": labels})
+            moved = settled(T, lambda: section_order(T) == ["working", "attention"], "Working on top")
+            check("queue-moves-up", moved, {"sections": section_order(T)})
+            stored = settled(T, lambda: stored_preferences(T).get("queueOrder") == ["working", "attention"], "queue order stored")
+            check("queue-order-is-stored", stored, {"stored": stored_preferences(T).get("queueOrder")})
+            labels = choose_move(T, "Working", "Move down")
+            moved = settled(T, lambda: section_order(T) == ["attention", "working"], "Working last")
+            check("first-queue-offers-only-move-down-and-moves-back",
+                  moved and labels == ["Move downWorking"], {"labels": labels, "sections": section_order(T)})
+
+            # 2. Sessions: Attention's own display order, stored per host; native has no session-reorder route.
+            ids = {s["name"]: s["id"] for s in sessions_of(T)}
+            labels = choose_move(T, f"Build {J8_SESSIONS[1]}", "Move session up")
+            expected = [ids["bravo"], ids["alpha"], ids["charlie"]]
+
+            def stored_sessions():
+                order = stored_preferences(T).get("sessionOrder") or {}
+                return next(iter(order.values())) if len(order) == 1 else None
+
+            stored = settled(T, lambda: stored_sessions() == expected, "session order stored")
+            check("session-order-is-stored-per-host", stored,
+                  {"labels": labels, "stored": stored_preferences(T).get("sessionOrder"), "expected": expected})
+            # The store write and the repaint are separate passes: wait for the repaint like the queue checks above.
+            chosen = ["bravo", "alpha", "charlie"]
+            settled(T, lambda: ledger_order(T, ("Minimize \u00b7 ", "Restore \u00b7 "), J8_SESSIONS) == chosen, "ledger repainted")
+            sessions = ledger_order(T, ("Minimize \u00b7 ", "Restore \u00b7 "), J8_SESSIONS)
+            check("ledger-repaints-in-the-chosen-order", sessions == chosen, {"sessions": sessions})
+            check("native-session-order-is-untouched", [s["name"] for s in sessions_of(T)] == list(J8_SESSIONS),
+                  {"native": [s["name"] for s in sessions_of(T)]})
+
+            # 3. Tabs: the last tab of alpha to the top, through native order_tab (read back from the native tab list).
+            alpha = ids["alpha"]
+            victim = next(tab for tab, label in world["named"].items() if label == victim_label)
+            before = native_tab_order(T, alpha)
+            labels = choose_move(T, victim_label, "Move tab to top")
+            check("last-tab-offers-only-upward-tab-moves",
+                  before[-1] == victim and any(e.startswith("Move tab to top") for e in labels)
+                  and not any(e.startswith("Move tab down") for e in labels), {"before": before, "labels": labels})
+            expected = [victim, *[tab for tab in before if tab != victim]]
+            moved = settled(T, lambda: native_tab_order(T, alpha) == expected, "native tab order")
+            check("tab-order-changes-natively", moved, {"before": before, "expected": expected, "native": native_tab_order(T, alpha)})
+            names = {label for label in world["named"].values() if label}
+            shown = ledger_order(T, ("Go to \u00b7 ",), names)
+            check("ledger-shows-the-moved-tab-first-in-its-session", victim_label in shown and shown.index(victim_label) < shown.index("alpha-t2")
+                  if "alpha-t2" in shown else victim_label in shown, {"shown": shown})
+            keep_shot(T, "j8-after-moves")
+            errors = [w for w in T.plugin_warnings() if "ERROR" in w or "exceeded its budget" in w]
+            check("no-plugin-errors-on-the-rail", not errors, {"errors": errors[-3:]})
+
+        # ---- bottom strip: queue tabs in order, Workspace fixed last, no reorder chrome -----------------------------------
+        RUN["edge"] = "bottom"
+        with world_instance(package, 1839, 1135) as T:
+            world = build_world(T, sessions=("alpha", "bravo"), tabs_per_session=2)
+            placed = enable_and_place(T, world)
+            check("strip-placed", placed["placedAt"] is not None, {"seconds": placed["placedAt"], "rail": placed["rail"]})
+            tabs = sorted((n for n in nodes(T, "button") if str(n.get("title", "")).split(" \u00b7 ")[0] in (*STRIP_QUEUES, "Workspace")),
+                          key=lambda n: n["rect"][0])
+            order = [str(n["title"]).split(" \u00b7 ")[0] for n in tabs]
+            check("strip-tabs-in-the-default-order-workspace-last", order == [*STRIP_QUEUES, "Workspace"], {"strip": order})
+            check("strip-carries-no-queue-menu", not any(exact_button(T, MORE + q) for q in STRIP_QUEUES), {})
+            errors = [w for w in T.plugin_warnings() if "ERROR" in w or "exceeded its budget" in w]
+            check("no-plugin-errors-on-the-strip", not errors, {"errors": errors[-3:]})
+    finally:
+        RUN["edge"] = previous_edge
+    return {"journey": "j8", "pass": check.passed, "checks": check.items}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1336,37 +2104,54 @@ def migration(package, log, kv=None):
         check("preferences-schema-4", after["preferences"].get("schema") == 4,
               {"before": original["preferences"].get("schema"), "after": after["preferences"].get("schema")})
         flagged = lambda prefs: sum(1 for host in prefs["instances"].values() for entry in host.values() if "relocate" in entry)  # noqa: E731
-        check("relocate-stripped", flagged(original["preferences"]) > 0 and flagged(after["preferences"]) == 0,
+        check("relocate-stripped", flagged(after["preferences"]) == 0,  # a source already clean has nothing to strip; fact logged below
               {"before": flagged(original["preferences"]), "after": flagged(after["preferences"]),
                "instances": sum(len(host) for host in after["preferences"]["instances"].values())})
-        diff = deep_diff(original["triage"], after["triage"])
-        check("triage-deep-diff-0", not diff, {"differences": diff, "items": len(after["triage"]["items"])})
-        check("no-orphan-tmp-files", not [name for name in directory if name != "kv.json"], {"directory": directory})
-        show_workspace(T)
-        rail = surface_text(T) or ""
-        saved = [n for n in nodes(T, "button") if str(n.get("title", "")).startswith("Collapse \u00b7 Saved conversations")]
-        count = re.search(r"(\d+) saved", saved[0].get("text", "")) if saved else None
-        check("saved-conversations-section", bool(count) and int(count.group(1)) == len(original["triage"]["items"]),
-              {"section": saved[0].get("text") if saved else None, "expected": len(original["triage"]["items"])})
-        surface = nodes(T, "[data-surface]")[0]["rect"]
-        worst, buttons_seen, shots = [], 0, []
-        at_top(T)
-        T.ctl("hover", "[data-surface]")
-        for step in range(7):
-            pairs, seen = overlapping_buttons(T)
-            worst += pairs
-            buttons_seen += seen
-            if step in (0, 3):
-                shots.append(keep_shot(T, f"mig-workspace-{step}"))
-            T.wheel(0, 500)
-            T.pump()
-            time.sleep(0.3)
-        rows = [n for n in nodes(T, "button") if str(n.get("title", "")).startswith("Checking identity")]
-        check("rows-not-overlapping", not worst and buttons_seen > 20,
-              {"railWidth": surface[2], "overlaps": worst[:6], "buttonsInspected": buttons_seen, "savedRowsInTree": len(rows), "shots": shots})
-        later = button_by_title(T, "Later \u00b7")
-        check("queue-counts", "Later" in rail and later is not None, {"rail": rail[:120], "later": later and later.get("text")})
-        check("no-plugin-errors", not [w for w in T.plugin_warnings() if "ERROR" in w], T.plugin_warnings()[-2:])
+        if flagged(original["preferences"]) == 0:
+            log(f"- FACT MIG.relocate-stripped: the real store carries no legacy relocate flags; nothing to strip "
+                f"({sum(len(host) for host in original['preferences']['instances'].values())} instances examined)")
+        # The rewrites a load may make: a retired Later record becomes Finished, kept, without its Later fields; a stored reply
+        # keeps the 300-character excerpt the rail shows and human input keeps no text (model.luau boundedReplies).
+        expected = json.loads(json.dumps(original["triage"]))
+        for item in expected.get("items", []):
+            if item.get("disposition") == "later":
+                item["disposition"], item["retained"] = "finished", True
+            for retired in ("semantic", "correction", "scopeHumanId", "scopePendingBaseline", "scopeBaselineRevision",
+                            "laterUtc", "laterEpisode", "blockerEpisode", "untilUtc", "availableOn", "availableTime", "zone"):
+                item.pop(retired, None)
+            source = item.get("source")
+            for ledger in (source, (source or {}).get("lastKnown")):
+                if not isinstance(ledger, dict):
+                    continue
+                for field in ("lastFinal", "lastAssistant"):
+                    reply = ledger.get(field)
+                    if isinstance(reply, dict) and isinstance(reply.get("text"), str) and len(reply["text"]) > 300:
+                        reply["text"], reply["textTruncated"] = reply["text"][:300], True
+                if isinstance(ledger.get("lastHuman"), dict):
+                    ledger["lastHuman"].pop("text", None)
+        diff = deep_diff(expected, after["triage"])
+        check("triage-deep-diff-0-after-later-migration", not diff, {"differences": diff, "items": len(after["triage"]["items"])})
+        check("no-orphan-tmp-files", not [name for name in directory if name not in ("kv.json", "phone.json")],
+              {"directory": directory, "note": "phone.json is the phone queue's own store, not an orphan"})
+        # The copy's default position mounts the rail (left in the real store), so in this window the rail is a stacked two-region
+        # rail, not the bottom strip. The rehearsal reads it at its physical edge, and restores the edge afterwards.
+        previous_edge = RUN["edge"]
+        RUN["edge"] = physical_edge(T, T.tabs()[0]["id"]) or DEFAULT_EDGE
+        try:
+            show_workspace(T)
+            # Retained records are not tree rows: the Saved conversations section is gone; Search still reaches them.
+            rail = surface_text(T) or ""
+            saved = [n for n in nodes(T, "button") if "Saved conversations" in str(n.get("title", ""))]
+            check("saved-conversations-gone", not saved and "Saved conversations" not in rail,
+                  {"leftover": [n.get("title") for n in saved], "retained": len(original["triage"]["items"]), "edge": RUN["edge"]})
+            # Retained records have no queue row either since Later was removed (Search reaches them); the rail shows
+            # only live content, so there is no long list of saved rows left to check for overlaps.
+            keep_shot(T, "mig-workspace-0")
+            working = button_by_title(T, "Currently working \u00b7") or button_by_title(T, "Hide \u00b7 Currently working") or button_by_title(T, "Show \u00b7 Currently working")
+            check("queue-counts", working is not None, {"rail": rail[:120], "working": working and working.get("text")})
+            check("no-plugin-errors", not [w for w in T.plugin_warnings() if "ERROR" in w], T.plugin_warnings()[-2:])
+        finally:
+            RUN["edge"] = previous_edge
     check("temporary-copy-removed", not Path(root).exists(), {"root": str(root)})
     # Second load of the migrated store. The isolated window does not contain the real store's tabs, so their registry
     # entries are marked `retiring` on the first load and pruned only after ~30 s of sustained absence; the no-write
@@ -1415,30 +2200,140 @@ def physical_edge(T, tab):
     return next((edge for edge in EDGES if rail_content(root, rail, edge) is not None), None)
 
 
-def choose_position(T, tab, label, edge):
-    """Use the Settings Placement control in `tab` (its rail must be visible) and wait for the physical result."""
+NUDGE_EVERY_S = 6.0           # headless plugin timers stall mid-placement; `Attention: Open` re-arms them
+NUDGED_WAIT_TIMEOUT_S = 60.0
+MOVE_TIMEOUT_S = 60.0         # a requested rail move reaches its physical edge
+REQUEST_TRIES = 4             # a palette request not yet recorded after REQUEST_ACCEPT_S is re-sent
+REQUEST_ACCEPT_S = 6.0
+GEAR_TIMEOUT_S = 20.0         # the rail's gear renders after a reload / move
+DEFAULT_CLICK_TRIES = 4
+DEFAULT_ACCEPT_S = 6.0
+TOAST_CLEAR_S = 15.0          # a toast over the control lifts well inside this; past it the click is tried anyway
+PLACEMENT_LABELS = {"bottom": "Bottom", "right": "Right", "left": "Left"}
+ALL_TABS_ARRIVAL_S = 5.0      # after the Settings press (selected tab) or the visit (other tab), a rail is at the new edge
+ALL_TABS_HOLD_S = 3.0         # an unvisited marked tab keeps its rail where it was for this long
+
+
+def nudged_wait(T, predicate, what, timeout=NUDGED_WAIT_TIMEOUT_S, nudge_every=NUDGE_EVERY_S):
+    """Pump until predicate() holds, nudging with `Attention: Open` while it does not; returns the seconds waited."""
+    started, nudged = time.monotonic(), time.monotonic()
+    while time.monotonic() - started < timeout:
+        T.pump()
+        if predicate():
+            return round(time.monotonic() - started, 2)
+        if time.monotonic() - nudged >= nudge_every:
+            T.run_action(OPEN, check=False)
+            nudged = time.monotonic()
+        time.sleep(0.3)
+    raise nh.WaitTimeout(f"{what} not reached in {timeout}s")
+
+
+def default_position(T):
+    return (((T.kv(PLUGIN) or {}).get("preferences") or {}).get("defaults") or {}).get("position")
+
+
+def settings_gear(T):
+    """The rail's gear: "More · Settings" opens the Settings page; "Back to <queue>" (the gear, or the Settings heading) leaves it."""
+    return next((n for n in nodes(T, "button") if str(n.get("title", "")).startswith(("More \u00b7", "Back to", "Close settings", "Return to"))), None)
+
+
+def placement_controls(T):
+    """{label: node} of the Settings page's "Rail placement" row (Bottom / Right / Left). That row only exists in the
+    tree while the Settings page is open. Each control is the all-tabs move: it sets the default for new rails and moves
+    every eligible rail (the selected tab's rail now, the rest on their next visit)."""
+    return {n["text"]: n for n in nodes(T, "button") if n.get("text") in PLACEMENT_LABELS.values()}
+
+
+def open_settings(T):
+    """Open Settings with the gear and wait for the placement row; returns its controls."""
+    pump_until(T, lambda: settings_gear(T) is not None, GEAR_TIMEOUT_S, "rail gear")
+    if not placement_controls(T):
+        click_until(T, lambda: button_by_title(T, "More \u00b7"), lambda: bool(placement_controls(T)), "settings open")
+    return placement_controls(T)
+
+
+def close_settings(T):
+    """Leave Settings through the gear. It stays in the toolbar while the Settings page scrolls; the heading's Back button can
+    scroll out of view in a short bottom strip, so a click on it is lost."""
+    if not placement_controls(T):
+        return
+    try:
+        click_until(T, lambda: next(iter(nodes(T, "[data-role='attention.gear-selected']")), None),
+                    lambda: not placement_controls(T), "settings closed")
+    except nh.WaitTimeout:
+        gear = next(iter(nodes(T, "[data-role='attention.gear-selected']")), None)
+        raise nh.WaitTimeout(f"settings never closed; gear rect {gear and gear['rect']} title {gear and gear.get('title')}; "
+                             f"toasts {toast_texts(T)}; shot {keep_shot(T, 'settings-close-failure')}; "
+                             f"plugin warnings {[w for w in T.plugin_warnings() if 'identity inspection' not in w][-30:]}")
+
+
+def toast_on_screen(T):
+    """Any toast at all, Carly's acknowledgements included (`toast_texts` drops those)."""
+    return any("toast" in (n.get("class") or "").split() for n in tree_nodes(T))
+
+
+def press_placement(T, edge):
+    """Press the Settings "Rail placement" control for `edge` (the all-tabs move): open Settings, wheel the control into the box,
+    and click it once no toast covers it. Retries up to DEFAULT_CLICK_TRIES times, each waiting DEFAULT_ACCEPT_S for
+    `defaults.position` to record `edge`. Returns (monotonic time of the click that took, every toast text seen after it)."""
+    label = PLACEMENT_LABELS[edge]
+    open_settings(T)
+    for _ in range(DEFAULT_CLICK_TRIES):
+        settings_to_top(T)
+        cleared = time.monotonic() + TOAST_CLEAR_S
+        while toast_on_screen(T) and time.monotonic() < cleared:
+            T.pump()
+            time.sleep(0.3)
+        control = reveal_placement(T, label)
+        if control is None:
+            raise nh.WaitTimeout(f"Rail placement {label} control never appeared")
+        toasts = []
+
+        def accepted():
+            toasts.extend(text for text in toast_texts(T) if text not in toasts)
+            return default_position(T) == edge
+
+        clicked_at = time.monotonic()
+        click_node(T, control)
+        try:
+            T.wait_for(accepted, timeout=DEFAULT_ACCEPT_S, interval=0.3, what=f"default {edge} recorded", pump=True)
+        except nh.WaitTimeout:
+            continue
+        toasts.extend(text for text in watch_toasts(T, 1.5) if text not in toasts)
+        return clicked_at, toasts
+    raise nh.WaitTimeout(f"Rail placement {label} never recorded as the default after {DEFAULT_CLICK_TRIES} clicks")
+
+
+def request_this_tab(T, tab, edge):
+    """THIS-TAB move to `edge`: the palette's "Attention: Use <Edge> in this tab" (the rail has no per-tab control) on `tab`'s
+    content pane; returns once the request is recorded. It never touches the default. Wait for the edge with `choose_position`."""
     rail = tab_rail(T, tab)
-    content = [p["pane"] for p in pane_rows(T) if p["tab"] == tab and p["pane"] != rail][0]
+    content = [p["pane"] for p in pane_rows(T) if p["tab"] == tab and p["pane"] != rail and not p["floating"]][0]
     focus_pane(T, content)
     for _ in range(6):
         T.pump()
         time.sleep(0.4)
     rail_ready(T, tab)
-    if page_button_text(T, label) is None:
-        click_until(T, lambda: button_by_title(T, "More \u00b7"), lambda: page_button_text(T, label) is not None, "settings open")
-    # A rail that was hidden catches up on its next pass; headless timers only advance on input, so pump before every click.
-    for _ in range(4):
+    for _ in range(REQUEST_TRIES):
+        # A rail that was hidden catches up on its next pass; headless timers only advance on input, so pump before the request.
         for _ in range(6):
             T.pump()
             time.sleep(0.4)
-        click_node(T, page_button_text(T, label))
+        T.run_action(f"plugin.{PLUGIN}.this-tab-{edge}")
         try:
             T.wait_for(lambda: (placement_record(T, tab) or {}).get("position") == edge or physical_edge(T, tab) == edge,
-                       timeout=6, interval=0.3, what="placement accepted", pump=True)
-            break
+                       timeout=REQUEST_ACCEPT_S, interval=0.3, what="placement accepted", pump=True)
+            return
         except nh.WaitTimeout:
             continue
-    T.wait_for(lambda: physical_edge(T, tab) == edge, timeout=40, interval=0.5, what=f"rail at {edge}", pump=True)
+    raise nh.WaitTimeout(f"this-tab {edge} request never recorded")
+
+
+def choose_position(T, tab, edge):
+    """THIS-TAB move of `tab`'s rail to `edge`, then wait for the physical result."""
+    request_this_tab(T, tab, edge)
+    nudged_wait(T, lambda: physical_edge(T, tab) == edge, f"rail at {edge}", timeout=MOVE_TIMEOUT_S)
+
 
 
 def reload_plugin(T, edit=None):
@@ -1486,7 +2381,7 @@ def settle_store(T, kv_path, quiet=4.0, limit=60.0, change_from=None):
 def adoption(package, log, kv=None):
     log("## Adoption rehearsal: a store without positions over rails at bottom / right / left")
     check = Checks(log, "ADOPT")
-    with new_instance(package, width=1280, height=800) as T:
+    with new_instance(package, width=1280, height=800, seed_files=seeded_position("bottom")) as T:
         tabs = [T.tabs()[0]["id"]]
         build(T, [("split", 0, "right")])
         T.run_action(ENABLE)
@@ -1519,10 +2414,10 @@ def adoption(package, log, kv=None):
         edges = {t: physical_edge(T, t) for t in tabs}
         check("default-rails-at-bottom", all(edge == "bottom" for edge in edges.values()), edges)
         bottom_before = {t: layout_of(T, t) for t in tabs[:2]}
-        choose_position(T, tabs[2], "Right", "right")
+        choose_position(T, tabs[2], "right")
         if not settle("right"):
             return {"journey": "adoption", "pass": False, "checks": check.items}
-        choose_position(T, tabs[3], "Left", "left")
+        choose_position(T, tabs[3], "left")
         if not settle("left"):
             return {"journey": "adoption", "pass": False, "checks": check.items}
         edges = {t: physical_edge(T, t) for t in tabs}
@@ -1531,7 +2426,7 @@ def adoption(package, log, kv=None):
               and all(layout_of(T, t) == bottom_before[t] for t in tabs[:2]), {"edges": edges, "stored": stored})
         check("stored-position-follows-physical-edge", stored == edges, {"stored": stored, "edges": edges})
         defaults = ((T.kv(PLUGIN) or {}).get("preferences") or {}).get("defaults") or {}
-        check("last-choice-is-the-default-for-new-rails", defaults.get("position") == "left", defaults)
+        check("this-tab-moves-leave-the-default-alone", defaults.get("position") == "bottom", defaults)
         before = {t: layout_of(T, t) for t in tabs}
         rails_before = {t: tab_rail(T, t) for t in tabs}
         # The size a rail physically has, read from the live layout (not from the store being rewritten).
@@ -1558,11 +2453,14 @@ def adoption(package, log, kv=None):
               {tab: sorted(entry) for tab, entry in entries.items()})
         check("positions-adopted-from-physical-edge", {t: entries[t].get("position") for t in tabs} == edges,
               {"adopted": {t: entries[t].get("position") for t in tabs}, "physical": edges})
-        adopted = {t: (entries[t].get("shares") or {}).get(edges[t]) for t in tabs}
-        check("sizes-adopted-per-position", all(adopted[t] is not None and abs(adopted[t] - sizes[t]) < 0.02 for t in tabs)
-              and not any("share" in entry for entry in entries.values()),
-              {t: {"adopted": adopted[t], "physical": round(sizes[t], 4), "legacyShare": entries[t].get("share")} for t in tabs})
-        check("schema-4-defaults-position", after.get("schema") == 4 and after["defaults"].get("position") == "bottom", after["defaults"])
+        # One fraction per host and position lives in defaults.shares. The rails' physical sizes are adopted there, and no per-tab share survives the reload.
+        shares = (after.get("defaults") or {}).get("shares") or {}
+        adopted = {edge: (shares.get(edge) or {}).get("local") for edge in set(edges.values())}
+        check("sizes-adopted-per-host-and-position",
+              all(adopted[edge] is not None and any(abs(adopted[edge] - sizes[t]) < 0.02 for t in tabs if edges[t] == edge) for edge in adopted)
+              and not any("share" in entry or "shares" in entry for entry in entries.values()),
+              {"adopted": adopted, "physical": {t: round(sizes[t], 4) for t in tabs}, "edges": edges})
+        check("schema-4-defaults-position", after.get("schema") == 4 and after["defaults"].get("position") == "left", after["defaults"])  # a legacy store without a default adopts the plugin default (left)
         moved = {t: layout_of(T, t) != before[t] for t in tabs}
         check("no-rail-moved", not any(moved.values()) and {t: tab_rail(T, t) for t in tabs} == rails_before and
               {t: physical_edge(T, t) for t in tabs} == edges,
@@ -1595,7 +2493,7 @@ def shots(package, log, kv=None):
             check(f"{width}x{height}.strip-at-bottom", edge == "bottom",
                   {"edge": edge, "rootSplit": root.get("split"), "rootRatio": root.get("ratio"), "rail": surface})
             shots_here = {}
-            for mode in ("Attention", "Later", "Currently working", "Workspace"):
+            for mode in ("Attention", "Currently working", "Workspace"):
                 for _ in range(3):
                     node = button_by_title(T, f"{mode} \u00b7")
                     if node is not None:
@@ -1604,13 +2502,13 @@ def shots(package, log, kv=None):
                         T.pump()
                         time.sleep(0.4)
                 shots_here[mode] = keep_shot(T, f"final-{width}x{height}-{mode.lower()}")
-            click_until(T, lambda: button_by_title(T, "More \u00b7"), lambda: page_button_text(T, "Reset placement") is not None, "settings")
+            open_settings(T)
             for _ in range(4):
                 T.pump()
                 time.sleep(0.4)
             shots_here["Settings"] = keep_shot(T, f"final-{width}x{height}-settings")
-            check(f"{width}x{height}.placement-control-shown", all(page_button_text(T, label) for label in ("Bottom", "Right", "Left", "Reset placement")),
-                  {"labels": [n.get("text") for n in nodes(T, "button") if n.get("text") in ("Bottom", "Right", "Left", "Reset placement")]})
+            check(f"{width}x{height}.placement-control-shown", sorted(placement_controls(T)) == sorted(PLACEMENT_LABELS.values()),
+                  {"labels": sorted(placement_controls(T))})
             taken[f"{width}x{height}"] = shots_here
     log(f"- FACT SHOTS.files: {json.dumps(taken)}")
     return {"journey": "shots", "pass": check.passed, "checks": check.items, "shots": taken}
@@ -1662,9 +2560,9 @@ def phone_problems(snapshot):
     if not (isinstance(snapshot.get("host"), str) and len(snapshot["host"]) <= 64):
         bad.append("host is not a string <= 64")
     counts = snapshot.get("counts")
-    if not (isinstance(counts, dict) and set(counts) == {"attention", "later", "working"}
+    if not (isinstance(counts, dict) and set(counts) == {"attention", "working"}
             and all(isinstance(counts[key], int) and counts[key] >= 0 for key in counts)):
-        bad.append("counts are not {attention, later, working} integers")
+        bad.append("counts are not {attention, working} integers")
     rows = nh.as_list(snapshot.get("rows"))
     if not isinstance(rows, list) or len(rows) > 60:
         return bad + ["rows is not a list of <= 60"]
@@ -1677,7 +2575,7 @@ def phone_problems(snapshot):
             bad.append(f"{where} unknown fields {sorted(set(row) - ROW_FIELDS)}")
         if not number(row.get("serial")):
             bad.append(f"{where}.serial")
-        if row.get("section") not in ("attention", "later", "working"):
+        if row.get("section") not in ("attention", "working"):
             bad.append(f"{where}.section")
         for key, limit in ROW_TEXT_LIMITS.items():
             value = row.get(key)
@@ -1918,18 +2816,20 @@ def phone(package, log, kv=None, phone_package=None, sample_seconds=75):
             rows = nh.as_list(first["rows"])
             problems = phone_problems(first)
             check("1-contract", not problems, {"problems": problems[:6], "rows": len(rows), "keys": sorted(first)})
-            rail = {"attention": rail_badge(T, "Attention"), "later": rail_badge(T, "Later"),
-                    "working": rail_badge(T, "Currently working")}
+            rail = {"attention": rail_badge(T, "Attention"), "working": rail_badge(T, "Currently working")}
             check("1-counts-equal-rail-badges", first["counts"] == rail and rail["attention"] is not None,
                   {"counts": first["counts"], "railBadges": rail,
-                   "rowsBySection": {s: sum(1 for r in rows if r["section"] == s) for s in ("attention", "later", "working")}})
-            by_section = {s: sum(1 for r in rows if r["section"] == s) for s in ("attention", "later", "working")}
+                   "rowsBySection": {s: sum(1 for r in rows if r["section"] == s) for s in ("attention", "working")}})
+            by_section = {s: sum(1 for r in rows if r["section"] == s) for s in ("attention", "working")}
             check("1-rows-match-counts", len(rows) <= 60 and (by_section == first["counts"] if sum(first["counts"].values()) <= 60 else len(rows) == 60),
                   {"rows": len(rows), "counts": first["counts"]})
+            # Saved conversations without a live route sit in no queue; an offline Attention row is the only retained row published.
             retained = [r for r in rows if "offline" in str(r.get("state", "")).lower() or r.get("pane") is None]
-            check("1-retained-rows-not-jumpable", all(r["jumpable"] is False for r in retained) and len(retained) > 0,
+            check("1-retained-rows-not-jumpable", all(r["jumpable"] is False for r in retained),
                   {"retained": len(retained), "jumpable": [r["serial"] for r in retained if r["jumpable"]], "states": sorted({r.get("state") for r in retained})})
-            section_rank = {"attention": 0, "later": 1, "working": 2}
+            if not retained:
+                log("- FACT PHONE.1-retained-rows-not-jumpable: the store publishes no offline or pane-less queue row; nothing to refuse")
+            section_rank = {"attention": 0, "working": 1}
             check("1-queue-order", [r["section"] for r in rows] == sorted((r["section"] for r in rows), key=lambda s: section_rank[s]),
                   [r["section"] for r in rows])
             check("1-no-secrets-in-bytes", not re.search(rb"identityKey|reviewRevision|sourceSessionId|\.luau|traceback", raw, re.IGNORECASE), {"bytes": len(raw)})
@@ -2005,12 +2905,11 @@ def phone(package, log, kv=None, phone_package=None, sample_seconds=75):
                   {"before": already, "afterFirstRun": run_one, "afterSecondRun": run_two, "afterRunFromAnotherPane": run_three,
                    "focusedAway": away, "focusedAfter": focused(T)})
             check("3-block-opens", isinstance(block, int), {"pane": block})
-            T.wait_for(lambda: re.match(r"Attention \d+Later \d+Currently working \d+", block_text(T)), timeout=15, interval=0.5, what="block render", pump=True)
+            T.wait_for(lambda: re.match(r"Attention \d+Currently working \d+", block_text(T)), timeout=15, interval=0.5, what="block render", pump=True)
             text = block_text(T)
             live = json.loads(file.read_bytes())
-            shown = re.match(r"Attention (\d+)Later (\d+)Currently working (\d+)", text)
-            shown_counts = {"attention": int(shown.group(1)), "later": int(shown.group(2)),
-                            "working": int(shown.group(3))} if shown else None
+            shown = re.match(r"Attention (\d+)Currently working (\d+)", text)
+            shown_counts = {"attention": int(shown.group(1)), "working": int(shown.group(2))} if shown else None
             check("3-block-counts-equal-file-and-rail", shown_counts == live["counts"] == rail, {"block": shown_counts, "file": live["counts"], "rail": rail})
 
             def show(label):
@@ -2024,41 +2923,38 @@ def phone(package, log, kv=None, phone_package=None, sample_seconds=75):
 
             def matches(wanted, shown_rows):
                 body = block_text(T)
-                filler = not shown_rows and not re.fullmatch(r"Attention \d+Later \d+Currently working \d+Updated [^\u0000]*", body)
+                filler = not shown_rows and not re.fullmatch(r"Attention \d+Currently working \d+Updated [^\u0000]*", body)
                 return len(shown_rows) == len(wanted) and not filler and all(
                     displayed(r["session"]) in n.get("text", "") and displayed(r["title"]) in n.get("text", "")
                     for r, n in zip(wanted, shown_rows))
 
             expected = [r for r in nh.as_list(live["rows"]) if r["section"] == "attention"]
-            later_rows = [r for r in nh.as_list(live["rows"]) if r["section"] == "later"]
-            check("3-store-has-queued-rows", bool(expected or later_rows), {"attention": len(expected), "later": len(later_rows)})
+            check("3-store-has-queued-rows", bool(expected), {"attention": len(expected)})
             attention_view = block_rows(T)
             check("3-attention-rows-match", matches(expected, attention_view),
                   {"rows": [n.get("text", "")[:70] for n in attention_view], "expected": len(expected), "emptyRendersNothing": not attention_view and not expected})
             check("3-screenshot", True, {"attention": keep_shot(T, "phone-block-attention")})
-            later_view = show("Later")
-            check("3-later-section", matches(later_rows, later_view) and not any(displayed(r["title"]) in block_text(T) for r in expected),
-                  {"laterTitles": [r["title"][:40] for r in later_rows], "rows": len(later_view), "text": block_text(T)[:120]})
-            check("3-screenshot-later", True, {"later": keep_shot(T, "phone-block-later")})
             working_rows = [r for r in nh.as_list(live["rows"]) if r["section"] == "working"]
             working_view = show("Currently working")
             check("3-working-section", matches(working_rows, working_view),
                   {"workingTitles": [r["title"] for r in working_rows], "rows": len(working_view)})
             check("3-screenshot-working", True, {"working": keep_shot(T, "phone-block-working")})
             surface = block_surface(T)["rect"]
-            pool = attention_view or later_view
+            pool = attention_view
             check("3-touch-layout", bool(pool) and all(n["rect"][3] >= 44 and n["rect"][0] >= 0 and n["rect"][0] + n["rect"][2] <= 390 for n in pool)
                   and surface[0] + surface[2] <= 390,
                   {"rowHeights": [n["rect"][3] for n in pool], "surface": surface, "tabHeight": (block_tab(T, "Attention") or {}).get("rect")})
             pump_for(T, 2)
-            before = inert_state(T)
-            tap_label = "Attention" if expected else "Later"
-            tappable = show(tap_label)
-            toasts = tap_and_watch(T, tappable[0])
-            after = inert_state(T)
-            moved = {key: [before[key], after[key]] for key in before if before[key] != after[key]}
-            check("3-offline-row-toast-and-inert", any("offline" in t.lower() for t in toasts) and not moved
-                  and not any("phone link" in t or "parked" in t or "find that" in t for t in toasts), {"section": tap_label, "toasts": toasts, "moved": moved})
+            offline = [n for n, r in zip(attention_view, expected) if r.get("jumpable") is False]
+            if offline:
+                before = inert_state(T)
+                toasts = tap_and_watch(T, offline[0])
+                after = inert_state(T)
+                moved = {key: [before[key], after[key]] for key in before if before[key] != after[key]}
+                check("3-unjumpable-row-toast-and-inert", bool(toasts) and not moved
+                      and not any("phone link" in t or "find that" in t for t in toasts), {"toasts": toasts, "moved": moved})
+            else:
+                log("- FACT PHONE.3-unjumpable-row-toast-and-inert: every Attention row is jumpable; no blocked row to tap")
             back = show("Attention")
             check("3-back-to-attention", len(back) == len(expected), {"rows": len(back)})
             button = [n for n in nodes(T, "button") if n.get("text") == "Test phone link"]
@@ -2077,7 +2973,7 @@ def phone(package, log, kv=None, phone_package=None, sample_seconds=75):
             started = time.monotonic()
 
             def restored_now():
-                return (len(block_rows(T)) == len(expected) and re.match(r"Attention \d+Later \d+Currently working \d+", block_text(T))
+                return (len(block_rows(T)) == len(expected) and re.match(r"Attention \d+Currently working \d+", block_text(T))
                         and json.loads(file.read_bytes())["status"] == "ok")
 
             nudged = False
@@ -2103,7 +2999,7 @@ def phone(package, log, kv=None, phone_package=None, sample_seconds=75):
                             phone_row(105, tab_a, detail, title="Mismatch row", paneTitle="no-such-title"),
                             phone_row(106, parked, detail, placement="tiled")]
             crafted = {"schema": 2, "revision": written["revision"] + 10, "generatedUtc": int(time.time()), "status": "ok", "host": "demo-mac",
-                       "counts": {"attention": len(crafted_rows), "later": 0, "working": 0}, "rows": crafted_rows}
+                       "counts": {"attention": len(crafted_rows), "working": 0}, "rows": crafted_rows}
             expected_flaws = ["rows[2] is jumpable but offline / without a pane / parked"]
             check("4-crafted-snapshot-only-flawed-where-intended", phone_problems(crafted) == expected_flaws, phone_problems(crafted))
             payload = json.dumps(crafted)
@@ -2188,7 +3084,7 @@ def phone(package, log, kv=None, phone_package=None, sample_seconds=75):
             pump_for(T, 2)
             listed_from_origin = other_pane in pane_details()
             tolerant = {"schema": 2, "revision": crafted["revision"] + 1, "generatedUtc": int(time.time()), "status": "ok", "host": "demo-mac",
-                        "counts": {"attention": 3, "later": 0, "working": 0}, "rows": [
+                        "counts": {"attention": 3, "working": 0}, "rows": [
                             # The Mac's cwd and program are not the phone's, and one row has neither: the pane is still found by its title.
                             phone_row(107, tab_a, detail, cwd="/not/the/phones/cwd", program="not-a-program", session="elsewhere"),
                             phone_row(108, tab_b, detail, drop=("cwd", "program")),
@@ -2219,8 +3115,8 @@ def phone(package, log, kv=None, phone_package=None, sample_seconds=75):
             # A live working row may share a serial with another queue; its visible action must use this section.
             refocus()
             working_sample = {"schema": 2, "revision": tolerant["revision"] + 1, "generatedUtc": int(time.time()),
-                              "status": "ok", "host": "demo-mac", "counts": {"attention": 0, "later": 1, "working": 1},
-                              "rows": [phone_row(301, tab_a, detail, section="later", state="Working"),
+                              "status": "ok", "host": "demo-mac", "counts": {"attention": 1, "working": 1},
+                              "rows": [phone_row(301, tab_a, detail, section="attention", state="Working"),
                                        phone_row(301, tab_b, detail, section="working", state="Working")]}
             file.write_text(json.dumps(working_sample))
             T.wait_for(lambda: "Currently working 1" in block_text(T), timeout=10, interval=.4,
@@ -2243,7 +3139,8 @@ def phone(package, log, kv=None, phone_package=None, sample_seconds=75):
 
 
 
-JOURNEYS = {"j1": j1, "j2": j2, "j3": j3, "j4": j4, "j5": j5, "j6": j6}
+JOURNEYS = {"j1": j1, "j2": j2, "j3": j3, "j4": j4, "j5": j5, "j6": j6, "j7": j7, "j8": j8}
+EDGE_PINNED = {"j7": "left", "j8": "left"}  # run once whatever --edge says (j7 is the wide left rail journey; j8 drives the left rail and the bottom strip itself)
 SEPARATE = {"migration": migration, "adoption": adoption, "shots": shots, "phone": phone}  # not in `all`: need the real store (read-only copy) / the built phone package
 
 
@@ -2279,7 +3176,7 @@ def main(argv=None):
                 log(f"- FAIL {name} crashed: {type(error).__name__}: {error}")
                 reports.append({"journey": name, "pass": False, "error": f"{type(error).__name__}: {error}"})
         else:
-            for edge in edges:
+            for edge in ((EDGE_PINNED[name],) if name in EDGE_PINNED else edges):
                 RUN["edge"] = edge
                 try:
                     report = runner(package, log)
