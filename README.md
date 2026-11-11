@@ -2,7 +2,7 @@
 
 # Attention
 
-**A needs-attention rail for Tern. No bell icon required.**
+**My highly opinionated attention rail for Tern.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
