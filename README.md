@@ -12,7 +12,9 @@
 
 ---
 
-<img src="docs/media/attention.png" alt="Attention in a left rail: Working and Attention queues over the Workspace" width="420">
+<p align="center">
+  <img src="docs/media/attention.png" alt="Attention in a left rail: Working and Attention queues over the Workspace" width="420">
+</p>
 
 Clicking Tern's stock ⌘⇧I needs-attention inbox was too many clicks, so I built this! Why click many times when one click better.
 
@@ -20,7 +22,7 @@ Clicking Tern's stock ⌘⇧I needs-attention inbox was too many clicks, so I bu
 - **A Workspace underneath** that matches the ergonomics of the native ⌘B sidebar (hosts, sessions, tabs), bar a few things Tern's plugin API can't do yet.
 - **Next / Previous buttons.** I find myself using Previous more than Next.
 
-It's factual: native runtime state and your explicit choices only. No AI inference, no prompts sent on your behalf, nothing leaves the machine. There's also a read-and-jump phone queue — your iPhone mirrors the queue from your Mac, and tapping a row jumps to that conversation.
+Enjoy! If you have any issues or suggestions, feel free to open an issue or PR.
 
 ## Install
 
