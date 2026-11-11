@@ -1246,7 +1246,7 @@ test("source questions, provider errors and recorded activity word a row's need"
 	local failed = replay(102, { questions = {}, questionCoverage = { status = "complete", knownTotal = 0, included = 0, omitted = 0 },
 		lastError = { id = "e", kind = "usage_limit", atUtc = 101 }, lastActivityAtUtc = 101 })
 	assert(row(failed, 11).attention and failed.attentionCount == 1, "a provider error that ended the turn needs attention")
-	assert(needOf(failed, 11) == "provider|Usage limit · reset time unknown|nil" and row(failed, 11).reason == "Recorded: Usage limit reached")
+	assert(needOf(failed, 11) == "provider|Hit usage limit|nil" and row(failed, 11).reason == "Recorded: Usage limit reached")
 	-- Every account blocked until 150: the row rests out of Attention, then returns on its own once the clock passes.
 	local blocked = replay(102.5, { lastError = { id = "e", kind = "usage_limit", atUtc = 101,
 		limit = { status = "blocked", untilUtc = 150 } } })
@@ -1256,7 +1256,7 @@ test("source questions, provider errors and recorded activity word a row's need"
 	assert(row(reset, 11).attention and reset.attentionCount == 1 and row(reset, 11).resting == nil
 		and needOf(reset, 11) == "provider|Usage limit · reset due|nil", "the deadline passing returns the row, never claiming a reset")
 	local unproven = replay(102.8, { lastError = { id = "e", kind = "usage_limit", atUtc = 101, limit = { status = "clear" } } })
-	assert(needOf(unproven, 11) == "provider|Usage limit · reset time unknown|nil", "only an omp deadline makes a reset due")
+	assert(needOf(unproven, 11) == "provider|Hit usage limit|nil", "only an omp deadline makes a reset due")
 	live.now, live.agents[1].state = 2, "working"
 	local working = replay(103)
 	assert(not row(working, 11).attention and needOf(working, 11) == "working|Working|103",
@@ -1268,7 +1268,7 @@ test("source questions, provider errors and recorded activity word a row's need"
 	local settled = replay(111)
 	assert(not row(settled, 11).attention and needOf(settled, 11) == nil, "an error recorded before the new work is history")
 	local again = replay(120, { lastError = { id = "e2", kind = "rate_limit", atUtc = 115 } })
-	assert(row(again, 11).attention and needOf(again, 11) == "provider|Rate limited · reset time unknown|nil")
+	assert(row(again, 11).attention and needOf(again, 11) == "provider|Hit rate limit|nil")
 	local unknownClock = replay(121, { coverage = { fields = { clock = "unknown", questions = "supported" } } })
 	assert(not row(unknownClock, 11).attention and needOf(unknownClock, 11) == nil, "an unparsed clock asserts no provider error")
 end)

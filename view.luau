@@ -588,7 +588,7 @@ end
 -- Line two of a rail queue row: model · need · age, with a separator only between present parts. The need is the
 -- model's own worded phrase (`row.need`, model.luau); the view decides only whether a Working row has stalled. CSS
 -- truncates the need first, then the model; the age never truncates and keeps its full sentence in its tooltip.
-local function railDetail(row, model, ageNode, nowUtc)
+local function railDetail(row, model, nowUtc)
 	local parts = {}
 	local function add(item)
 		if #parts > 0 then
@@ -633,14 +633,7 @@ local function railDetail(row, model, ageNode, nowUtc)
 			add(needNode)
 		end
 	end
-	local clock = if ageNode then primaryClock(row) else nil
-	-- The short age ("2m", "≈ 3h"); a row with a fixed chip (no clock) leaves its sentence to the row tooltip.
-	if clock then
-		local elapsed = if finite(clock.atUtc) and finite(nowUtc) and nowUtc >= clock.atUtc
-			then phone.age(nowUtc - clock.atUtc) else "?"
-		ageNode.p.text = (if clock.recorded == true then "≈ " else "") .. elapsed
-		add(ageNode)
-	end
+	-- No age: the clock's sentence stays in the row tooltip.
 	return node("row", { key = "detail", role = "attention.detail-line", gap = "none", wrap = false }, parts)
 end
 
@@ -1166,7 +1159,7 @@ function view.render(renderer, logical, presentation, options)
 					chip.p.title, chip.p.truncate, chip.p.wrap = priorityName, nil, nil
 					table.insert(line, chip)
 				end
-				table.insert(lines, railDetail(row, model, ageNode, options.nowUtc))
+				table.insert(lines, railDetail(row, model, options.nowUtc))
 				local sessionName = text("name", "attention.rail-session", string.upper(session))
 				sessionName.p.truncate, sessionName.p.title = "end", session
 				content = { node("row", { key = "cells", role = "attention.cells", gap = "sm", wrap = false }, {

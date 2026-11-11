@@ -2424,13 +2424,12 @@ do
 	assert(#line.c == 2 and line.c[2].p.key == "priority" and line.c[2].p.role == "attention.priority"
 		and line.c[2].p.text == "P1" and line.c[2].p.title == "P1 Next", "line one is the title and its priority chip, nothing else")
 	local detail = detailOf(rowNode)
-	assert(detail.p.role == "attention.detail-line" and keys(detail) == "need,sep-age,age",
-		"line two is need · age when no model is known: " .. keys(detail))
+	assert(detail.p.role == "attention.detail-line" and keys(detail) == "need",
+		"line two is the need alone when no model is known; it carries no age: " .. keys(detail))
 	assert(detail.c[1].p.role == "attention.need" and detail.c[1].p.text == "New update" and detail.c[1].p.title == "New update",
 		"the need is the model's phrase, verbatim, with its full text in a tooltip")
-	assert(detail.c[2].p.role == "attention.detail-sep" and detail.c[2].p.text == "·")
-	assert(detail.c[3].p.text == "6m" and detail.c[3].p.role == "attention.age", "the age is the short elapsed time")
-	assert(detail.c[3].p.title == "The agent last replied 6 minutes ago.", "the short age keeps the full sentence in its tooltip")
+	assert(string.find(childAt(main, "open").p.title, "The agent last replied 6 minutes ago.", 1, true),
+		"the clock's sentence stays in the row tooltip")
 	assert(main.c[2].p.role == "attention.more" and main.c[2].c[1].p.name == "more" and main.c[2].c[1].p.role == "attention.more-icon")
 	assert(view.resolve(renderer, main.c[2].p.actions.click).op == "menu", "More opens the tracking menu")
 	local last = 0
@@ -2450,9 +2449,9 @@ do
 	local second = railScreen("rail-unset", { unpriced })
 	local unpricedRow = childAt(sectionRows(second, "attention"), "r2")
 	assert(#lineOf(unpricedRow).c == 1, "an unset priority renders no chip")
-	assert(keys(detailOf(unpricedRow)) == "age", "no need, no model: the age alone, with no stray separator")
+	assert(keys(detailOf(unpricedRow)) == "", "no need, no model: an empty line two, with no stray separator")
 
-	-- With a known model, line two reads model · need · age; a recorded clock keeps its ≈ and its dashed role.
+	-- With a known model, line two reads model · need.
 	local modeled = railItem(3)
 	modeled.need, modeled.sourceObservation.status = { kind = "question", text = "Asks: Ship it?" }, "missing"
 	local modeledInput = presentation({ modeled })
@@ -2463,11 +2462,9 @@ do
 	local modeledRow = childAt(sectionRows(paint(view.newRenderer("rail-model"), modeledLogical, modeledInput, nil,
 		{ position = "left", nowUtc = 1320 }), "attention"), "r3")
 	local modeledDetail = detailOf(modeledRow)
-	assert(keys(modeledDetail) == "model,sep-need,need,sep-age,age", "model · need · age: " .. keys(modeledDetail))
-	assert(textOf(modeledDetail) == "Opus 5.5\n·\nAsks: Ship it?\n·\n≈ 2m", textOf(modeledDetail))
-	assert(modeledDetail.c[1].p.role == "attention.model-line" and modeledDetail.c[5].p.role == "attention.age-recorded",
-		"the model keeps its line role; a recorded age keeps the recorded style")
-	assert(string.find(modeledDetail.c[5].p.title, "cannot be read right now", 1, true), "the recorded age's tooltip says why")
+	assert(keys(modeledDetail) == "model,sep-need,need", "model · need: " .. keys(modeledDetail))
+	assert(textOf(modeledDetail) == "Opus 5.5\n·\nAsks: Ship it?", textOf(modeledDetail))
+	assert(modeledDetail.c[1].p.role == "attention.model-line", "the model keeps its line role")
 
 	-- A Working row's line two follows what its agent waits on: a model call is quiet until 15m, then Stalled; a tool
 	-- is named after a minute and Stalled only past an hour; with nothing known in flight, it never claims a stall.

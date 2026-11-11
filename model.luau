@@ -146,8 +146,8 @@ end
 -- A usage or rate limit's three wordings: while omp blocks every account (the row rests, out of Attention), once
 -- that block's deadline passed (due, never claimed as reset: the provider may still refuse), and with no deadline.
 local LIMIT_NEEDS = {
-	usage_limit = { "Usage limit", "Usage limit · reset due", "Usage limit · reset time unknown" },
-	rate_limit = { "Rate limited", "Rate limit · reset due", "Rate limited · reset time unknown" },
+	usage_limit = { "Usage limit", "Usage limit · reset due", "Hit usage limit" },
+	rate_limit = { "Rate limited", "Rate limit · reset due", "Hit rate limit" },
 }
 
 -- Until when a limited row rests: the reader's `limit` says every enabled account of the provider is blocked until
