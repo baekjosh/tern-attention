@@ -16,8 +16,8 @@
 
 Clicking Tern's stock ⌘⇧I needs-attention inbox was too many clicks, so I built this! Why click many times when one click better.
 
-- **A needs-attention view that's just there.** I keep it pinned below my panes, sticky across all windows. No clicking a bell icon to see what needs me.
-- **A Workspace tab** that's pretty much the same thing as the ⌘B side window. Honestly I rarely use it — the simplicity of the attention inbox suits the monkey brain better: know what button to press next, instead of navigating sessions and tabs. That's what ⌘B is for; I keep the stock left sidebar and the attention pane at the bottom.
+- **Working, then Attention.** I run it as a left rail. The top lists the tabs whose agents are working right now; below that, what needs you: a question, a finished reply, a turn that failed. Swap the two from either section's **⋯** menu.
+- **A Workspace underneath** that matches the ergonomics of the native ⌘B sidebar (hosts, sessions, tabs), bar a few things Tern's plugin API can't do yet.
 - **Next / Previous buttons.** I find myself using Previous more than Next.
 
 It's factual: native runtime state and your explicit choices only. No AI inference, no prompts sent on your behalf, nothing leaves the machine. There's also a read-and-jump phone queue — your iPhone mirrors the queue from your Mac, and tapping a row jumps to that conversation.
