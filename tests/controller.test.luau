@@ -2002,8 +2002,8 @@ do
 	world:command("open"); world:advance(3100)
 	assert(#world.opens == 3 and world.membership[world.opens[3].pane] == 3, "Open recreates only the current hidden tab")
 	world:switch(5); world:advance(3100)
-	assert(world.prefs.instances["host-8"]["5"].pane == world.opens[4].pane,
-		"remote host instances must have independent stable identity")
+	assert(world.prefs.instances["host-8"] == nil and #world.opens == 3 and world.layouts[5].pane == 12,
+		"visiting a remote host never publishes the private workspace into its session")
 	assert(world.membership[second] == 4, "host navigation cannot borrow another instance")
 end
 
@@ -2562,33 +2562,29 @@ do
 	end
 end
 
--- Parked, floating and rails of a disconnected host are not painted; an ordinary background rail beside them is.
+-- Parked and floating rails are not painted; an ordinary local background rail beside them is.
 do
 	local world = native(true)
-	world:addTab(4, 11); world:addTab(5, 12); world:addTab(6, 13, 8, 9); world:addTab(7, 14)
-	world.additionalAgents = { [11] = "working", [12] = "working", [13] = "working", [14] = "working" }
+	world:addTab(4, 11); world:addTab(5, 12); world:addTab(7, 14)
+	world.additionalAgents = { [11] = "working", [12] = "working", [14] = "working" }
 	world:advance(3100)
 	local rails = { world.opens[1].pane }
-	for tab = 4, 7 do
+	for _, tab in { 4, 5, 7 } do
 		world:switch(tab); world:advance(3100)
 		table.insert(rails, world.opens[#world.opens].pane)
 	end
 	world:switch(3); world:advance(3100)
-	local ordinary, parked, remote, floating = rails[2], rails[3], rails[4], rails[5]
+	local ordinary, parked, floating = rails[2], rails[3], rails[4]
 	world.layouts[5], world.parked[parked] = { pane = 12 }, true
 	world.layouts[7], world.floating[floating], world.floats[7] = { pane = 14 }, true, { { pane = floating } }
-	world.hostStates[8] = "disconnected"
 	world:advance(1100)
 	local sets = copy(world.canvasSetsByPane)
 	setSecondRequest(world, true)
 	world:advance(1500)
 	assert(queueCount(world, ordinary, "attention") == "2", "fixture: an ordinary background rail catches up")
-	for _, rail in { parked, remote, floating } do
-		assert((world.canvasSetsByPane[rail] or 0) == (sets[rail] or 0), "a parked, floating or offline-host rail is not painted")
+	for _, rail in { parked, floating } do
+		assert((world.canvasSetsByPane[rail] or 0) == (sets[rail] or 0), "a parked or floating rail is not painted")
 	end
-	world.hostStates[8] = nil
-	world:advance(1500)
-	assert(queueCount(world, remote, "attention") == "2", "a reconnected host's rail catches up")
 end
 
 do
@@ -2671,23 +2667,23 @@ end
 
 do
 	local world = native(true)
-	world:addTab(5, 12, 8, 9)
+	world:addTab(5, 12, 1, 9)
 	world:advance(3100); world:switch(5); world:advance(3100)
 	local pane = world.opens[2].pane
 	world.layouts[5], world.parked[pane] = { pane = 12 }, true
-	world.hostStates[8] = "disconnected"
+	world.hostStates[1] = "disconnected"
 	world:advance(1100)
-	assert(world.canvases[pane] and not world.prefs.instances["host-8"]["5"].retiring,
+	assert(world.canvases[pane] and not world.prefs.instances["local"]["5"].retiring,
 		"disconnection alone is unknown availability, not confirmed retirement")
 	world:emit("tab_closed", { tab = 5 })
 	world.tabs[5], world.membership[12] = nil, nil
 	world:reload(); world:advance(1000)
-	assert(world.canvases[pane] and world.prefs.instances["host-8"]["5"].retiring,
+	assert(world.canvases[pane] and world.prefs.instances["local"]["5"].retiring,
 		"confirmed disconnected-tab retirement survives reload without closing an unavailable pane")
-	world.hostStates[8] = "connected"
+	world.hostStates[1] = "connected"
 	world:switch(3); world:advance(1100)
-	assert(not world.canvases[pane] and world.prefs.instances["host-8"] == nil,
-		"reconnection consumes durable retirement, leaves no owned parked orphan, and drops the empty host bucket")
+	assert(not world.canvases[pane] and world.prefs.instances["local"]["5"] == nil,
+		"reconnection consumes durable retirement and leaves no owned parked orphan")
 end
 
 for _, phase in { "placing", "recovering", "failed" } do
@@ -3229,60 +3225,48 @@ do
 	assert(world.layouts[4].split == "right" and world.layouts[4][1].pane == second, "the other tab still waits for its visit")
 end
 
--- Left for all marks a rail on an offline host as well: its stored entry carries the marker, nothing is moved while
--- the host is away, and the rail moves on its first visit after the host connects.
+-- Remote sessions are shared surfaces: neither explicit Open nor all-tabs placement may publish a local rail.
 do
 	local world = native(true)
 	world:addTab(4, 11, 5, 7)
 	world:advance(3100)
-	local here = world.opens[1].pane
+	local localRail = world.opens[1].pane
 	world:switch(4); world:advance(3100)
-	local remote = world.opens[2].pane
-	world:switch(3); world:advance(100)
-	assert(world.prefs.instances["host-5"]["4"] and world.layouts[4].split == "right" and world.root.split == "right",
-		"fixture: a local rail and a remote rail both sit on the left")
-	world.hostStates[5] = "disconnected"
-	world:advance(1100)
-	local tree, writes = copy(world.layouts[4]), world.layoutWritesByTab[4] or 0
-	world:command("all-tabs-bottom"); world:advance(1500)
-	assert(toastCount(world, "info", "This tab moves now · 1 tab moves on their next visit") == 1,
-		"the connected rail moves now and the offline host's rail is queued for its next visit")
-	assert(world.root.split == "down" and world.root[2].pane == here, "the connected rail moves")
-	local offline = world.prefs.instances["host-5"]["4"]
-	assert(offline.moveTo == "bottom" and offline.position == "left" and equalValue(world.layouts[4], tree)
-		and (world.layoutWritesByTab[4] or 0) == writes and world.canvases[remote],
-		"the offline host's rail is marked and not moved while the host is away")
-	world.hostStates[5] = nil
-	world:advance(1100)
-	world:switch(4); world:advance(3100)
-	assert(world.layouts[4].split == "down" and world.layouts[4][2].pane == remote
-		and world.prefs.instances["host-5"]["4"].moveTo == nil and world.prefs.instances["host-5"]["4"].position == "bottom",
-		"the rail moves on its first visit after the host connects")
+	world:command("open"); world:advance(100)
+	world:command("all-tabs-bottom"); world:advance(3100)
+	assert(world.layouts[4].pane == 11 and world.prefs.instances["host-5"] == nil,
+		"remote content remains alone after automatic and explicit placement")
+	assert(#world.opens == 1 and world.canvases[localRail] ~= nil,
+		"the local navigator remains available without creating a remote copy")
+	world.hostStates[5] = "disconnected"; world:advance(1100)
+	world.hostStates[5] = nil; world:advance(3100)
+	assert(#world.opens == 1 and world.layouts[4].pane == 11,
+		"reconnection cannot recreate a private navigator on the remote host")
 end
 
--- The selected tab on an offline host is not an eligible visit: its mark stays while the host is away, and the rail
--- moves on the next pass after the host connects.
+-- Upgrade removes old remote canvases even when parked, leaving other plugins and content untouched.
 do
 	local world = native(true)
 	world:addTab(4, 11, 5, 7)
+	for _, pane in { 77, 78 } do
+		world.canvases[pane] = { pane = pane, owner = "attention", about = "attention:tab:v1:7:4",
+			title = "Private workspace", view = { k = "text", p = { text = "Private local conversation" } } }
+		world.membership[pane], world.paneHosts[pane] = 4, 5
+	end
+	world.parked[78] = true
+	world.canvases[79] = { pane = 79, owner = "notes", about = "notes:board", title = "Notes",
+		view = { k = "text", p = { text = "Remote notes" } } }
+	world.membership[79], world.paneHosts[79] = 4, 5
+	world.layouts[4] = { split = "right", ratio = 0.3, [1] = { pane = 77 }, [2] = { pane = 11 } }
+	world.prefs.instances["host-5"] = { ["4"] = { tab = 4, session = 7, pane = 77, userHidden = false } }
 	world:advance(3100)
-	world:switch(4); world:advance(3100)
-	local remote = world.opens[2].pane
-	assert(world.prefs.instances["host-5"]["4"] and world.layouts[4].split == "right",
-		"fixture: the selected tab is on the remote host with its rail on the left")
-	world.hostStates[5] = "disconnected"
-	world:advance(1100)
-	local tree, writes = copy(world.layouts[4]), world.layoutWritesByTab[4] or 0
-	world:command("all-tabs-bottom"); world:advance(3000)
-	local offline = world.prefs.instances["host-5"]["4"]
-	assert(offline.moveTo == "bottom" and offline.position == "left" and equalValue(world.layouts[4], tree)
-		and (world.layoutWritesByTab[4] or 0) == writes and toastCount(world, "info", "This tab moves now") == 0,
-		"the selected tab on an offline host keeps its mark and does not move")
-	world.hostStates[5] = nil
-	world:advance(3100)
-	assert(world.layouts[4].split == "down" and world.layouts[4][2].pane == remote
-		and world.prefs.instances["host-5"]["4"].moveTo == nil and world.prefs.instances["host-5"]["4"].position == "bottom",
-		"the rail moves once the host connects")
+	assert(world.canvases[77] == nil and world.canvases[78] == nil and world.layouts[4].pane == 11,
+		"upgrade removes both visible and parked leaked canvases without closing the content pane")
+	assert(world.canvases[79] and world.canvases[79].view.p.text == "Remote notes",
+		"cleanup never closes another plugin's canvas")
+	world:switch(4); world:advance(3100); world:reload(); world:advance(3100)
+	assert(world.canvases[77] == nil and world.canvases[78] == nil and #world.opens == 1,
+		"visiting and reloading cannot resurrect the removed remote rails")
 end
 
 -- Hiding, parking or floating a marked rail, or moving it by hand, drops the marker without moving anything; a
@@ -4879,25 +4863,25 @@ end
 
 do
 	local world = native(true)
-	world:addTab(4, 11, 5, 7)
-	world:addTab(6, 14, 5, 9)
+	world:addTab(4, 11, 1, 7)
+	world:addTab(6, 14, 1, 9)
 	world.additionalAgents = { [11] = "waiting_input" }
 	world:advance(3100)
 	world:switch(4); world:advance(3100)
 	local rail = world.opens[#world.opens].pane
-	assert(world.prefs.instances["host-5"]["4"], "the remote tab records its instance")
-	world.hostStates[5] = "disconnected"
+	assert(world.prefs.instances["local"]["4"], "the local tab records its instance")
+	world.hostStates[1] = "disconnected"
 	world.tabs[4], world.layouts[4] = nil, nil
 	world.membership[11], world.membership[rail], world.canvases[rail] = nil, nil, nil
 	world:switch(3)
 	world:advance(4100)
-	assert(world.prefs.instances["host-5"]["4"], "a disconnected host never retires its instances")
-	world.hostStates[5] = nil
+	assert(world.prefs.instances["local"]["4"], "a disconnected host never retires its instances")
+	world.hostStates[1] = nil
 	world:advance(1500)
-	assert(world.prefs.instances["host-5"]["4"], "absence shorter than three passes keeps the instance")
+	assert(world.prefs.instances["local"]["4"], "absence shorter than three passes keeps the instance")
 	world:advance(31000)
-	assert(world.prefs.instances["host-5"] == nil,
-		"an unobserved remote tab close retires after sustained absence, dropping the emptied host bucket")
+	assert(world.prefs.instances["local"]["4"] == nil,
+		"an unobserved local tab close retires after sustained absence")
 	assert(instanceFor(world, 4) == nil, "the retired rail leaves the diagnostics inventory")
 end
 

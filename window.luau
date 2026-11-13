@@ -939,7 +939,7 @@ local function railVisible(rail, data, activeHost, activeTab)
 	local native = rail.pane and data and data.allPanes[rail.pane]
 	local host = data and data.hosts[rail.host]
 	return activeTab and activeHost and activeHost.state == "connected"
-		and native and data.canvases[rail.pane] and host and host.connected and rail.host == activeHost.id
+		and native and data.canvases[rail.pane] and host and host.key == "local" and host.connected and rail.host == activeHost.id
 		and native.tab == activeTab and not native.parked and not rail.saved.userHidden
 end
 
@@ -1727,6 +1727,21 @@ local function discover(cx, data, prefs)
 	for pane, metadata in pairs(data.canvases) do
 		local native = data.allPanes[pane]
 		local host = native and data.hosts[native.host]
+		-- Canvases belong to the host's shared session, not this window. Never publish the
+		-- private cross-host workspace there; remove old remote rails, including parked ones.
+		if host and host.key ~= "local" then
+			ownedCanvas(cx, pane)
+			cx.layout:close(pane)
+			placement.changed()
+			counters.layoutWrites += 1
+			for _, rail in pairs(rails) do
+				if rail.pane == pane then
+					rail.saved.closeAccepted = true
+					saveInstance(cx, rail)
+				end
+			end
+			continue
+		end
 		local assigned = false
 		for _, rail in pairs(rails) do if rail.pane == pane then assigned = true; break end end
 		if host and not assigned and not closedPanes[pane] then
@@ -1769,7 +1784,7 @@ local function discover(cx, data, prefs)
 		else
 			rail.absentPasses, rail.absentSince = 0, nil
 		end
-		if rail.saved.retiring or closedTabs[rail.tab] or (tab and tab.session ~= rail.session)
+		if (host and host.key ~= "local") or rail.saved.retiring or closedTabs[rail.tab] or (tab and tab.session ~= rail.session)
 			or (rail.absentPasses >= 3 and host and host.connected) then
 			if rail.pane and data.allPanes[rail.pane] == nil and rail.absentPasses >= 3
 				and rail.absentSince and tern.now() - rail.absentSince >= 30000 then
@@ -1892,9 +1907,9 @@ local function selectedContent(cx, data)
 		else treeLeaf(arrangement.root, owned)
 	local host = data.hosts[focused.host]
 	-- The one visit-eligibility predicate (placement, discovery and the all-tabs consume): a mounted, unzoomed, nonfloating
-	-- tab on a connected host.
+	-- tab on the local host. Remote canvases are shared with that host's other clients.
 	return { host = focused.host, tab = focused.tab, target = target, arrangement = arrangement,
-		eligible = host ~= nil and host.connected and not focused.floating and not focused.parked and not arrangement.zoomed }
+		eligible = host ~= nil and host.key == "local" and host.connected and not focused.floating and not focused.parked and not arrangement.zoomed }
 end
 
 local function prepareLayout(cx, rail)
@@ -1933,7 +1948,8 @@ local function createRail(cx, rail, data, selected, prefs)
 		end
 	end
 	local current = cx.hosts:current()
-	assert(current and current.id == rail.host and current.state == "connected", "Host selection changed")
+	assert(current and current.kind == "local" and current.id == rail.host and current.state == "connected",
+		"Attention stays on the local host; remote canvases are shared")
 	assert(cx.session:tab_of(cx.session:focused()) == rail.tab, "Tab selection changed")
 	if rail.saved.position == nil then rail.saved.position = prefs.defaults.position end
 	prepareLayout(cx, rail)
@@ -2049,7 +2065,7 @@ local function maintainInstances(cx, data, prefs)
 	local selected = selectedContent(cx, data)
 	for _, rail in pairs(rails) do
 		local host = data.hosts[rail.host]
-		if host and host.connected then
+		if host and host.key == "local" and host.connected then
 			local arrangement = data.tabs[rail.tab] and placement.observe(cx, rail.tab)
 			if arrangement and treeLeaf(arrangement.root, owned) == nil then
 				-- A cached observation can nominate retirement, never authorize a close.
@@ -2127,6 +2143,8 @@ end
 -- One paint of one rail: renders, writes the change and records what the canvas now shows. Returns whether the native
 -- write was accepted, its failure, and the options used. A rejected write leaves the renderer to resend in full.
 local function paintRail(cx, data, prefs, rail, arrival, hidden)
+	assert(data.hosts[rail.host] and data.hosts[rail.host].key == "local",
+		"Attention cannot publish private navigation to a remote host")
 	local options = viewOptions(prefs, rail, data)
 	options.arrival = arrival
 	local inputs = renderInputs(options, if hidden then HIDDEN_CLOCK_S else RENDER_CLOCK_S)
@@ -2162,7 +2180,8 @@ function catchup.ready(rail, data)
 	local native = if rail.pane then data.allPanes[rail.pane] else nil
 	local host = data.hosts[rail.host]
 	return rail.phase == "ready" and not rail.saved.userHidden and not rail.saved.retiring and not closedTabs[rail.tab]
-		and data.tabs[rail.tab] ~= nil and native ~= nil and data.canvases[rail.pane] ~= nil and host ~= nil and host.connected
+		and data.tabs[rail.tab] ~= nil and native ~= nil and data.canvases[rail.pane] ~= nil and host ~= nil
+		and host.key == "local" and host.connected
 		and native.tab == rail.tab and not native.parked and not native.floating
 end
 
@@ -3842,6 +3861,9 @@ local function availability(cx, prefs, data, selected, rail)
 	if not host or not host.connected then
 		return describe("host-offline", "No mounted rail — use native navigation · this host is offline")
 	end
+	if host.key ~= "local" then
+		return describe("remote-host", "Attention stays on your local host · remote sessions are shared")
+	end
 	record.pane, record.phase = rail and rail.pane, rail and rail.phase
 	if not selected.eligible then
 		return describe("deferred", if selected.arrangement.zoomed then "Placement deferred · unzoom this tab to place Attention"
@@ -3869,7 +3891,9 @@ local function resolveHere(cx)
 			here.selected = selectedContent(cx, here.data)
 			local host = here.selected and here.data.hosts[here.selected.host]
 			local tab = here.selected and here.data.tabs[here.selected.tab]
-			if host and host.connected and tab then here.rail = ensureRail(here.data, prefs, host, tab) end
+			if host and host.key == "local" and host.connected and tab then
+				here.rail = ensureRail(here.data, prefs, host, tab)
+			end
 		end
 	end
 	here.availability = availability(cx, prefs, here.data, here.selected, here.rail)

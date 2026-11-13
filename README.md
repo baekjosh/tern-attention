@@ -32,6 +32,8 @@ tern plugin install github.com/baekjosh/tern-attention
 
 Then choose **Attention: Enable here** in Tern's command palette. The rail mounts on the left by default (flip Settings → tabs to Horizontal and it reads as a native sidebar), and Settings still holds the default (Bottom / Right / Left); per-tab relayout lives in the palette (**Attention: Use Right in this tab**, and friends).
 
+Attention mounts only on the local host. Remote sessions are shared with their other clients, so the plugin never places your private workspace rail there. Updating removes older Attention canvases from connected remote hosts; their chats and other panes stay intact.
+
 The full behavioral spec, the placement engine, and the proof boundaries live in [docs/REFERENCE.md](docs/REFERENCE.md).
 
 ## License
